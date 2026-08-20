@@ -7,6 +7,7 @@
 *.dll
 *.so
 *.dylib
+/bifrost
 
 # Test binary, built with `go test -c`
 *.test
@@ -26,6 +27,9 @@ go.work.sum
 
 # env file
 .env
+
+# Bifrost atomic-write leftovers after an interrupted process
+*.tmp
 
 # Editor/IDE
 # .idea/
