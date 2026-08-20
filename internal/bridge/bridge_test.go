@@ -22,6 +22,7 @@ type fakeSource struct {
 	pullRequests         []githubapi.PullRequest
 	threads              []githubapi.ReviewThread
 	threadsByPullRequest map[int][]githubapi.ReviewThread
+	threadErrors         map[int]error
 	openError            error
 }
 
@@ -36,6 +37,9 @@ func (source *fakeSource) OpenPullRequests(context.Context, string, []string) ([
 }
 
 func (source *fakeSource) ReviewThreads(_ context.Context, pullRequest githubapi.PullRequest) ([]githubapi.ReviewThread, error) {
+	if err := source.threadErrors[pullRequest.Number]; err != nil {
+		return nil, err
+	}
 	if source.threadsByPullRequest != nil {
 		return source.threadsByPullRequest[pullRequest.Number], nil
 	}
@@ -435,6 +439,59 @@ func TestDispatchQueueCancellationLeavesJobsUndelivered(t *testing.T) {
 	}
 }
 
+func TestQueuedJobUsesLatestMappingBeforeDispatch(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		name             string
+		initialSessionID string
+	}{
+		{name: "mapping added"},
+		{name: "mapping replaced", initialSessionID: "old-session"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			directory := t.TempDir()
+			mappingPath := filepath.Join(directory, "mappings.json")
+			mappings := &mappingFile{Version: mappingSchemaVersion, PullRequests: map[string]mapping{
+				"owner/repo#1": {Harness: "codex", SessionID: "session-1"},
+				"owner/repo#2": {Harness: "codex", SessionID: "session-2"},
+			}}
+			if testCase.initialSessionID != "" {
+				mappings.PullRequests["owner/repo#3"] = mapping{Harness: "codex", SessionID: testCase.initialSessionID}
+			}
+			if err := saveJSON(mappingPath, mappings); err != nil {
+				t.Fatal(err)
+			}
+			agentHarness := &blockingHarness{started: make(chan string, 3), release: make(chan struct{}, 3)}
+			monitor := New(sourceWithPullRequests(3), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+			done := make(chan error, 1)
+			go func() {
+				_, err := monitor.RunOnce(context.Background())
+				done <- err
+			}()
+			receiveStartedSession(t, agentHarness.started)
+			receiveStartedSession(t, agentHarness.started)
+			mappings.PullRequests["owner/repo#3"] = mapping{Harness: "codex", SessionID: "session-3"}
+			if err := saveJSON(mappingPath, mappings); err != nil {
+				t.Fatal(err)
+			}
+			agentHarness.release <- struct{}{}
+			if sessionID := receiveStartedSession(t, agentHarness.started); sessionID != "session-3" {
+				t.Fatalf("queued dispatch used session %q", sessionID)
+			}
+			agentHarness.release <- struct{}{}
+			agentHarness.release <- struct{}{}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for mapped queued dispatch")
+			}
+		})
+	}
+}
+
 type selectiveHarness struct {
 	mutex    sync.Mutex
 	errors   map[string]error
@@ -487,6 +544,45 @@ func TestDispatchQueueCommitsOnlySuccessfulJobs(t *testing.T) {
 	agentHarness.mutex.Lock()
 	defer agentHarness.mutex.Unlock()
 	if len(agentHarness.requests) != 3 || agentHarness.requests[2].SessionID != "session-failure" {
+		t.Fatalf("requests = %#v", agentHarness.requests)
+	}
+}
+
+func TestPerPullRequestSourceFailureDoesNotBlockHealthyDispatch(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	mappingPath := filepath.Join(directory, "mappings.json")
+	if err := saveJSON(mappingPath, &mappingFile{Version: mappingSchemaVersion, PullRequests: map[string]mapping{
+		"owner/repo#1": {Harness: "codex", SessionID: "session-1"},
+		"owner/repo#2": {Harness: "codex", SessionID: "session-2"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	source := sourceWithPullRequests(2)
+	source.threadErrors = map[int]error{1: errors.New("temporary thread failure")}
+	agentHarness := &selectiveHarness{errors: make(map[string]error)}
+	statePath := filepath.Join(directory, "state.json")
+	monitor := New(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, mappingPath)
+
+	result, err := monitor.RunOnce(context.Background())
+	if err == nil || result.Dispatches != 1 {
+		t.Fatalf("first result/error = %#v / %v", result, err)
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Threads["owner/repo#1"] != nil || state.Threads["owner/repo#2"] == nil {
+		t.Fatalf("state = %#v", state.Threads)
+	}
+	delete(source.threadErrors, 1)
+	result, err = monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 1 {
+		t.Fatalf("retry result/error = %#v / %v", result, err)
+	}
+	agentHarness.mutex.Lock()
+	defer agentHarness.mutex.Unlock()
+	if len(agentHarness.requests) != 2 || agentHarness.requests[1].SessionID != "session-1" {
 		t.Fatalf("requests = %#v", agentHarness.requests)
 	}
 }
@@ -621,13 +717,42 @@ func TestDispatchQueueDefersJobsBeyondCapacity(t *testing.T) {
 	}
 	source.openError = nil
 	result, err = monitor.RunOnce(context.Background())
-	if err != nil || result.Dispatches != 1 || result.Deferred != maxPendingDispatches {
+	if err == nil || result.Dispatches != 1 || result.Deferred != 1 {
 		t.Fatalf("deferred retry result/error = %#v / %v", result, err)
 	}
 	agentHarness.mutex.Lock()
 	defer agentHarness.mutex.Unlock()
-	if agentHarness.requests[len(agentHarness.requests)-1].SessionID != fmt.Sprintf("session-%d", pullRequestCount) {
-		t.Fatalf("last request = %#v", agentHarness.requests[len(agentHarness.requests)-1])
+	foundDeferred := false
+	for _, request := range agentHarness.requests[firstAttempts:] {
+		foundDeferred = foundDeferred || request.SessionID == fmt.Sprintf("session-%d", pullRequestCount)
+	}
+	if !foundDeferred {
+		t.Fatalf("deferred session was not attempted: %#v", agentHarness.requests[firstAttempts:])
+	}
+}
+
+func TestDispatchQueueWrapsWhenBacklogShrinksBelowCursor(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	if err := saveJSON(statePath, &stateFile{Version: stateSchemaVersion, QueueCursor: 100, Threads: make(map[string]map[string]string)}); err != nil {
+		t.Fatal(err)
+	}
+	const pullRequestCount = 50
+	mappingPath := filepath.Join(directory, "mappings.json")
+	mappings := &mappingFile{Version: mappingSchemaVersion, PullRequests: make(map[string]mapping, pullRequestCount)}
+	for number := 1; number <= pullRequestCount; number++ {
+		mappings.PullRequests[fmt.Sprintf("owner/repo#%d", number)] = mapping{Harness: "codex", SessionID: fmt.Sprintf("session-%d", number)}
+	}
+	if err := saveJSON(mappingPath, mappings); err != nil {
+		t.Fatal(err)
+	}
+	agentHarness := &selectiveHarness{errors: make(map[string]error)}
+	monitor := New(sourceWithPullRequests(pullRequestCount), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, mappingPath)
+
+	result, err := monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != pullRequestCount || result.Deferred != 0 {
+		t.Fatalf("result/error = %#v / %v", result, err)
 	}
 }
 
@@ -707,7 +832,7 @@ func TestOmittedThreadsRemainPending(t *testing.T) {
 	statePath := filepath.Join(directory, "state.json")
 	monitor := New(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, filepath.Join(directory, "mappings.json"))
 
-	if result, err := monitor.RunOnce(context.Background()); err != nil || result.Dispatches != 1 {
+	if result, err := monitor.RunOnce(context.Background()); err != nil || result.Dispatches != 1 || result.DeferredThreads == 0 {
 		t.Fatalf("first result/error = %#v / %v", result, err)
 	}
 	state, err := loadState(statePath)

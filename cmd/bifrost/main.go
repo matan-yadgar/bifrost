@@ -54,7 +54,7 @@ func main() {
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
 		result, err := monitor.RunOnce(ctx)
-		log.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, time.Since(started).Round(time.Millisecond))
+		log.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
 		return result, err
 	}
 	if *runOnce {
@@ -62,8 +62,8 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if result.Deferred > 0 {
-			log.Fatalf("%d pull request dispatches were deferred", result.Deferred)
+		if err := incompleteDeliveryError(result); err != nil {
+			log.Fatal(err)
 		}
 		return
 	}
@@ -85,4 +85,11 @@ func main() {
 			}
 		}
 	}
+}
+
+func incompleteDeliveryError(result bridge.CycleResult) error {
+	if result.Deferred == 0 && result.DeferredThreads == 0 {
+		return nil
+	}
+	return fmt.Errorf("incomplete delivery: %d pull requests and %d review threads were deferred", result.Deferred, result.DeferredThreads)
 }

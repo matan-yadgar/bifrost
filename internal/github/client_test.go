@@ -16,7 +16,7 @@ func TestOpenPullRequestsFiltersAuthors(t *testing.T) {
 	t.Parallel()
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path != "/repos/owner/repo/pulls" {
+		if request.Method != http.MethodGet || request.URL.Path != "/repos/owner/repo/pulls" {
 			http.Error(writer, "wrong path", http.StatusBadRequest)
 			return
 		}
@@ -74,13 +74,27 @@ func TestReviewThreadsPaginatesThreadsAndComments(t *testing.T) {
 			http.Error(writer, "bad request", http.StatusBadRequest)
 			return
 		}
+		if request.Method != http.MethodPost {
+			http.Error(writer, "wrong method", http.StatusBadRequest)
+			return
+		}
+		commentsQuery := strings.Contains(body.Query, "PullRequestReviewThreadComments")
+		if commentsQuery {
+			if body.Variables["id"] != "thread-b" || body.Variables["first"] != float64(githubPageSize) {
+				http.Error(writer, "wrong comment target", http.StatusBadRequest)
+				return
+			}
+		} else if body.Variables["owner"] != "owner" || body.Variables["repo"] != "repo" || body.Variables["number"] != float64(42) || body.Variables["first"] != float64(githubPageSize) || body.Variables["commentsFirst"] != float64(githubPageSize) {
+			http.Error(writer, "wrong pull request target", http.StatusBadRequest)
+			return
+		}
 		writer.Header().Set("Content-Type", "application/json")
 		cursor := ""
 		if body.Variables["after"] != nil {
 			cursor, _ = body.Variables["after"].(string)
 		}
 		switch {
-		case strings.Contains(body.Query, "PullRequestReviewThreadComments"):
+		case commentsQuery:
 			requestMutex.Lock()
 			commentCursors = append(commentCursors, cursor)
 			requestMutex.Unlock()
@@ -136,5 +150,59 @@ func TestReviewThreadsPaginatesThreadsAndComments(t *testing.T) {
 	wantCommentCursors := []string{"comment-page-2", "comment-page-3"}
 	if fmt.Sprint(threadCursors) != fmt.Sprint(wantThreadCursors) || fmt.Sprint(commentCursors) != fmt.Sprint(wantCommentCursors) {
 		t.Fatalf("thread/comment cursors = %#v / %#v", threadCursors, commentCursors)
+	}
+}
+
+func TestClientRejectsOversizedResponse(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(strings.Repeat("x", maxGitHubResponseBytes+1)))
+	}))
+	defer server.Close()
+	client := NewClient("")
+	client.restBaseURL = server.URL
+
+	var output any
+	err := client.get(context.Background(), server.URL, &output)
+	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestReviewThreadsEnforcesCumulativeDataBudget(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		var body struct {
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, "bad request", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch body.Variables["after"] {
+		case "page-2":
+			fmt.Fprint(writer, `{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[{"id":"2","author":{"login":"b"},"bodyText":"second","url":"v","createdAt":"2026-08-20T10:01:00Z","updatedAt":"2026-08-20T10:01:00Z"}]}}}}`)
+		case nil:
+			fmt.Fprint(writer, `{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[{"id":"prior","isResolved":false,"path":"prior.go","comments":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[]}},{"id":"current","isResolved":false,"path":"current.go","comments":{"pageInfo":{"hasNextPage":true,"endCursor":"page-2"},"nodes":[{"id":"1","author":{"login":"a"},"bodyText":"first","url":"u","createdAt":"2026-08-20T10:00:00Z","updatedAt":"2026-08-20T10:00:00Z"}]}}]}}}}}`)
+		default:
+			http.Error(writer, "wrong cursor", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := NewClient("")
+	client.graphQLURL = server.URL
+	priorBytes := reviewThreadDataBytes(ReviewThread{ID: "prior", Path: "prior.go"})
+	currentBytes := reviewThreadDataBytes(ReviewThread{ID: "current", Path: "current.go", Comments: []ReviewComment{{ID: "1", Author: "a", Body: "first", URL: "u"}}})
+	secondBytes := reviewCommentDataBytes(ReviewComment{ID: "2", Author: "b", Body: "second", URL: "v"})
+
+	threads, err := client.reviewThreads(context.Background(), PullRequest{Repository: "owner/repo", Number: 42}, priorBytes+currentBytes+secondBytes-1)
+	if err == nil || !strings.Contains(err.Error(), "review thread data exceeds") {
+		t.Fatalf("error = %v", err)
+	}
+	if threads != nil || requests.Load() != 2 {
+		t.Fatalf("threads/requests = %#v / %d", threads, requests.Load())
 	}
 }

@@ -18,7 +18,11 @@ import (
 	"time"
 )
 
-const githubPageSize = 100
+const (
+	githubPageSize           = 100
+	maxGitHubResponseBytes   = 8 * 1024 * 1024
+	maxReviewThreadDataBytes = 32 * 1024 * 1024
+)
 
 var tokenEnvironmentNames = []string{"GH_TOKEN", "GITHUB_TOKEN"}
 
@@ -112,6 +116,19 @@ type ReviewComment struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type reviewDataBudget struct {
+	limit int
+	used  int
+}
+
+func (budget *reviewDataBudget) retain(size int) bool {
+	if size > budget.limit-budget.used {
+		return false
+	}
+	budget.used += size
+	return true
+}
+
 func NewClient(token string) *Client {
 	return &Client{
 		token:       token,
@@ -191,12 +208,17 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string, a
 }
 
 func (client *Client) ReviewThreads(ctx context.Context, pullRequest PullRequest) ([]ReviewThread, error) {
+	return client.reviewThreads(ctx, pullRequest, maxReviewThreadDataBytes)
+}
+
+func (client *Client) reviewThreads(ctx context.Context, pullRequest PullRequest, dataLimit int) ([]ReviewThread, error) {
 	owner, repository, ok := strings.Cut(pullRequest.Repository, "/")
 	if !ok {
 		return nil, fmt.Errorf("invalid repository %q", pullRequest.Repository)
 	}
 
 	var threads []ReviewThread
+	budget := &reviewDataBudget{limit: dataLimit}
 	var after *string
 	for {
 		var response reviewThreadsResponse
@@ -214,11 +236,15 @@ func (client *Client) ReviewThreads(ctx context.Context, pullRequest PullRequest
 		connection := response.Repository.PullRequest.ReviewThreads
 		for _, node := range connection.Nodes {
 			thread := threadFromNode(node)
+			threadDataBytes := reviewThreadDataBytes(thread)
+			if !budget.retain(threadDataBytes) {
+				return nil, fmt.Errorf("review thread data exceeds %d bytes", dataLimit)
+			}
 			if node.Comments.PageInfo.HasNextPage {
 				if node.Comments.PageInfo.EndCursor == "" {
 					return nil, fmt.Errorf("review thread %s comments have another page without a cursor", node.ID)
 				}
-				comments, err := client.moreComments(ctx, node.ID, node.Comments.PageInfo.EndCursor)
+				comments, err := client.moreComments(ctx, node.ID, node.Comments.PageInfo.EndCursor, budget)
 				if err != nil {
 					return nil, err
 				}
@@ -240,7 +266,19 @@ func (client *Client) ReviewThreads(ctx context.Context, pullRequest PullRequest
 	return threads, nil
 }
 
-func (client *Client) moreComments(ctx context.Context, threadID, cursor string) ([]ReviewComment, error) {
+func reviewThreadDataBytes(thread ReviewThread) int {
+	size := len(thread.ID) + len(thread.Path) + len(thread.DiffSide) + len(thread.StartDiffSide)
+	for _, comment := range thread.Comments {
+		size += reviewCommentDataBytes(comment)
+	}
+	return size
+}
+
+func reviewCommentDataBytes(comment ReviewComment) int {
+	return len(comment.ID) + len(comment.Author) + len(comment.Body) + len(comment.URL)
+}
+
+func (client *Client) moreComments(ctx context.Context, threadID, cursor string, budget *reviewDataBudget) ([]ReviewComment, error) {
 	var comments []ReviewComment
 	after := &cursor
 	for {
@@ -251,7 +289,12 @@ func (client *Client) moreComments(ctx context.Context, threadID, cursor string)
 			return nil, err
 		}
 		for _, node := range response.Node.Comments.Nodes {
-			comments = append(comments, commentFromNode(node))
+			comment := commentFromNode(node)
+			commentBytes := reviewCommentDataBytes(comment)
+			if !budget.retain(commentBytes) {
+				return nil, fmt.Errorf("review thread data exceeds %d bytes", budget.limit)
+			}
+			comments = append(comments, comment)
 		}
 		if !response.Node.Comments.PageInfo.HasNextPage {
 			return comments, nil
@@ -311,9 +354,12 @@ func (client *Client) do(request *http.Request, output any) error {
 		return err
 	}
 	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxGitHubResponseBytes+1))
 	if err != nil {
 		return err
+	}
+	if len(body) > maxGitHubResponseBytes {
+		return fmt.Errorf("GitHub API response exceeds %d bytes", maxGitHubResponseBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("GitHub API %s: %s", response.Status, strings.TrimSpace(string(body)))

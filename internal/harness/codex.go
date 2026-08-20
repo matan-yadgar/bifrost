@@ -7,13 +7,25 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 )
 
 var ErrSessionNotFound = errors.New("Codex session not found")
 
-const maxStderrCaptureBytes = 64 * 1024
+const (
+	maxStderrCaptureBytes = 64 * 1024
+	maxDiagnosticBytes    = 4 * 1024
+)
+
+var (
+	ansiEscapePattern          = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+	authorizationPattern       = regexp.MustCompile(`(?im)(["']?[a-z0-9_-]*authorization[a-z0-9_-]*["']?)([ \t]*[:=][ \t]*)[^\r\n]*`)
+	sensitiveAssignmentPattern = regexp.MustCompile(`(?i)(["']?[a-z0-9_-]*(?:password|secret|token|api[_-]?key|access[_-]?key)[a-z0-9_-]*["']?)([[:space:]]*[:=][[:space:]]*)("[^"\r\n]*"|'[^'\r\n]*'|[^ \t\r\n,;}]+)`)
+	credentialPattern          = regexp.MustCompile(`(?i)\b(gh[pousr]_[a-z0-9_]{20,}|github_pat_[a-z0-9_]{20,}|sk-[a-z0-9_-]{20,})\b`)
+)
 
 type Request struct {
 	SessionID        string
@@ -172,7 +184,35 @@ type commandError struct {
 }
 
 func (commandError *commandError) Error() string {
-	return commandError.cause.Error()
+	diagnostic := sanitizeDiagnostic(commandError.stderr)
+	if diagnostic == "" {
+		return commandError.cause.Error()
+	}
+	return fmt.Sprintf("%s: %s", commandError.cause, diagnostic)
+}
+
+func sanitizeDiagnostic(value string) string {
+	value = ansiEscapePattern.ReplaceAllString(value, "")
+	value = strings.Map(func(character rune) rune {
+		if character != '\r' && character != '\n' && character != '\t' && unicode.IsControl(character) {
+			return ' '
+		}
+		return character
+	}, value)
+	value = authorizationPattern.ReplaceAllString(value, "$1$2[redacted]")
+	value = sensitiveAssignmentPattern.ReplaceAllString(value, "$1$2[redacted]")
+	value = credentialPattern.ReplaceAllString(value, "[redacted]")
+	value = strings.Map(func(character rune) rune {
+		if unicode.IsControl(character) {
+			return ' '
+		}
+		return character
+	}, value)
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) <= maxDiagnosticBytes {
+		return value
+	}
+	return strings.ToValidUTF8(value[:maxDiagnosticBytes], "")
 }
 
 func (commandError *commandError) Unwrap() error {

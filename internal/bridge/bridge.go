@@ -48,13 +48,15 @@ type Monitor struct {
 	mappingFile  string
 	mappingMutex sync.Mutex
 	spawnLocks   keyedMutex
+	sessionLocks keyedMutex
 }
 
 type CycleResult struct {
-	PullRequests int
-	Threads      int
-	Dispatches   int
-	Deferred     int
+	PullRequests    int
+	Threads         int
+	Dispatches      int
+	Deferred        int
+	DeferredThreads int
 }
 
 type mapping struct {
@@ -81,9 +83,8 @@ type dispatchJob struct {
 }
 
 type queuedDispatch struct {
-	index   int
-	job     dispatchJob
-	mapping mapping
+	index int
+	job   dispatchJob
 }
 
 type keyedMutex struct {
@@ -121,7 +122,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 	var result CycleResult
 	var cycleErrors []error
 	var jobs []dispatchJob
-	var fallbackJob *dispatchJob
+	var wrapJobs []dispatchJob
 	seenJobKeys := make(map[string]bool)
 	queueCursor := state.QueueCursor
 	uniqueJobs := 0
@@ -149,7 +150,12 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 				continue
 			}
 			key := pullRequestKey(pullRequest.Repository, pullRequest.Number)
+			if seenJobKeys[key] {
+				continue
+			}
+			seenJobKeys[key] = true
 			prompt, includedThreads := reviewPrompt(pullRequest, changed)
+			result.DeferredThreads += len(changed) - len(includedThreads)
 			includedFingerprints := make(map[string]string, len(includedThreads))
 			for threadID := range includedThreads {
 				includedFingerprints[threadID] = fingerprints[threadID]
@@ -158,23 +164,26 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 				repository: repository, key: key,
 				prompt: prompt, fingerprints: includedFingerprints,
 			}
-			if seenJobKeys[key] {
-				continue
-			}
-			seenJobKeys[key] = true
 			if uniqueJobs < queueCursor {
-				if fallbackJob == nil {
-					fallbackJob = &job
+				if len(wrapJobs) < maxPendingDispatches {
+					wrapJobs = append(wrapJobs, job)
 				}
 			} else if len(jobs) < maxPendingDispatches {
 				jobs = append(jobs, job)
+				if retainedPrefix := maxPendingDispatches - len(jobs); len(wrapJobs) > retainedPrefix {
+					clear(wrapJobs[retainedPrefix:])
+					wrapJobs = wrapJobs[:retainedPrefix]
+				}
 			}
 			uniqueJobs++
 		}
 	}
 	effectiveCursor := queueCursor
-	if len(jobs) == 0 && fallbackJob != nil {
-		jobs = append(jobs, *fallbackJob)
+	startedFromPrefix := len(jobs) == 0
+	if remaining := maxPendingDispatches - len(jobs); remaining > 0 && len(wrapJobs) > 0 {
+		jobs = append(jobs, wrapJobs[:min(remaining, len(wrapJobs))]...)
+	}
+	if startedFromPrefix && len(jobs) > 0 {
 		effectiveCursor = 0
 	}
 	result.Deferred = uniqueJobs - len(jobs)
@@ -257,7 +266,6 @@ func (monitor *Monitor) dispatchLanes(jobs []dispatchJob) ([][]queuedDispatch, e
 	var lanes [][]queuedDispatch
 	for index, job := range jobs {
 		mapping := mappings.PullRequests[job.key]
-		mapping.SessionID = strings.TrimSpace(mapping.SessionID)
 		laneKey := "working-directory:" + filepath.Clean(job.repository.WorkingDirectory)
 		if mapping.SessionID != "" {
 			laneKey = "session:" + strings.ToLower(mapping.SessionID)
@@ -268,23 +276,68 @@ func (monitor *Monitor) dispatchLanes(jobs []dispatchJob) ([][]queuedDispatch, e
 			laneIndexes[laneKey] = laneIndex
 			lanes = append(lanes, nil)
 		}
-		lanes[laneIndex] = append(lanes[laneIndex], queuedDispatch{index: index, job: job, mapping: mapping})
+		lanes[laneIndex] = append(lanes[laneIndex], queuedDispatch{index: index, job: job})
 	}
 	return lanes, nil
 }
 
 func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) error {
 	job := item.job
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("dispatch %s: %w", job.key, err)
+		}
+		mapping, err := monitor.mappingForDispatch(job.key)
+		if err != nil {
+			return err
+		}
+		if mapping.SessionID == "" {
+			unlock := monitor.spawnLocks.lock(filepath.Clean(job.repository.WorkingDirectory))
+			current, currentError := monitor.mappingForDispatch(job.key)
+			if currentError != nil {
+				unlock()
+				return currentError
+			}
+			if current != mapping {
+				unlock()
+				continue
+			}
+			dispatchError := monitor.dispatchWithMapping(ctx, job, mapping, true)
+			unlock()
+			return dispatchError
+		}
+
+		unlock := monitor.sessionLocks.lock(strings.ToLower(mapping.SessionID))
+		current, currentError := monitor.mappingForDispatch(job.key)
+		if currentError != nil {
+			unlock()
+			return currentError
+		}
+		if current != mapping {
+			unlock()
+			continue
+		}
+		dispatchError := monitor.dispatchWithMapping(ctx, job, mapping, false)
+		unlock()
+		return dispatchError
+	}
+}
+
+func (monitor *Monitor) dispatchWithMapping(ctx context.Context, job dispatchJob, mapping mapping, spawnLocked bool) error {
 	key := job.key
-	mapped := item.mapping.SessionID != ""
-	if mapped && item.mapping.Harness != "" && !strings.EqualFold(strings.TrimSpace(item.mapping.Harness), monitor.harness.Name()) {
-		return fmt.Errorf("%s is mapped to unsupported harness %q", key, item.mapping.Harness)
+	mapped := mapping.SessionID != ""
+	if mapped && mapping.Harness != "" && !strings.EqualFold(mapping.Harness, monitor.harness.Name()) {
+		return fmt.Errorf("%s is mapped to unsupported harness %q", key, mapping.Harness)
 	}
 	var dispatchResult harness.Result
 	var err error
 	if mapped {
 		dispatchResult, err = monitor.harness.Dispatch(ctx, harness.Request{
-			SessionID: item.mapping.SessionID, WorkingDirectory: job.repository.WorkingDirectory, Prompt: job.prompt,
+			SessionID: mapping.SessionID, WorkingDirectory: job.repository.WorkingDirectory, Prompt: job.prompt,
+		})
+	} else if spawnLocked {
+		dispatchResult, err = monitor.harness.Dispatch(ctx, harness.Request{
+			WorkingDirectory: job.repository.WorkingDirectory, Prompt: job.prompt,
 		})
 	} else {
 		dispatchResult, err = monitor.spawn(ctx, job.repository.WorkingDirectory, job.prompt)
@@ -292,7 +345,7 @@ func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) error
 	spawned := !mapped
 	expectedSessionID := ""
 	if mapped && errors.Is(err, harness.ErrSessionNotFound) {
-		expectedSessionID = item.mapping.SessionID
+		expectedSessionID = mapping.SessionID
 		dispatchResult, err = monitor.spawn(ctx, job.repository.WorkingDirectory, job.prompt)
 		spawned = true
 	}
@@ -317,6 +370,15 @@ func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) error
 	return nil
 }
 
+func (monitor *Monitor) mappingForDispatch(key string) (mapping, error) {
+	mappings, err := loadMappings(monitor.mappingFile)
+	if err != nil {
+		return mapping{}, fmt.Errorf("load mapping for %s: %w", key, err)
+	}
+	value := mappings.PullRequests[key]
+	return value, nil
+}
+
 func (monitor *Monitor) spawn(ctx context.Context, workingDirectory, prompt string) (harness.Result, error) {
 	unlock := monitor.spawnLocks.lock(filepath.Clean(workingDirectory))
 	defer unlock()
@@ -334,7 +396,7 @@ func (monitor *Monitor) recordMapping(key, sessionID, expectedSessionID string) 
 	if err != nil {
 		return fmt.Errorf("reload mappings: %w", err)
 	}
-	existing := strings.TrimSpace(mappings.PullRequests[key].SessionID)
+	existing := mappings.PullRequests[key].SessionID
 	if existing != "" && !strings.EqualFold(existing, expectedSessionID) {
 		return nil
 	}
@@ -350,7 +412,7 @@ func (monitor *Monitor) currentMappingSession(key string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reload mappings: %w", err)
 	}
-	return strings.TrimSpace(mappings.PullRequests[key].SessionID), nil
+	return mappings.PullRequests[key].SessionID, nil
 }
 
 func changedThreads(state *stateFile, pullRequest githubapi.PullRequest, threads []githubapi.ReviewThread) ([]githubapi.ReviewThread, bool, map[string]string) {
@@ -481,12 +543,14 @@ func loadMappings(path string) (*mappingFile, error) {
 		mappings.PullRequests = make(map[string]mapping)
 	}
 	normalizedMappings := make(map[string]mapping, len(mappings.PullRequests))
-	for key, mapping := range mappings.PullRequests {
+	for key, value := range mappings.PullRequests {
 		normalized := strings.ToLower(strings.TrimSpace(key))
-		if existing, found := normalizedMappings[normalized]; found && existing != mapping {
+		value.Harness = strings.TrimSpace(value.Harness)
+		value.SessionID = strings.TrimSpace(value.SessionID)
+		if existing, found := normalizedMappings[normalized]; found && existing != value {
 			return nil, fmt.Errorf("conflicting mappings for %s", normalized)
 		}
-		normalizedMappings[normalized] = mapping
+		normalizedMappings[normalized] = value
 	}
 	mappings.PullRequests = normalizedMappings
 	return mappings, nil
