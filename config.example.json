@@ -1,0 +1,16 @@
+{
+  "poll_interval": "5m",
+  "state_file": "state.json",
+  "mapping_file": "mappings.json",
+  "repositories": [
+    {
+      "name": "owner/repository",
+      "authors": ["your-github-login"],
+      "working_directory": "~/src/repository"
+    }
+  ],
+  "harness": {
+    "type": "codex",
+    "command": "codex"
+  }
+}
