@@ -2,7 +2,6 @@
   "poll_interval": "5m",
   "dispatch_timeout": "30m",
   "state_file": "state.json",
-  "mapping_directory": "mappings",
   "repositories": [
     {
       "name": "owner/repository",

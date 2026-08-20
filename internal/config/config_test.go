@@ -54,9 +54,6 @@ func TestLoad(t *testing.T) {
 	if runtimeConfig.StateFile != filepath.Join(directory, "state.json") {
 		t.Fatalf("state file = %q", runtimeConfig.StateFile)
 	}
-	if runtimeConfig.MappingDirectory != filepath.Join(directory, "mappings") {
-		t.Fatalf("mapping directory = %q", runtimeConfig.MappingDirectory)
-	}
 }
 
 func TestLoadRejectsDuplicateRepositories(t *testing.T) {
@@ -152,81 +149,23 @@ func TestLoadUsesConfiguredDispatchTimeout(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsLegacyMappingFile(t *testing.T) {
-	t.Parallel()
-	for _, testCase := range []struct {
-		name       string
-		configJSON string
-		legacyFile bool
-	}{
-		{
-			name:       "configured legacy path",
-			configJSON: `{"mapping_file":"old.json","repositories":[{"name":"owner/repo","working_directory":"repo"}]}`,
-		},
-		{
-			name:       "default legacy path exists",
-			configJSON: `{"repositories":[{"name":"owner/repo","working_directory":"repo"}]}`,
-			legacyFile: true,
-		},
-	} {
-		testCase := testCase
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-			directory := t.TempDir()
-			if err := os.Mkdir(filepath.Join(directory, "repo"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if testCase.legacyFile {
-				if err := os.WriteFile(filepath.Join(directory, "mappings.json"), []byte("{}"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			configPath := filepath.Join(directory, "config.json")
-			if err := os.WriteFile(configPath, []byte(testCase.configJSON), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Load(configPath); err == nil {
-				t.Fatal("expected legacy mapping error")
-			}
-		})
-	}
-}
-
 func TestLoadRejectsPathCollisions(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name             string
-		stateFile        string
-		mappingDirectory string
-	}{
-		{name: "state and mapping", stateFile: "shared", mappingDirectory: "shared"},
-		{name: "state and config", stateFile: "config.json", mappingDirectory: "mappings"},
-		{name: "mapping and config", stateFile: "state.json", mappingDirectory: "config.json"},
-		{name: "state beneath mapping", stateFile: "mappings/owner/repo/42.json", mappingDirectory: "mappings"},
-		{name: "mapping beneath state", stateFile: "data", mappingDirectory: "data/mappings"},
+	directory := t.TempDir()
+	workingDirectory := filepath.Join(directory, "repo")
+	if err := os.Mkdir(workingDirectory, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			directory := t.TempDir()
-			workingDirectory := filepath.Join(directory, "repo")
-			if err := os.Mkdir(workingDirectory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			configPath := filepath.Join(directory, "config.json")
-			configJSON := `{
-  "state_file": "` + test.stateFile + `",
-  "mapping_directory": "` + test.mappingDirectory + `",
+	configPath := filepath.Join(directory, "config.json")
+	configJSON := `{
+  "state_file": "config.json",
   "repositories": [{"name":"owner/repo","working_directory":"repo"}],
   "harness": {"type":"codex"}
 }`
-			if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Load(configPath); err == nil {
-				t.Fatal("expected path collision error")
-			}
-		})
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("expected path collision error")
 	}
 }

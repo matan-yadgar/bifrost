@@ -14,27 +14,13 @@ import (
 	"time"
 )
 
-var ErrSessionNotFound = errors.New("Codex session not found")
-
 const (
 	maxStderrCaptureBytes = 64 * 1024
 	processCleanupTimeout = 5 * time.Second
 )
 
-type Request struct {
-	SessionID        string
-	WorkingDirectory string
-	Prompt           string
-}
-
-type Result struct {
-	SessionID string
-}
-
-// Harness implementations must support concurrent Dispatch calls for different sessions.
-type Harness interface {
-	Name() string
-	Dispatch(context.Context, Request) (Result, error)
+type sessionDiscoverer interface {
+	Discover(context.Context, []Target) ([]Discovery, error)
 }
 
 type commandRunner interface {
@@ -42,21 +28,27 @@ type commandRunner interface {
 }
 
 type Codex struct {
-	command string
-	args    []string
-	runner  commandRunner
+	command    string
+	args       []string
+	runner     commandRunner
+	discoverer sessionDiscoverer
 }
 
 func NewCodex(command string, args, environment []string) *Codex {
 	return &Codex{
-		command: command,
-		args:    append([]string(nil), args...),
-		runner:  &execRunner{environment: slices.Clone(environment)},
+		command:    command,
+		args:       append([]string(nil), args...),
+		runner:     &execRunner{environment: slices.Clone(environment)},
+		discoverer: &codexAppServer{command: command, environment: slices.Clone(environment)},
 	}
 }
 
 func (codex *Codex) Name() string {
 	return "codex"
+}
+
+func (codex *Codex) Discover(ctx context.Context, targets []Target) ([]Discovery, error) {
+	return codex.discoverer.Discover(ctx, targets)
 }
 
 func (codex *Codex) Dispatch(ctx context.Context, request Request) (Result, error) {

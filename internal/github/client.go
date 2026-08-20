@@ -91,6 +91,7 @@ type PullRequest struct {
 	Number     int
 	Title      string
 	URL        string
+	HeadRef    string
 }
 
 type ReviewThread struct {
@@ -186,6 +187,9 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string, a
 			User    struct {
 				Login string `json:"login"`
 			} `json:"user"`
+			Head struct {
+				Ref string `json:"ref"`
+			} `json:"head"`
 		}
 		if err := client.get(ctx, endpoint, &response); err != nil {
 			return nil, err
@@ -199,6 +203,7 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string, a
 				Number:     pullRequest.Number,
 				Title:      pullRequest.Title,
 				URL:        pullRequest.HTMLURL,
+				HeadRef:    pullRequest.Head.Ref,
 			})
 		}
 		if len(response) < githubPageSize {

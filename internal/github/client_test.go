@@ -27,7 +27,7 @@ func TestOpenPullRequestsFiltersAuthors(t *testing.T) {
 		}
 		page := request.URL.Query().Get("page")
 		if page == "2" {
-			fmt.Fprint(writer, `[{"number":101,"title":"mine too","html_url":"https://example/pr/101","user":{"login":"matan"}}]`)
+			_, _ = fmt.Fprint(writer, `[{"number":101,"title":"mine too","html_url":"https://example/pr/101","user":{"login":"matan"},"head":{"ref":"codex/second"}}]`)
 			return
 		}
 		if page != "1" {
@@ -43,6 +43,7 @@ func TestOpenPullRequestsFiltersAuthors(t *testing.T) {
 			rows[index] = map[string]any{
 				"number": index + 1, "title": "pr", "html_url": fmt.Sprintf("https://example/pr/%d", index+1),
 				"user": map[string]string{"login": login},
+				"head": map[string]any{"ref": "codex/feature"},
 			}
 		}
 		_ = json.NewEncoder(writer).Encode(rows)
@@ -57,6 +58,12 @@ func TestOpenPullRequestsFiltersAuthors(t *testing.T) {
 	}
 	if len(pullRequests) != 2 || pullRequests[0].Number != 1 || pullRequests[1].Number != 101 || requests.Load() != 2 {
 		t.Fatalf("pull requests = %#v", pullRequests)
+	}
+	if pullRequests[0].HeadRef != "codex/feature" {
+		t.Fatalf("first pull request head = %#v", pullRequests[0])
+	}
+	if pullRequests[1].HeadRef != "codex/second" {
+		t.Fatalf("second pull request head = %#v", pullRequests[1])
 	}
 }
 

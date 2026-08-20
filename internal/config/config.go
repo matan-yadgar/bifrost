@@ -2,7 +2,6 @@ package config
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,13 +15,11 @@ const (
 )
 
 type Config struct {
-	PollInterval      string       `json:"poll_interval"`
-	DispatchTimeout   string       `json:"dispatch_timeout"`
-	StateFile         string       `json:"state_file"`
-	MappingDirectory  string       `json:"mapping_directory"`
-	LegacyMappingFile string       `json:"mapping_file,omitempty"`
-	Repositories      []Repository `json:"repositories"`
-	Harness           Harness      `json:"harness"`
+	PollInterval    string       `json:"poll_interval"`
+	DispatchTimeout string       `json:"dispatch_timeout"`
+	StateFile       string       `json:"state_file"`
+	Repositories    []Repository `json:"repositories"`
+	Harness         Harness      `json:"harness"`
 }
 
 type Repository struct {
@@ -38,12 +35,11 @@ type Harness struct {
 }
 
 type Runtime struct {
-	PollInterval     time.Duration
-	DispatchTimeout  time.Duration
-	StateFile        string
-	MappingDirectory string
-	Repositories     []Repository
-	Harness          Harness
+	PollInterval    time.Duration
+	DispatchTimeout time.Duration
+	StateFile       string
+	Repositories    []Repository
+	Harness         Harness
 }
 
 func DefaultPath() (string, error) {
@@ -77,9 +73,6 @@ func Load(path string) (Runtime, error) {
 	}
 
 	baseDirectory := filepath.Dir(path)
-	if strings.TrimSpace(config.LegacyMappingFile) != "" {
-		return Runtime{}, fmt.Errorf("mapping_file was replaced by mapping_directory; migrate each PR mapping to mappings/<owner>/<repo>/<number>.json")
-	}
 	pollInterval, err := positiveDuration("poll_interval", config.PollInterval, defaultPollInterval)
 	if err != nil {
 		return Runtime{}, err
@@ -137,31 +130,16 @@ func Load(path string) (Runtime, error) {
 	if err != nil {
 		return Runtime{}, fmt.Errorf("state_file: %w", err)
 	}
-	mappingDirectory := config.MappingDirectory
-	if strings.TrimSpace(mappingDirectory) == "" {
-		legacyPath := filepath.Join(baseDirectory, "mappings.json")
-		if info, statError := os.Stat(legacyPath); statError == nil && !info.IsDir() {
-			return Runtime{}, fmt.Errorf("legacy mapping file %s exists; migrate it to the mappings directory layout", legacyPath)
-		} else if statError != nil && !errors.Is(statError, os.ErrNotExist) {
-			return Runtime{}, fmt.Errorf("inspect legacy mapping file: %w", statError)
-		}
-		mappingDirectory = "mappings"
-	}
-	mappingDirectory, err = resolvePath(baseDirectory, mappingDirectory)
-	if err != nil {
-		return Runtime{}, fmt.Errorf("mapping_directory: %w", err)
-	}
-	if pathsOverlap(stateFile, path) || pathsOverlap(mappingDirectory, stateFile) || pathsOverlap(mappingDirectory, path) {
-		return Runtime{}, fmt.Errorf("config, state_file, and mapping_directory must use different paths")
+	if pathsOverlap(stateFile, path) {
+		return Runtime{}, fmt.Errorf("config and state_file must use different paths")
 	}
 
 	return Runtime{
-		PollInterval:     pollInterval,
-		DispatchTimeout:  dispatchTimeout,
-		StateFile:        stateFile,
-		MappingDirectory: mappingDirectory,
-		Repositories:     config.Repositories,
-		Harness:          config.Harness,
+		PollInterval:    pollInterval,
+		DispatchTimeout: dispatchTimeout,
+		StateFile:       stateFile,
+		Repositories:    config.Repositories,
+		Harness:         config.Harness,
 	}, nil
 }
 

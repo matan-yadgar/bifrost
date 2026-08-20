@@ -2,10 +2,8 @@ package bridge
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,15 +18,23 @@ import (
 type fakeSource struct {
 	pullRequest          githubapi.PullRequest
 	pullRequests         []githubapi.PullRequest
+	pullRequestsByRepo   map[string][]githubapi.PullRequest
 	threads              []githubapi.ReviewThread
 	threadsByPullRequest map[int][]githubapi.ReviewThread
 	threadErrors         map[int]error
 	openError            error
+	openErrorsByRepo     map[string]error
 }
 
-func (source *fakeSource) OpenPullRequests(context.Context, string, []string) ([]githubapi.PullRequest, error) {
+func (source *fakeSource) OpenPullRequests(_ context.Context, repository string, _ []string) ([]githubapi.PullRequest, error) {
+	if err := source.openErrorsByRepo[repository]; err != nil {
+		return nil, err
+	}
 	if source.openError != nil {
 		return nil, source.openError
+	}
+	if source.pullRequestsByRepo != nil {
+		return source.pullRequestsByRepo[repository], nil
 	}
 	if source.pullRequests != nil {
 		return source.pullRequests, nil
@@ -47,64 +53,94 @@ func (source *fakeSource) ReviewThreads(_ context.Context, pullRequest githubapi
 }
 
 type fakeHarness struct {
-	requests     []harness.Request
-	startedID    string
-	err          error
-	beforeReturn func()
-	dispatch     func(harness.Request) (harness.Result, error)
+	mutex         sync.Mutex
+	name          string
+	requests      []harness.Request
+	targets       []harness.Target
+	discoverCalls int
+	discoveredID  string
+	discoverErr   error
+	discover      func([]harness.Target) ([]harness.Discovery, error)
+	startedID     string
+	err           error
+	dispatch      func(harness.Request) (harness.Result, error)
 }
 
-func newTestMonitor(source Source, agentHarness harness.Harness, repositories []Repository, statePath, mappingDirectory string) *Monitor {
-	return New(source, agentHarness, repositories, statePath, mappingDirectory, time.Minute)
-}
-
-func writeMappings(t *testing.T, directory string, mappings map[string]mapping) {
-	t.Helper()
-	for key, value := range mappings {
-		if err := saveMapping(directory, key, value); err != nil {
-			t.Fatal(err)
+func newTestMonitor(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, routes map[string]route) *Monitor {
+	state, err := loadState(statePath)
+	if err != nil {
+		panic(err)
+	}
+	if len(routes) > 0 {
+		for key, value := range routes {
+			state.Routes[key] = value
+		}
+		if err := saveJSON(statePath, state); err != nil {
+			panic(err)
 		}
 	}
+	return New(source, agentHarness, repositories, statePath, time.Minute)
 }
 
-func readTestMapping(t *testing.T, directory, key string) mapping {
+func readTestRoute(t *testing.T, statePath, key string) route {
 	t.Helper()
-	value, err := loadMapping(directory, key)
+	state, err := loadState(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return value
+	return state.Routes[key]
 }
 
 func (agentHarness *fakeHarness) Name() string {
+	if agentHarness.name != "" {
+		return agentHarness.name
+	}
 	return "codex"
 }
 
+func (agentHarness *fakeHarness) Discover(_ context.Context, targets []harness.Target) ([]harness.Discovery, error) {
+	agentHarness.discoverCalls++
+	agentHarness.targets = append(agentHarness.targets, targets...)
+	if agentHarness.discover != nil {
+		return agentHarness.discover(targets)
+	}
+	discoveries := make([]harness.Discovery, len(targets))
+	for index := range discoveries {
+		if agentHarness.discoverErr != nil {
+			discoveries[index].Err = agentHarness.discoverErr
+		} else if agentHarness.discoveredID != "" {
+			discoveries[index] = harness.Discovery{Session: harness.Session{ID: agentHarness.discoveredID}, Found: true}
+		}
+	}
+	return discoveries, nil
+}
+
 func (agentHarness *fakeHarness) Dispatch(_ context.Context, request harness.Request) (harness.Result, error) {
+	agentHarness.mutex.Lock()
 	agentHarness.requests = append(agentHarness.requests, request)
-	if agentHarness.dispatch != nil {
-		return agentHarness.dispatch(request)
-	}
-	if agentHarness.beforeReturn != nil {
-		agentHarness.beforeReturn()
-	}
-	if request.SessionID != "" {
-		return harness.Result{SessionID: request.SessionID}, agentHarness.err
-	}
-	if agentHarness.startedID == "" {
+	dispatch := agentHarness.dispatch
+	dispatchError := agentHarness.err
+	if request.SessionID == "" && agentHarness.startedID == "" {
 		agentHarness.startedID = "019c0000-0000-7000-8000-000000000010"
 	}
-	return harness.Result{SessionID: agentHarness.startedID}, agentHarness.err
+	startedID := agentHarness.startedID
+	agentHarness.mutex.Unlock()
+	if dispatch != nil {
+		return dispatch(request)
+	}
+	if request.SessionID != "" {
+		return harness.Result{SessionID: request.SessionID}, dispatchError
+	}
+	return harness.Result{SessionID: startedID}, dispatchError
 }
 
 func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
 	statePath := filepath.Join(directory, "state.json")
-	mappingPath := filepath.Join(directory, "mappings.json")
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	source := &fakeSource{
-		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", URL: "https://example/pr/42"},
+		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", URL: "https://example/pr/42", HeadRef: "codex/feature-42"},
 		threads: []githubapi.ReviewThread{
 			{ID: "thread-1", Path: "main.go", Comments: []githubapi.ReviewComment{{
 				ID: "comment-1", Author: "reviewer", Body: "consider this", URL: "https://example/comment/1", CreatedAt: now, UpdatedAt: now,
@@ -115,7 +151,7 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 		},
 	}
 	agentHarness := &fakeHarness{}
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, mappingPath)
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err != nil {
@@ -130,8 +166,11 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 	if !strings.Contains(agentHarness.requests[0].Prompt, "main.go") || !strings.Contains(agentHarness.requests[0].Prompt, "other.go") {
 		t.Fatalf("prompt did not batch both threads: %s", agentHarness.requests[0].Prompt)
 	}
-	if value := readTestMapping(t, mappingPath, "owner/repo#42"); value.SessionID != agentHarness.startedID {
-		t.Fatalf("mapping = %#v", value)
+	if !strings.Contains(agentHarness.requests[0].Prompt, "Head branch: codex/feature-42") {
+		t.Fatalf("prompt did not identify the PR head branch: %s", agentHarness.requests[0].Prompt)
+	}
+	if value := readTestRoute(t, statePath, "owner/repo#42"); value.SessionID != agentHarness.startedID {
+		t.Fatalf("route = %#v", value)
 	}
 
 	result, err = monitor.RunOnce(context.Background())
@@ -146,7 +185,7 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 		t.Fatalf("updated result/error = %#v / %v", result, err)
 	}
 	if agentHarness.requests[1].SessionID != agentHarness.startedID {
-		t.Fatalf("updated thread did not resume mapped session: %#v", agentHarness.requests[1])
+		t.Fatalf("updated thread did not resume cached session: %#v", agentHarness.requests[1])
 	}
 
 	source.threads[0].IsResolved = true
@@ -161,36 +200,291 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 	}
 }
 
+func TestMonitorDiscoversExistingTaskBeforeDispatch(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	const sessionID = "019c0000-0000-7000-8000-000000000019"
+	agentHarness := &fakeHarness{discoveredID: sessionID}
+	statePath := filepath.Join(directory, "state.json")
+	source := reviewSource()
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
+
+	result, err := monitor.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Dispatches != 1 || len(agentHarness.requests) != 1 || agentHarness.requests[0].SessionID != sessionID {
+		t.Fatalf("result/requests = %#v / %#v", result, agentHarness.requests)
+	}
+	if len(agentHarness.targets) != 1 {
+		t.Fatalf("discovery targets = %#v", agentHarness.targets)
+	}
+	target := agentHarness.targets[0]
+	if target.Repository != source.pullRequest.Repository || target.PullRequest != source.pullRequest.Number || target.URL != source.pullRequest.URL || target.HeadRef != source.pullRequest.HeadRef || target.WorkingDirectory != directory {
+		t.Fatalf("discovery target = %#v", target)
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Routes["owner/repo#42"].SessionID != sessionID {
+		t.Fatalf("routes = %#v", state.Routes)
+	}
+}
+
+func TestMonitorDiscoversUnroutedJobsInOneBatch(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const discoveredSessionID = "019c0000-0000-7000-8000-000000000020"
+	const spawnedSessionID = "019c0000-0000-7000-8000-000000000021"
+	discoveryFailure := errors.New("target discovery failed")
+	agentHarness := &fakeHarness{
+		startedID: spawnedSessionID,
+		discover: func(targets []harness.Target) ([]harness.Discovery, error) {
+			if len(targets) != 3 || targets[0].PullRequest != 1 || targets[1].PullRequest != 2 || targets[2].PullRequest != 3 {
+				return nil, fmt.Errorf("unexpected targets: %#v", targets)
+			}
+			return []harness.Discovery{
+				{Session: harness.Session{ID: discoveredSessionID}, Found: true},
+				{},
+				{Err: discoveryFailure},
+			}, nil
+		},
+	}
+	monitor := newTestMonitor(sourceWithPullRequests(3), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
+
+	result, err := monitor.RunOnce(context.Background())
+	if !errors.Is(err, discoveryFailure) || result.Dispatches != 2 {
+		t.Fatalf("result/error = %#v / %v", result, err)
+	}
+	if agentHarness.discoverCalls != 1 || len(agentHarness.targets) != 3 {
+		t.Fatalf("discovery calls/targets = %d / %#v", agentHarness.discoverCalls, agentHarness.targets)
+	}
+	if len(agentHarness.requests) != 2 {
+		t.Fatalf("requests = %#v", agentHarness.requests)
+	}
+	requestedSessions := map[string]bool{}
+	for _, request := range agentHarness.requests {
+		requestedSessions[request.SessionID] = true
+	}
+	if !requestedSessions[discoveredSessionID] || !requestedSessions[""] {
+		t.Fatalf("requests = %#v", agentHarness.requests)
+	}
+	state, loadError := loadState(statePath)
+	if loadError != nil {
+		t.Fatal(loadError)
+	}
+	if state.Routes["owner/repo#1"].SessionID != discoveredSessionID || state.Routes["owner/repo#2"].SessionID != spawnedSessionID || state.Routes["owner/repo#3"].SessionID != "" {
+		t.Fatalf("routes = %#v", state.Routes)
+	}
+	if state.Threads["owner/repo#1"] == nil || state.Threads["owner/repo#2"] == nil || state.Threads["owner/repo#3"] != nil {
+		t.Fatalf("threads = %#v", state.Threads)
+	}
+}
+
+func TestMonitorRotatesPastDeferredDiscoverySuffix(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	firstFailure := errors.New("fatal discovery failure")
+	secondFailure := errors.New("stop after rotation check")
+	discoverCalls := 0
+	agentHarness := &fakeHarness{discover: func(targets []harness.Target) ([]harness.Discovery, error) {
+		discoverCalls++
+		discoveries := make([]harness.Discovery, len(targets))
+		if discoverCalls == 1 {
+			discoveries[0].Err = firstFailure
+			for index := 1; index < len(discoveries); index++ {
+				discoveries[index].Err = fmt.Errorf("%w: reconnect budget exhausted", harness.ErrDiscoveryDeferred)
+			}
+			return discoveries, nil
+		}
+		for index := range discoveries {
+			discoveries[index].Err = secondFailure
+		}
+		return discoveries, nil
+	}}
+	monitor := newTestMonitor(sourceWithPullRequests(6), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), nil)
+
+	if _, err := monitor.RunOnce(context.Background()); !errors.Is(err, harness.ErrDiscoveryDeferred) {
+		t.Fatalf("first discovery error = %v", err)
+	}
+	if _, err := monitor.RunOnce(context.Background()); !errors.Is(err, secondFailure) {
+		t.Fatalf("second discovery error = %v", err)
+	}
+	if len(agentHarness.targets) != 12 || agentHarness.targets[6].PullRequest != 2 {
+		t.Fatalf("discovery order = %#v", agentHarness.targets)
+	}
+}
+
+func TestMonitorReplacesRouteOwnedByAnotherHarness(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const discoveredSessionID = "019c0000-0000-7000-8000-000000000021"
+	agentHarness := &fakeHarness{discoveredID: discoveredSessionID}
+	routes := map[string]route{"owner/repo#42": {Harness: "claude", SessionID: "claude-session"}}
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
+
+	result, err := monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 1 {
+		t.Fatalf("result/error = %#v / %v", result, err)
+	}
+	if len(agentHarness.requests) != 1 || agentHarness.requests[0].SessionID != discoveredSessionID {
+		t.Fatalf("requests = %#v", agentHarness.requests)
+	}
+	if value := readTestRoute(t, statePath, "owner/repo#42"); value.Harness != "codex" || value.SessionID != discoveredSessionID {
+		t.Fatalf("route = %#v", value)
+	}
+}
+
+func TestMonitorLeavesFeedbackPendingWhenDiscoveryIsAmbiguous(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	agentHarness := &fakeHarness{discoverErr: harness.ErrAmbiguousSession}
+	statePath := filepath.Join(directory, "state.json")
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
+
+	result, err := monitor.RunOnce(context.Background())
+	if !errors.Is(err, harness.ErrAmbiguousSession) || result.Dispatches != 0 || len(agentHarness.requests) != 0 {
+		t.Fatalf("result/error/requests = %#v / %v / %#v", result, err, agentHarness.requests)
+	}
+	state, loadError := loadState(statePath)
+	if loadError != nil {
+		t.Fatal(loadError)
+	}
+	if len(state.Threads) != 0 || len(state.Routes) != 0 {
+		t.Fatalf("ambiguous discovery changed delivery state: %#v", state)
+	}
+}
+
+func TestMonitorPrunesClosedPullRequestStateAfterSuccessfulListing(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	openPullRequest := reviewSource().pullRequest
+	openThread := reviewThread("open-thread", time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC))
+	if err := saveJSON(statePath, &stateFile{
+		Version: stateSchemaVersion,
+		Threads: map[string]map[string]string{
+			"owner/repo#42": {openThread.ID: fingerprint(openThread)},
+			"owner/repo#41": {"closed-thread": "fingerprint"},
+		},
+		Routes: map[string]route{
+			"owner/repo#42": {Harness: "codex", SessionID: "open-session"},
+			"owner/repo#41": {Harness: "codex", SessionID: "closed-session"},
+			"other/repo#1":  {Harness: "codex", SessionID: "other-session"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := &fakeSource{pullRequest: openPullRequest, threads: []githubapi.ReviewThread{openThread}}
+	monitor := New(source, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute)
+
+	result, err := monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 0 {
+		t.Fatalf("result/error = %#v / %v", result, err)
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Threads["owner/repo#41"] != nil || state.Routes["owner/repo#41"].SessionID != "" {
+		t.Fatalf("closed PR state remains: %#v", state)
+	}
+	if state.Threads["owner/repo#42"] == nil || state.Routes["owner/repo#42"].SessionID != "open-session" || state.Routes["other/repo#1"].SessionID != "other-session" {
+		t.Fatalf("active or unrelated state was pruned: %#v", state)
+	}
+}
+
+func TestMonitorDoesNotPruneRoutesWhenPullRequestListingFails(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	if err := saveJSON(statePath, &stateFile{
+		Version: stateSchemaVersion,
+		Threads: map[string]map[string]string{"owner/repo#41": {"thread": "fingerprint"}},
+		Routes:  map[string]route{"owner/repo#41": {Harness: "codex", SessionID: "preserved-session"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	monitor := New(&fakeSource{openError: errors.New("temporary failure")}, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute)
+
+	if _, err := monitor.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected listing error")
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Routes["owner/repo#41"].SessionID != "preserved-session" || state.Threads["owner/repo#41"]["thread"] != "fingerprint" {
+		t.Fatalf("state was pruned after failed listing: %#v", state)
+	}
+}
+
+func TestMonitorPrunesSuccessfulRepositoryAndPreservesFailedRepository(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	if err := saveJSON(statePath, &stateFile{
+		Version: stateSchemaVersion,
+		Threads: map[string]map[string]string{
+			"good/repo#1": {"thread": "fingerprint"},
+			"bad/repo#2":  {"thread": "fingerprint"},
+		},
+		Routes: map[string]route{
+			"good/repo#1": {Harness: "codex", SessionID: "good-session"},
+			"bad/repo#2":  {Harness: "codex", SessionID: "bad-session"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := &fakeSource{
+		pullRequestsByRepo: map[string][]githubapi.PullRequest{"Good/Repo": nil},
+		openErrorsByRepo:   map[string]error{"Bad/Repo": errors.New("temporary failure")},
+	}
+	monitor := New(source, &fakeHarness{}, []Repository{
+		{Name: "Good/Repo", WorkingDirectory: directory},
+		{Name: "Bad/Repo", WorkingDirectory: directory},
+	}, statePath, time.Minute)
+
+	if _, err := monitor.RunOnce(context.Background()); err == nil {
+		t.Fatal("expected partial listing error")
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Routes["good/repo#1"].SessionID != "" || state.Threads["good/repo#1"] != nil {
+		t.Fatalf("successfully scanned repository was not pruned: %#v", state)
+	}
+	if state.Routes["bad/repo#2"].SessionID != "bad-session" || state.Threads["bad/repo#2"]["thread"] != "fingerprint" {
+		t.Fatalf("failed repository state was not preserved: %#v", state)
+	}
+}
+
 func TestMonitorPersistsStartedSessionAndRetriesFailedDelivery(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
-	const externalSessionID = "019c0000-0000-7000-8000-000000000012"
+	statePath := filepath.Join(directory, "state.json")
 	source := reviewSource()
 	dispatchError := context.DeadlineExceeded
 	agentHarness := &fakeHarness{
 		startedID: "019c0000-0000-7000-8000-000000000011",
 		err:       dispatchError,
-		beforeReturn: func() {
-			writeMappings(t, mappingPath, map[string]mapping{
-				"owner/other#7": {Harness: "codex", SessionID: externalSessionID},
-			})
-		},
 	}
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err == nil || result.Dispatches != 0 {
 		t.Fatalf("failed result/error = %#v / %v", result, err)
 	}
-	startedMapping := readTestMapping(t, mappingPath, "owner/repo#42")
-	externalMapping := readTestMapping(t, mappingPath, "owner/other#7")
-	if startedMapping.SessionID != agentHarness.startedID || externalMapping.SessionID != externalSessionID {
-		t.Fatalf("mappings = %#v / %#v", startedMapping, externalMapping)
+	startedRoute := readTestRoute(t, statePath, "owner/repo#42")
+	if startedRoute.SessionID != agentHarness.startedID {
+		t.Fatalf("route = %#v", startedRoute)
 	}
 
 	agentHarness.err = nil
-	agentHarness.beforeReturn = nil
 	result, err = monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != 1 {
 		t.Fatalf("retry result/error = %#v / %v", result, err)
@@ -200,15 +494,13 @@ func TestMonitorPersistsStartedSessionAndRetriesFailedDelivery(t *testing.T) {
 	}
 }
 
-func TestMonitorTreatsBlankMappedSessionAsUnmapped(t *testing.T) {
+func TestMonitorTreatsBlankCachedSessionAsUnrouted(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
-	writeMappings(t, mappingPath, map[string]mapping{
-		"OWNER/REPO#42": {Harness: "codex", SessionID: "  "},
-	})
+	statePath := filepath.Join(directory, "state.json")
+	routes := map[string]route{"owner/repo#42": {Harness: "codex", SessionID: "  "}}
 	agentHarness := &fakeHarness{startedID: "019c0000-0000-7000-8000-000000000013"}
-	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
 
 	if _, err := monitor.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
@@ -216,21 +508,21 @@ func TestMonitorTreatsBlankMappedSessionAsUnmapped(t *testing.T) {
 	if len(agentHarness.requests) != 1 || agentHarness.requests[0].SessionID != "" {
 		t.Fatalf("request = %#v", agentHarness.requests)
 	}
-	if value := readTestMapping(t, mappingPath, "owner/repo#42"); value.SessionID != agentHarness.startedID {
-		t.Fatalf("mapping = %#v", value)
+	if value := readTestRoute(t, statePath, "owner/repo#42"); value.SessionID != agentHarness.startedID {
+		t.Fatalf("route = %#v", value)
 	}
 }
 
-func TestMonitorReplacesMissingMappedSession(t *testing.T) {
+func TestMonitorReplacesRediscoveredMissingCachedSession(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
+	statePath := filepath.Join(directory, "state.json")
 	const oldSessionID = "019c0000-0000-7000-8000-000000000014"
 	const newSessionID = "019c0000-0000-7000-8000-000000000015"
-	writeMappings(t, mappingPath, map[string]mapping{
+	routes := map[string]route{
 		"owner/repo#42": {Harness: "codex", SessionID: oldSessionID},
-	})
-	agentHarness := &fakeHarness{dispatch: func(request harness.Request) (harness.Result, error) {
+	}
+	agentHarness := &fakeHarness{discoveredID: oldSessionID, dispatch: func(request harness.Request) (harness.Result, error) {
 		if request.SessionID == oldSessionID {
 			return harness.Result{SessionID: oldSessionID}, harness.ErrSessionNotFound
 		}
@@ -239,22 +531,168 @@ func TestMonitorReplacesMissingMappedSession(t *testing.T) {
 		}
 		return harness.Result{SessionID: newSessionID}, nil
 	}}
-	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
 
 	result, err := monitor.RunOnce(context.Background())
-	if err != nil || result.Dispatches != 1 {
-		t.Fatalf("result/error = %#v / %v", result, err)
+	if !errors.Is(err, harness.ErrSessionNotFound) || result.Dispatches != 0 {
+		t.Fatalf("stale result/error = %#v / %v", result, err)
 	}
-	if len(agentHarness.requests) != 2 || agentHarness.requests[0].SessionID != oldSessionID || agentHarness.requests[1].SessionID != "" {
+	staleRoute := readTestRoute(t, statePath, "owner/repo#42")
+	if len(agentHarness.requests) != 1 || agentHarness.requests[0].SessionID != oldSessionID || staleRoute.SessionID != oldSessionID || !staleRoute.Stale {
 		t.Fatalf("requests = %#v", agentHarness.requests)
 	}
-	if value := readTestMapping(t, mappingPath, "owner/repo#42"); value.SessionID != newSessionID {
-		t.Fatalf("mapping = %#v", value)
+
+	result, err = monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 1 {
+		t.Fatalf("replacement result/error = %#v / %v", result, err)
+	}
+	if len(agentHarness.requests) != 2 || agentHarness.requests[1].SessionID != "" {
+		t.Fatalf("requests = %#v", agentHarness.requests)
+	}
+	if value := readTestRoute(t, statePath, "owner/repo#42"); value.SessionID != newSessionID {
+		t.Fatalf("route = %#v", value)
 	}
 
 	result, err = monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != 0 || len(agentHarness.requests) != 2 {
 		t.Fatalf("unchanged result/error/requests = %#v / %v / %#v", result, err, agentHarness.requests)
+	}
+}
+
+func TestMonitorRediscoversTaskWhenCachedSessionIsStale(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const oldSessionID = "019c0000-0000-7000-8000-000000000016"
+	const rediscoveredSessionID = "019c0000-0000-7000-8000-000000000017"
+	routes := map[string]route{
+		"owner/repo#42": {Harness: "codex", SessionID: oldSessionID},
+	}
+	agentHarness := &fakeHarness{
+		discoveredID: rediscoveredSessionID,
+		dispatch: func(request harness.Request) (harness.Result, error) {
+			if request.SessionID == oldSessionID {
+				return harness.Result{SessionID: oldSessionID}, harness.ErrSessionNotFound
+			}
+			return harness.Result{SessionID: request.SessionID}, nil
+		},
+	}
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
+
+	result, err := monitor.RunOnce(context.Background())
+	if !errors.Is(err, harness.ErrSessionNotFound) || result.Dispatches != 0 {
+		t.Fatalf("stale result/error = %#v / %v", result, err)
+	}
+	if len(agentHarness.requests) != 1 || agentHarness.requests[0].SessionID != oldSessionID {
+		t.Fatalf("requests = %#v", agentHarness.requests)
+	}
+
+	result, err = monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 1 {
+		t.Fatalf("rediscovery result/error = %#v / %v", result, err)
+	}
+	if len(agentHarness.requests) != 2 || agentHarness.requests[1].SessionID != rediscoveredSessionID {
+		t.Fatalf("requests = %#v", agentHarness.requests)
+	}
+	if value := readTestRoute(t, statePath, "owner/repo#42"); value.SessionID != rediscoveredSessionID {
+		t.Fatalf("route = %#v", value)
+	}
+}
+
+func TestMonitorLeavesStaleRouteFeedbackPendingWhenRediscoveryFails(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const staleSessionID = "019c0000-0000-7000-8000-000000000018"
+	routes := map[string]route{"owner/repo#42": {Harness: "codex", SessionID: staleSessionID}}
+	agentHarness := &fakeHarness{
+		discoverErr: harness.ErrAmbiguousSession,
+		dispatch: func(request harness.Request) (harness.Result, error) {
+			return harness.Result{SessionID: request.SessionID}, harness.ErrSessionNotFound
+		},
+	}
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
+
+	result, err := monitor.RunOnce(context.Background())
+	if !errors.Is(err, harness.ErrSessionNotFound) || result.Dispatches != 0 || len(agentHarness.requests) != 1 || agentHarness.discoverCalls != 0 {
+		t.Fatalf("first result/error/requests = %#v / %v / %#v", result, err, agentHarness.requests)
+	}
+	state, loadError := loadState(statePath)
+	if loadError != nil {
+		t.Fatal(loadError)
+	}
+	if current := state.Routes["owner/repo#42"]; current.SessionID != staleSessionID || !current.Stale || len(state.Threads) != 0 {
+		t.Fatalf("failed rediscovery committed state: %#v", state)
+	}
+
+	result, err = monitor.RunOnce(context.Background())
+	if !errors.Is(err, harness.ErrAmbiguousSession) || result.Dispatches != 0 || len(agentHarness.requests) != 1 || agentHarness.discoverCalls != 1 {
+		t.Fatalf("retry result/error/requests/discoveries = %#v / %v / %#v / %d", result, err, agentHarness.requests, agentHarness.discoverCalls)
+	}
+	result, err = monitor.RunOnce(context.Background())
+	if !errors.Is(err, harness.ErrAmbiguousSession) || result.Dispatches != 0 || len(agentHarness.requests) != 1 || agentHarness.discoverCalls != 2 {
+		t.Fatalf("second retry result/error/requests/discoveries = %#v / %v / %#v / %d", result, err, agentHarness.requests, agentHarness.discoverCalls)
+	}
+}
+
+func TestMonitorRetriesStaleRouteAfterBatchDiscoveryFailure(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const staleSessionID = "019c0000-0000-7000-8000-000000000030"
+	const replacementSessionID = "019c0000-0000-7000-8000-000000000031"
+	discoveryUnavailable := errors.New("discovery unavailable")
+	replacementFailed := errors.New("replacement failed")
+	unavailable := true
+	spawnFails := true
+	agentHarness := &fakeHarness{
+		discover: func(targets []harness.Target) ([]harness.Discovery, error) {
+			if unavailable {
+				return nil, discoveryUnavailable
+			}
+			return make([]harness.Discovery, len(targets)), nil
+		},
+		dispatch: func(request harness.Request) (harness.Result, error) {
+			if request.SessionID == staleSessionID {
+				return harness.Result{SessionID: staleSessionID}, harness.ErrSessionNotFound
+			}
+			if spawnFails {
+				return harness.Result{}, replacementFailed
+			}
+			return harness.Result{SessionID: replacementSessionID}, nil
+		},
+	}
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, map[string]route{
+		"owner/repo#42": {Harness: "codex", SessionID: staleSessionID},
+	})
+
+	if result, err := monitor.RunOnce(context.Background()); !errors.Is(err, harness.ErrSessionNotFound) || result.Dispatches != 0 {
+		t.Fatalf("stale result/error = %#v / %v", result, err)
+	}
+	if result, err := monitor.RunOnce(context.Background()); !errors.Is(err, discoveryUnavailable) || result.Dispatches != 0 {
+		t.Fatalf("unavailable result/error = %#v / %v", result, err)
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current := state.Routes["owner/repo#42"]; current.SessionID != staleSessionID || !current.Stale || state.Threads["owner/repo#42"] != nil {
+		t.Fatalf("pending stale state = %#v", state)
+	}
+
+	unavailable = false
+	if result, err := monitor.RunOnce(context.Background()); !errors.Is(err, replacementFailed) || result.Dispatches != 0 {
+		t.Fatalf("failed replacement result/error = %#v / %v", result, err)
+	}
+	if current := readTestRoute(t, statePath, "owner/repo#42"); current.SessionID != staleSessionID || !current.Stale {
+		t.Fatalf("stale route was lost after failed replacement: %#v", current)
+	}
+	spawnFails = false
+	if result, err := monitor.RunOnce(context.Background()); err != nil || result.Dispatches != 1 {
+		t.Fatalf("recovery result/error = %#v / %v", result, err)
+	}
+	if current := readTestRoute(t, statePath, "owner/repo#42"); current.SessionID != replacementSessionID || current.Stale {
+		t.Fatalf("replacement route = %#v", current)
 	}
 }
 
@@ -264,7 +702,7 @@ func TestMonitorDoesNotCommitDeliveryWithoutSessionID(t *testing.T) {
 	agentHarness := &fakeHarness{dispatch: func(harness.Request) (harness.Result, error) {
 		return harness.Result{}, nil
 	}}
-	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), filepath.Join(directory, "mappings"))
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), nil)
 
 	if result, err := monitor.RunOnce(context.Background()); err == nil || result.Dispatches != 0 {
 		t.Fatalf("result/error = %#v / %v", result, err)
@@ -286,6 +724,10 @@ type blockingHarness struct {
 
 func (agentHarness *blockingHarness) Name() string {
 	return "codex"
+}
+
+func (agentHarness *blockingHarness) Discover(_ context.Context, targets []harness.Target) ([]harness.Discovery, error) {
+	return make([]harness.Discovery, len(targets)), nil
 }
 
 func (agentHarness *blockingHarness) Dispatch(ctx context.Context, request harness.Request) (harness.Result, error) {
@@ -325,16 +767,15 @@ func (agentHarness *blockingHarness) Dispatch(ctx context.Context, request harne
 func TestDispatchQueueRunsDifferentSessionsInParallelAndSerializesOneSession(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
 	const sharedSessionID = "019c0000-0000-7000-8000-000000000020"
 	const otherSessionID = "019c0000-0000-7000-8000-000000000021"
 	const thirdSessionID = "019c0000-0000-7000-8000-000000000022"
-	writeMappings(t, mappingPath, map[string]mapping{
+	routes := map[string]route{
 		"owner/repo#1": {Harness: "codex", SessionID: sharedSessionID},
 		"owner/repo#2": {Harness: "codex", SessionID: sharedSessionID},
 		"owner/repo#3": {Harness: "codex", SessionID: otherSessionID},
 		"owner/repo#4": {Harness: "codex", SessionID: thirdSessionID},
-	})
+	}
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	source := &fakeSource{
 		pullRequests: []githubapi.PullRequest{
@@ -351,7 +792,7 @@ func TestDispatchQueueRunsDifferentSessionsInParallelAndSerializesOneSession(t *
 		},
 	}
 	agentHarness := &blockingHarness{started: make(chan string, 4), release: make(chan struct{}, 4)}
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), routes)
 	type runResult struct {
 		result CycleResult
 		err    error
@@ -409,16 +850,14 @@ func TestDispatchQueueRunsDifferentSessionsInParallelAndSerializesOneSession(t *
 func TestDispatchQueueCancellationLeavesJobsUndelivered(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
-	mappings := make(map[string]mapping)
+	routes := make(map[string]route)
 	for number := 1; number <= 5; number++ {
-		mappings[fmt.Sprintf("owner/repo#%d", number)] = mapping{Harness: "codex", SessionID: fmt.Sprintf("session-%d", number)}
+		routes[fmt.Sprintf("owner/repo#%d", number)] = route{Harness: "codex", SessionID: fmt.Sprintf("session-%d", number)}
 	}
-	writeMappings(t, mappingPath, mappings)
 	source := sourceWithPullRequests(5)
 	agentHarness := &blockingHarness{started: make(chan string, 5), release: make(chan struct{})}
 	statePath := filepath.Join(directory, "state.json")
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, mappingPath)
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -459,6 +898,10 @@ func (agentHarness *timeoutHarness) Name() string {
 	return "codex"
 }
 
+func (agentHarness *timeoutHarness) Discover(_ context.Context, targets []harness.Target) ([]harness.Discovery, error) {
+	return make([]harness.Discovery, len(targets)), nil
+}
+
 func (agentHarness *timeoutHarness) Dispatch(ctx context.Context, _ harness.Request) (harness.Result, error) {
 	deadline, found := ctx.Deadline()
 	if !found {
@@ -472,10 +915,10 @@ func (agentHarness *timeoutHarness) Dispatch(ctx context.Context, _ harness.Requ
 func TestDispatchTimeoutPreservesSessionAndLeavesFeedbackPending(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingDirectory := filepath.Join(directory, "mappings")
 	const dispatchTimeout = 250 * time.Millisecond
 	agentHarness := &timeoutHarness{sessionID: "started-session", deadline: make(chan timeoutObservation, 1)}
-	monitor := New(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingDirectory, dispatchTimeout)
+	statePath := filepath.Join(directory, "state.json")
+	monitor := New(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, dispatchTimeout)
 	type cycleOutcome struct {
 		result CycleResult
 		err    error
@@ -504,8 +947,8 @@ func TestDispatchTimeoutPreservesSessionAndLeavesFeedbackPending(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) || result.Dispatches != 0 {
 		t.Fatalf("result/error = %#v / %v", result, err)
 	}
-	if value := readTestMapping(t, mappingDirectory, "owner/repo#42"); value.SessionID != agentHarness.sessionID {
-		t.Fatalf("mapping = %#v", value)
+	if value := readTestRoute(t, statePath, "owner/repo#42"); value.SessionID != agentHarness.sessionID {
+		t.Fatalf("route = %#v", value)
 	}
 	state, err := loadState(filepath.Join(directory, "state.json"))
 	if err != nil {
@@ -513,56 +956,6 @@ func TestDispatchTimeoutPreservesSessionAndLeavesFeedbackPending(t *testing.T) {
 	}
 	if len(state.Threads) != 0 {
 		t.Fatalf("timed-out feedback was committed: %#v", state.Threads)
-	}
-}
-
-func TestQueuedJobUsesLatestMappingBeforeDispatch(t *testing.T) {
-	t.Parallel()
-	for _, testCase := range []struct {
-		name             string
-		initialSessionID string
-	}{
-		{name: "mapping added"},
-		{name: "mapping replaced", initialSessionID: "old-session"},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			directory := t.TempDir()
-			mappingPath := filepath.Join(directory, "mappings.json")
-			mappings := map[string]mapping{
-				"owner/repo#1": {Harness: "codex", SessionID: "session-1"},
-				"owner/repo#2": {Harness: "codex", SessionID: "session-2"},
-			}
-			if testCase.initialSessionID != "" {
-				mappings["owner/repo#3"] = mapping{Harness: "codex", SessionID: testCase.initialSessionID}
-			}
-			writeMappings(t, mappingPath, mappings)
-			agentHarness := &blockingHarness{started: make(chan string, 3), release: make(chan struct{}, 3)}
-			monitor := newTestMonitor(sourceWithPullRequests(3), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
-			done := make(chan error, 1)
-			go func() {
-				_, err := monitor.RunOnce(context.Background())
-				done <- err
-			}()
-			receiveStartedSession(t, agentHarness.started)
-			receiveStartedSession(t, agentHarness.started)
-			if err := saveMapping(mappingPath, "owner/repo#3", mapping{Harness: "codex", SessionID: "session-3"}); err != nil {
-				t.Fatal(err)
-			}
-			agentHarness.release <- struct{}{}
-			if sessionID := receiveStartedSession(t, agentHarness.started); sessionID != "session-3" {
-				t.Fatalf("queued dispatch used session %q", sessionID)
-			}
-			agentHarness.release <- struct{}{}
-			agentHarness.release <- struct{}{}
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for mapped queued dispatch")
-			}
-		})
 	}
 }
 
@@ -576,6 +969,10 @@ func (agentHarness *selectiveHarness) Name() string {
 	return "codex"
 }
 
+func (agentHarness *selectiveHarness) Discover(_ context.Context, targets []harness.Target) ([]harness.Discovery, error) {
+	return make([]harness.Discovery, len(targets)), nil
+}
+
 func (agentHarness *selectiveHarness) Dispatch(_ context.Context, request harness.Request) (harness.Result, error) {
 	agentHarness.mutex.Lock()
 	defer agentHarness.mutex.Unlock()
@@ -586,14 +983,13 @@ func (agentHarness *selectiveHarness) Dispatch(_ context.Context, request harnes
 func TestDispatchQueueCommitsOnlySuccessfulJobs(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
-	writeMappings(t, mappingPath, map[string]mapping{
+	routes := map[string]route{
 		"owner/repo#1": {Harness: "codex", SessionID: "session-success"},
 		"owner/repo#2": {Harness: "codex", SessionID: "session-failure"},
-	})
+	}
 	agentHarness := &selectiveHarness{errors: map[string]error{"session-failure": context.DeadlineExceeded}}
 	statePath := filepath.Join(directory, "state.json")
-	monitor := newTestMonitor(sourceWithPullRequests(2), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, mappingPath)
+	monitor := newTestMonitor(sourceWithPullRequests(2), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err == nil || result.Dispatches != 1 {
@@ -623,16 +1019,15 @@ func TestDispatchQueueCommitsOnlySuccessfulJobs(t *testing.T) {
 func TestPerPullRequestSourceFailureDoesNotBlockHealthyDispatch(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
-	writeMappings(t, mappingPath, map[string]mapping{
+	routes := map[string]route{
 		"owner/repo#1": {Harness: "codex", SessionID: "session-1"},
 		"owner/repo#2": {Harness: "codex", SessionID: "session-2"},
-	})
+	}
 	source := sourceWithPullRequests(2)
 	source.threadErrors = map[int]error{1: errors.New("temporary thread failure")}
 	agentHarness := &selectiveHarness{errors: make(map[string]error)}
 	statePath := filepath.Join(directory, "state.json")
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, mappingPath)
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err == nil || result.Dispatches != 1 {
@@ -672,6 +1067,10 @@ func (agentHarness *staleSessionHarness) Name() string {
 	return "codex"
 }
 
+func (agentHarness *staleSessionHarness) Discover(_ context.Context, targets []harness.Target) ([]harness.Discovery, error) {
+	return make([]harness.Discovery, len(targets)), nil
+}
+
 func (agentHarness *staleSessionHarness) Dispatch(_ context.Context, request harness.Request) (harness.Result, error) {
 	if request.SessionID != "" {
 		agentHarness.resumeStarted <- struct{}{}
@@ -697,16 +1096,15 @@ func (agentHarness *staleSessionHarness) Dispatch(_ context.Context, request har
 func TestStaleSessionsStartSeriallyInOneWorkingDirectory(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
-	writeMappings(t, mappingPath, map[string]mapping{
+	routes := map[string]route{
 		"owner/repo#1": {Harness: "codex", SessionID: "stale-1"},
 		"owner/repo#2": {Harness: "codex", SessionID: "stale-2"},
-	})
+	}
 	agentHarness := &staleSessionHarness{
 		resumeStarted: make(chan struct{}, 2), resumeRelease: make(chan struct{}),
 		spawnStarted: make(chan struct{}, 2), spawnRelease: make(chan struct{}, 2),
 	}
-	monitor := newTestMonitor(sourceWithPullRequests(2), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+	monitor := newTestMonitor(sourceWithPullRequests(2), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), routes)
 	done := make(chan error, 1)
 	go func() {
 		_, err := monitor.RunOnce(context.Background())
@@ -720,6 +1118,18 @@ func TestStaleSessionsStartSeriallyInOneWorkingDirectory(t *testing.T) {
 		}
 	}
 	close(agentHarness.resumeRelease)
+	select {
+	case err := <-done:
+		if !errors.Is(err, harness.ErrSessionNotFound) {
+			t.Fatalf("stale-route error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out clearing stale routes")
+	}
+	go func() {
+		_, err := monitor.RunOnce(context.Background())
+		done <- err
+	}()
 	select {
 	case <-agentHarness.spawnStarted:
 	case <-time.After(2 * time.Second):
@@ -750,21 +1160,19 @@ func TestStaleSessionsStartSeriallyInOneWorkingDirectory(t *testing.T) {
 func TestDispatchQueueDefersJobsBeyondCapacity(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	mappingPath := filepath.Join(directory, "mappings.json")
 	const expectedPendingLimit = 100
 	const pullRequestCount = 101
 	source := sourceWithPullRequests(pullRequestCount)
-	mappings := make(map[string]mapping, pullRequestCount)
+	routes := make(map[string]route, pullRequestCount)
 	for number := 1; number <= pullRequestCount; number++ {
-		mappings[fmt.Sprintf("owner/repo#%d", number)] = mapping{Harness: "codex", SessionID: fmt.Sprintf("session-%d", number)}
+		routes[fmt.Sprintf("owner/repo#%d", number)] = route{Harness: "codex", SessionID: fmt.Sprintf("session-%d", number)}
 	}
-	writeMappings(t, mappingPath, mappings)
 	dispatchErrors := make(map[string]error, expectedPendingLimit)
 	for number := 1; number <= expectedPendingLimit; number++ {
 		dispatchErrors[fmt.Sprintf("session-%d", number)] = context.DeadlineExceeded
 	}
 	agentHarness := &selectiveHarness{errors: dispatchErrors}
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), routes)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err == nil || result.Dispatches != 0 || result.Deferred != 1 {
@@ -805,14 +1213,12 @@ func TestDispatchQueueWrapsWhenBacklogShrinksBelowCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	const pullRequestCount = 50
-	mappingPath := filepath.Join(directory, "mappings.json")
-	mappings := make(map[string]mapping, pullRequestCount)
+	routes := make(map[string]route, pullRequestCount)
 	for number := 1; number <= pullRequestCount; number++ {
-		mappings[fmt.Sprintf("owner/repo#%d", number)] = mapping{Harness: "codex", SessionID: fmt.Sprintf("session-%d", number)}
+		routes[fmt.Sprintf("owner/repo#%d", number)] = route{Harness: "codex", SessionID: fmt.Sprintf("session-%d", number)}
 	}
-	writeMappings(t, mappingPath, mappings)
 	agentHarness := &selectiveHarness{errors: make(map[string]error)}
-	monitor := newTestMonitor(sourceWithPullRequests(pullRequestCount), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, mappingPath)
+	monitor := newTestMonitor(sourceWithPullRequests(pullRequestCount), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, routes)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != pullRequestCount || result.Deferred != 0 {
@@ -825,12 +1231,11 @@ func TestDispatchQueueCoalescesDuplicatePullRequests(t *testing.T) {
 	directory := t.TempDir()
 	source := sourceWithPullRequests(1)
 	source.pullRequests = append(source.pullRequests, source.pullRequests[0])
-	mappingPath := filepath.Join(directory, "mappings.json")
-	writeMappings(t, mappingPath, map[string]mapping{
+	routes := map[string]route{
 		"owner/repo#1": {Harness: "codex", SessionID: "session-1"},
-	})
+	}
 	agentHarness := &selectiveHarness{errors: make(map[string]error)}
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), mappingPath)
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), routes)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != 1 {
@@ -840,31 +1245,6 @@ func TestDispatchQueueCoalescesDuplicatePullRequests(t *testing.T) {
 	defer agentHarness.mutex.Unlock()
 	if len(agentHarness.requests) != 1 {
 		t.Fatalf("requests = %#v", agentHarness.requests)
-	}
-}
-
-func TestMappingPathIsCaseInsensitiveAndRejectsTraversal(t *testing.T) {
-	t.Parallel()
-	directory := t.TempDir()
-	if err := saveMapping(directory, "Owner/Repo#1", mapping{Harness: "codex", SessionID: "session-1"}); err != nil {
-		t.Fatal(err)
-	}
-	if value := readTestMapping(t, directory, "owner/repo#1"); value.SessionID != "session-1" {
-		t.Fatalf("mapping = %#v", value)
-	}
-	firstPath, err := mappingPath(directory, "owner/repo#1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondPath, err := mappingPath(directory, "owner/other#1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if firstPath == secondPath {
-		t.Fatalf("different PRs share mapping path %q", firstPath)
-	}
-	if _, err := mappingPath(directory, "../repo#1"); err == nil {
-		t.Fatal("expected invalid key error")
 	}
 }
 
@@ -903,7 +1283,7 @@ func TestOmittedThreadsRemainPending(t *testing.T) {
 	}
 	agentHarness := &fakeHarness{}
 	statePath := filepath.Join(directory, "state.json")
-	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, filepath.Join(directory, "mappings"))
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
 
 	if result, err := monitor.RunOnce(context.Background()); err != nil || result.Dispatches != 1 || result.DeferredThreads == 0 {
 		t.Fatalf("first result/error = %#v / %v", result, err)
@@ -947,7 +1327,7 @@ func sourceWithPullRequests(count int) *fakeSource {
 	}
 	for number := 1; number <= count; number++ {
 		source.pullRequests = append(source.pullRequests, githubapi.PullRequest{
-			Repository: "Owner/Repo", Number: number, URL: fmt.Sprintf("https://example/pr/%d", number),
+			Repository: "Owner/Repo", Number: number, URL: fmt.Sprintf("https://example/pr/%d", number), HeadRef: fmt.Sprintf("codex/feature-%d", number),
 		})
 		source.threadsByPullRequest[number] = []githubapi.ReviewThread{reviewThread(fmt.Sprintf("thread-%d", number), now)}
 	}
@@ -966,19 +1346,7 @@ func reviewThread(id string, now time.Time) githubapi.ReviewThread {
 func reviewSource() *fakeSource {
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	return &fakeSource{
-		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", URL: "https://example/pr/42"},
+		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", URL: "https://example/pr/42", HeadRef: "codex/feature-42"},
 		threads:     []githubapi.ReviewThread{reviewThread("thread-1", now)},
-	}
-}
-
-func readJSON(t *testing.T, path string, output any) {
-	t.Helper()
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	if err := json.NewDecoder(file).Decode(output); err != nil {
-		t.Fatal(err)
 	}
 }
