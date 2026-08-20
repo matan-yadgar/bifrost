@@ -202,7 +202,7 @@ func runAppServerHelper(mode string) {
 	os.Exit(0)
 }
 
-func TestAppServerDiscoveryIntersectsURLAndBranchAcrossPages(t *testing.T) {
+func TestAppServerDiscoveryUsesURLCandidatesAcrossPages(t *testing.T) {
 	t.Parallel()
 	const creatorSessionID = "019c0000-0000-7000-8000-000000000001"
 	const reviewerSessionID = "019c0000-0000-7000-8000-000000000002"
@@ -211,9 +211,8 @@ func TestAppServerDiscoveryIntersectsURLAndBranchAcrossPages(t *testing.T) {
 			rpcResult(2, searchResult([]string{reviewerSessionID}, "next")) +
 			rpcResult(3, searchResult(nil, "")) +
 			rpcResult(4, searchResult([]string{creatorSessionID}, "")) +
-			rpcResult(5, searchResult(nil, "")) +
-			rpcResult(6, searchResult([]string{creatorSessionID}, "")) +
-			rpcResult(7, threadFullTurnsResultJSON("turn-1", "created https://github.com/owner/repo/pull/42 from codex/feature-42", stringPointer(finalAssistantMessage))),
+			rpcResult(5, threadFullTurnsResultJSON("turn-1", "created https://github.com/owner/repo/pull/42 from codex/feature-42", stringPointer(finalAssistantMessage))) +
+			rpcResult(6, threadFullTurnsResultJSON("turn-2", "reviewed https://github.com/owner/repo/pull/42", stringPointer(finalAssistantMessage))),
 	)
 	var requests bytes.Buffer
 	client := newAppServerClient(responses, &requests)
@@ -221,7 +220,7 @@ func TestAppServerDiscoveryIntersectsURLAndBranchAcrossPages(t *testing.T) {
 	if err := client.initialize(); err != nil {
 		t.Fatal(err)
 	}
-	discovery := client.discover("https://github.com/owner/repo/pull/42", "codex/feature-42")
+	discovery := client.discover(Target{URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42"})
 	if discovery.Err != nil {
 		t.Fatal(discovery.Err)
 	}
@@ -229,10 +228,10 @@ func TestAppServerDiscoveryIntersectsURLAndBranchAcrossPages(t *testing.T) {
 		t.Fatalf("discovery = %#v", discovery)
 	}
 	emitted := decodeAppServerRequests(t, requests.Bytes())
-	if len(emitted) != 8 {
+	if len(emitted) != 7 {
 		t.Fatalf("request count = %d: %#v", len(emitted), emitted)
 	}
-	wantMethods := []string{"initialize", "initialized", "thread/search", "thread/search", "thread/search", "thread/search", "thread/search", "thread/turns/list"}
+	wantMethods := []string{"initialize", "initialized", "thread/search", "thread/search", "thread/search", "thread/turns/list", "thread/turns/list"}
 	for index, method := range wantMethods {
 		if emitted[index].Method != method {
 			t.Fatalf("request %d method = %q", index, emitted[index].Method)
@@ -241,25 +240,54 @@ func TestAppServerDiscoveryIntersectsURLAndBranchAcrossPages(t *testing.T) {
 	assertExactProtocolRequests(t, emitted, creatorSessionID)
 }
 
-func TestAppServerDiscoveryRejectsAmbiguousIntersection(t *testing.T) {
+func TestAppServerDiscoveryRejectsAmbiguousURLCandidates(t *testing.T) {
 	t.Parallel()
 	const firstSessionID = "019c0000-0000-7000-8000-000000000001"
 	const secondSessionID = "019c0000-0000-7000-8000-000000000002"
-	sessions := []string{firstSessionID, secondSessionID}
+	const unreadableSessionID = "019c0000-0000-7000-8000-000000000003"
+	sessions := []string{firstSessionID, secondSessionID, unreadableSessionID}
 	responses := strings.NewReader(
 		rpcResult(1, `{}`) +
 			rpcResult(2, searchResult(sessions, "")) + rpcResult(3, searchResult(nil, "")) +
-			rpcResult(4, searchResult(sessions, "")) + rpcResult(5, searchResult(nil, "")) +
-			rpcResult(6, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))) +
-			rpcResult(7, threadFullTurnsResultJSON("turn-2", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
+			rpcResult(4, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))) +
+			rpcResult(5, threadFullTurnsResultJSON("turn-2", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
 	)
 	client := newAppServerClient(responses, &bytes.Buffer{})
 	if err := client.initialize(); err != nil {
 		t.Fatal(err)
 	}
-	discovery := client.discover("https://github.com/owner/repo/pull/42", "codex/feature-42")
+	discovery := client.discover(Target{URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42"})
 	if !errors.Is(discovery.Err, ErrAmbiguousSession) {
 		t.Fatalf("error = %v", discovery.Err)
+	}
+}
+
+func TestAppServerDiscoveryExcludesKnownStaleSessionBeforeAmbiguity(t *testing.T) {
+	t.Parallel()
+	const olderStaleSessionID = "019c0000-0000-7000-8000-000000000000"
+	const staleSessionID = "019c0000-0000-7000-8000-000000000001"
+	const replacementSessionID = "019c0000-0000-7000-8000-000000000002"
+	responses := strings.NewReader(
+		rpcResult(1, `{}`) +
+			rpcResult(2, searchResult([]string{olderStaleSessionID, staleSessionID, replacementSessionID}, "")) +
+			rpcResult(3, searchResult(nil, "")) +
+			rpcResult(4, threadFullTurnsResultJSON("turn-2", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
+	)
+	var requests bytes.Buffer
+	client := newAppServerClient(responses, &requests)
+	if err := client.initialize(); err != nil {
+		t.Fatal(err)
+	}
+	discovery := client.discover(Target{
+		URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42",
+		ExcludedSessionIDs: []string{olderStaleSessionID, staleSessionID},
+	})
+	if discovery.Err != nil || !discovery.Found || discovery.Session.ID != replacementSessionID {
+		t.Fatalf("discovery = %#v", discovery)
+	}
+	emitted := decodeAppServerRequests(t, requests.Bytes())
+	if len(emitted) != 5 || emitted[4].Params["threadId"] != replacementSessionID {
+		t.Fatalf("requests = %#v", emitted)
 	}
 }
 
@@ -274,14 +302,13 @@ func TestAppServerDiscoveryRequiresOneFinalResponseWithBothIdentifiers(t *testin
 	responses := strings.NewReader(
 		rpcResult(1, `{}`) +
 			rpcResult(2, searchResult([]string{sessionID}, "")) + rpcResult(3, searchResult(nil, "")) +
-			rpcResult(4, searchResult([]string{sessionID}, "")) + rpcResult(5, searchResult(nil, "")) +
-			rpcResult(6, turnsResult),
+			rpcResult(4, turnsResult),
 	)
 	client := newAppServerClient(responses, &bytes.Buffer{})
 	if err := client.initialize(); err != nil {
 		t.Fatal(err)
 	}
-	discovery := client.discover("https://github.com/owner/repo/pull/42", "codex/feature-42")
+	discovery := client.discover(Target{URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42"})
 	if discovery.Err != nil || discovery.Found {
 		t.Fatalf("discovery = %#v", discovery)
 	}
@@ -422,8 +449,6 @@ func assertExactProtocolRequests(t *testing.T, requests []appServerRequest, crea
 		{term: "https://github.com/owner/repo/pull/42", archived: false},
 		{term: "https://github.com/owner/repo/pull/42", archived: false, cursor: "next"},
 		{term: "https://github.com/owner/repo/pull/42", archived: true},
-		{term: "codex/feature-42", archived: false},
-		{term: "codex/feature-42", archived: true},
 	}
 	wantSources := make([]any, len(codexTaskSources))
 	for index, source := range codexTaskSources {
@@ -439,7 +464,7 @@ func assertExactProtocolRequests(t *testing.T, requests []appServerRequest, crea
 			t.Fatalf("search request %d cursor = %#v", index, cursor)
 		}
 	}
-	turnsParams := requests[7].Params
+	turnsParams := requests[5].Params
 	if turnsParams["threadId"] != creatorSessionID || turnsParams["limit"] != float64(threadTurnsPageSize) || turnsParams["sortDirection"] != "desc" || turnsParams["itemsView"] != "full" {
 		t.Fatalf("turns request = %#v", turnsParams)
 	}

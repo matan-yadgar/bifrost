@@ -283,6 +283,196 @@ func TestMonitorDiscoversUnroutedJobsInOneBatch(t *testing.T) {
 	}
 }
 
+func TestMonitorCheckpointsCompletedDispatchBeforeQueueDrains(t *testing.T) {
+	t.Parallel()
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	firstDirectory := t.TempDir()
+	secondDirectory := t.TempDir()
+	firstPullRequest := githubapi.PullRequest{
+		Repository: "Owner/First", Number: 1, Title: "First", URL: "https://github.com/owner/first/pull/1", HeadRef: "codex/first",
+	}
+	secondPullRequest := githubapi.PullRequest{
+		Repository: "Owner/Second", Number: 2, Title: "Second", URL: "https://github.com/owner/second/pull/2", HeadRef: "codex/second",
+	}
+	firstThread := reviewThread("first-thread", time.Now())
+	secondThread := reviewThread("second-thread", time.Now())
+	source := &fakeSource{
+		pullRequestsByRepo: map[string][]githubapi.PullRequest{
+			"Owner/First":  {firstPullRequest},
+			"Owner/Second": {secondPullRequest},
+		},
+		threadsByPullRequest: map[int][]githubapi.ReviewThread{
+			1: {firstThread},
+			2: {secondThread},
+		},
+	}
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseSecond) }) })
+	agentHarness := &fakeHarness{dispatch: func(request harness.Request) (harness.Result, error) {
+		if strings.Contains(request.Prompt, firstPullRequest.URL) {
+			return harness.Result{SessionID: "first-session"}, nil
+		}
+		close(secondStarted)
+		<-releaseSecond
+		return harness.Result{SessionID: "second-session"}, nil
+	}}
+	monitor := newTestMonitor(source, agentHarness, []Repository{
+		{Name: "Owner/First", WorkingDirectory: firstDirectory},
+		{Name: "Owner/Second", WorkingDirectory: secondDirectory},
+	}, statePath, nil)
+	done := make(chan struct {
+		result CycleResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := monitor.RunOnce(context.Background())
+		done <- struct {
+			result CycleResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the second dispatch")
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		state, err := loadState(statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Routes["owner/first#1"].SessionID == "first-session" && state.Threads["owner/first#1"][firstThread.ID] == fingerprint(firstThread) {
+			if state.Routes["owner/second#2"].SessionID != "" || state.Threads["owner/second#2"] != nil {
+				t.Fatalf("blocked dispatch was checkpointed: %#v", state)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("completed dispatch was not checkpointed while the queue was blocked")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	releaseOnce.Do(func() { close(releaseSecond) })
+	select {
+	case outcome := <-done:
+		if outcome.err != nil || outcome.result.Dispatches != 2 {
+			t.Fatalf("result/error = %#v / %v", outcome.result, outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the queue to drain")
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Routes["owner/second#2"].SessionID != "second-session" || state.Threads["owner/second#2"][secondThread.ID] != fingerprint(secondThread) {
+		t.Fatalf("final state = %#v", state)
+	}
+}
+
+func TestMonitorCheckpointsStaleRouteBeforeQueueDrains(t *testing.T) {
+	t.Parallel()
+	const staleSessionID = "019c0000-0000-7000-8000-000000000040"
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	firstDirectory := t.TempDir()
+	secondDirectory := t.TempDir()
+	firstPullRequest := githubapi.PullRequest{
+		Repository: "Owner/First", Number: 1, Title: "First", URL: "https://github.com/owner/first/pull/1", HeadRef: "codex/first",
+	}
+	secondPullRequest := githubapi.PullRequest{
+		Repository: "Owner/Second", Number: 2, Title: "Second", URL: "https://github.com/owner/second/pull/2", HeadRef: "codex/second",
+	}
+	firstThread := reviewThread("first-thread", time.Now())
+	secondThread := reviewThread("second-thread", time.Now())
+	source := &fakeSource{
+		pullRequestsByRepo: map[string][]githubapi.PullRequest{
+			"Owner/First":  {firstPullRequest},
+			"Owner/Second": {secondPullRequest},
+		},
+		threadsByPullRequest: map[int][]githubapi.ReviewThread{
+			1: {firstThread},
+			2: {secondThread},
+		},
+	}
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseSecond) }) })
+	agentHarness := &fakeHarness{dispatch: func(request harness.Request) (harness.Result, error) {
+		if request.SessionID == staleSessionID {
+			return harness.Result{SessionID: staleSessionID}, harness.ErrSessionNotFound
+		}
+		close(secondStarted)
+		<-releaseSecond
+		return harness.Result{SessionID: "second-session"}, nil
+	}}
+	monitor := newTestMonitor(source, agentHarness, []Repository{
+		{Name: "Owner/First", WorkingDirectory: firstDirectory},
+		{Name: "Owner/Second", WorkingDirectory: secondDirectory},
+	}, statePath, map[string]route{
+		"owner/first#1": {Harness: "codex", SessionID: staleSessionID},
+	})
+	done := make(chan struct {
+		result CycleResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := monitor.RunOnce(context.Background())
+		done <- struct {
+			result CycleResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the second dispatch")
+	}
+	deadline := time.After(2 * time.Second)
+	for {
+		state, err := loadState(statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstRoute := state.Routes["owner/first#1"]
+		if firstRoute.SessionID == staleSessionID && firstRoute.Stale {
+			if state.Threads["owner/first#1"] != nil || state.Routes["owner/second#2"].SessionID != "" {
+				t.Fatalf("pending dispatch state = %#v", state)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("stale route was not checkpointed while the queue was blocked")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	releaseOnce.Do(func() { close(releaseSecond) })
+	select {
+	case outcome := <-done:
+		if !errors.Is(outcome.err, harness.ErrSessionNotFound) || outcome.result.Dispatches != 1 {
+			t.Fatalf("result/error = %#v / %v", outcome.result, outcome.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the queue to drain")
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Routes["owner/second#2"].SessionID != "second-session" || state.Threads["owner/second#2"][secondThread.ID] != fingerprint(secondThread) {
+		t.Fatalf("final state = %#v", state)
+	}
+}
+
 func TestMonitorRotatesPastDeferredDiscoverySuffix(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
@@ -569,7 +759,12 @@ func TestMonitorRediscoversTaskWhenCachedSessionIsStale(t *testing.T) {
 		"owner/repo#42": {Harness: "codex", SessionID: oldSessionID},
 	}
 	agentHarness := &fakeHarness{
-		discoveredID: rediscoveredSessionID,
+		discover: func(targets []harness.Target) ([]harness.Discovery, error) {
+			if len(targets) != 1 || len(targets[0].ExcludedSessionIDs) != 1 || targets[0].ExcludedSessionIDs[0] != oldSessionID {
+				return nil, fmt.Errorf("unexpected discovery targets: %#v", targets)
+			}
+			return []harness.Discovery{{Session: harness.Session{ID: rediscoveredSessionID}, Found: true}}, nil
+		},
 		dispatch: func(request harness.Request) (harness.Result, error) {
 			if request.SessionID == oldSessionID {
 				return harness.Result{SessionID: oldSessionID}, harness.ErrSessionNotFound
@@ -596,6 +791,67 @@ func TestMonitorRediscoversTaskWhenCachedSessionIsStale(t *testing.T) {
 	}
 	if value := readTestRoute(t, statePath, "owner/repo#42"); value.SessionID != rediscoveredSessionID {
 		t.Fatalf("route = %#v", value)
+	}
+}
+
+func TestMonitorRetainsPriorStaleSessionExclusions(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const firstStaleSessionID = "019c0000-0000-7000-8000-000000000041"
+	const currentSessionID = "019c0000-0000-7000-8000-000000000042"
+	const replacementSessionID = "019c0000-0000-7000-8000-000000000043"
+	agentHarness := &fakeHarness{
+		discover: func(targets []harness.Target) ([]harness.Discovery, error) {
+			if len(targets) != 1 || len(targets[0].ExcludedSessionIDs) != 2 ||
+				targets[0].ExcludedSessionIDs[0] != firstStaleSessionID || targets[0].ExcludedSessionIDs[1] != currentSessionID {
+				return nil, fmt.Errorf("unexpected discovery targets: %#v", targets)
+			}
+			return []harness.Discovery{{Session: harness.Session{ID: replacementSessionID}, Found: true}}, nil
+		},
+		dispatch: func(request harness.Request) (harness.Result, error) {
+			if request.SessionID == currentSessionID {
+				return harness.Result{SessionID: currentSessionID}, harness.ErrSessionNotFound
+			}
+			return harness.Result{SessionID: request.SessionID}, nil
+		},
+	}
+	monitor := newTestMonitor(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, map[string]route{
+		"owner/repo#42": {
+			Harness: "codex", SessionID: currentSessionID,
+			StaleSessionIDs: []string{firstStaleSessionID},
+		},
+	})
+
+	if result, err := monitor.RunOnce(context.Background()); !errors.Is(err, harness.ErrSessionNotFound) || result.Dispatches != 0 {
+		t.Fatalf("stale result/error = %#v / %v", result, err)
+	}
+	staleRoute := readTestRoute(t, statePath, "owner/repo#42")
+	if !staleRoute.Stale || len(staleRoute.StaleSessionIDs) != 2 || staleRoute.StaleSessionIDs[0] != firstStaleSessionID || staleRoute.StaleSessionIDs[1] != currentSessionID {
+		t.Fatalf("stale route = %#v", staleRoute)
+	}
+	if result, err := monitor.RunOnce(context.Background()); err != nil || result.Dispatches != 1 {
+		t.Fatalf("replacement result/error = %#v / %v", result, err)
+	}
+	replacementRoute := readTestRoute(t, statePath, "owner/repo#42")
+	if replacementRoute.SessionID != replacementSessionID || replacementRoute.Stale || len(replacementRoute.StaleSessionIDs) != 2 {
+		t.Fatalf("replacement route = %#v", replacementRoute)
+	}
+}
+
+func TestAppendStaleSessionIDDeduplicatesAndBoundsHistory(t *testing.T) {
+	t.Parallel()
+	sessionIDs := make([]string, maxStaleSessionIDs)
+	for index := range sessionIDs {
+		sessionIDs[index] = fmt.Sprintf("session-%02d", index)
+	}
+	bounded := appendStaleSessionID(sessionIDs, "new-session")
+	if len(bounded) != maxStaleSessionIDs || bounded[0] != "session-01" || bounded[len(bounded)-1] != "new-session" {
+		t.Fatalf("bounded history = %#v", bounded)
+	}
+	deduplicated := appendStaleSessionID(bounded, "SESSION-01")
+	if len(deduplicated) != maxStaleSessionIDs || deduplicated[0] != "session-01" || deduplicated[len(deduplicated)-1] != "new-session" {
+		t.Fatalf("deduplicated history = %#v", deduplicated)
 	}
 }
 

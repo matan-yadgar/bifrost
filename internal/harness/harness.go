@@ -17,6 +17,8 @@ type Target struct {
 	URL              string
 	HeadRef          string
 	WorkingDirectory string
+	// ExcludedSessionIDs must be removed from candidates before ambiguity is evaluated.
+	ExcludedSessionIDs []string
 }
 
 type Session struct {

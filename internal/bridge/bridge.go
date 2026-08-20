@@ -25,6 +25,7 @@ const (
 	maxPendingDispatches = 100
 	maxDispatchPrompt    = 256 * 1024
 	maxCommentExcerpt    = 2 * 1024
+	maxStaleSessionIDs   = 16
 )
 
 const promptOmissionSuffix = "\n[Additional changed threads omitted from this message; they remain pending for a later poll.]\n"
@@ -59,9 +60,10 @@ type CycleResult struct {
 }
 
 type route struct {
-	Harness   string `json:"harness"`
-	SessionID string `json:"session_id"`
-	Stale     bool   `json:"stale,omitempty"`
+	Harness         string   `json:"harness"`
+	SessionID       string   `json:"session_id"`
+	Stale           bool     `json:"stale,omitempty"`
+	StaleSessionIDs []string `json:"stale_session_ids,omitempty"`
 }
 
 type stateFile struct {
@@ -79,7 +81,7 @@ type dispatchJob struct {
 	prompt       string
 	fingerprints map[string]string
 	sessionID    string
-	staleID      string
+	staleIDs     []string
 }
 
 type dispatchOutcome struct {
@@ -87,6 +89,11 @@ type dispatchOutcome struct {
 	sessionID    string
 	replaceRoute bool
 	staleID      string
+}
+
+type dispatchCompletion struct {
+	index   int
+	outcome dispatchOutcome
 }
 
 type queuedDispatch struct {
@@ -218,72 +225,89 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 		}
 		stateChanged = false
 	}
-	for index, outcome := range monitor.runDispatchQueue(ctx, jobs, discoveryErrors) {
-		job := jobs[index]
+	for _, discoveryError := range discoveryErrors {
+		if discoveryError != nil {
+			cycleErrors = append(cycleErrors, discoveryError)
+		}
+	}
+	for completion := range monitor.runDispatchQueue(ctx, jobs, discoveryErrors) {
+		job := jobs[completion.index]
+		outcome := completion.outcome
 		if outcome.replaceRoute {
 			if strings.TrimSpace(outcome.staleID) != "" {
-				state.Routes[job.key] = route{Harness: monitor.harness.Name(), SessionID: outcome.staleID, Stale: true}
+				state.Routes[job.key] = route{
+					Harness: monitor.harness.Name(), SessionID: outcome.staleID, Stale: true,
+					StaleSessionIDs: appendStaleSessionID(job.staleIDs, outcome.staleID),
+				}
 			} else if strings.TrimSpace(outcome.sessionID) == "" {
 				delete(state.Routes, job.key)
 			} else {
-				state.Routes[job.key] = route{Harness: monitor.harness.Name(), SessionID: outcome.sessionID}
+				state.Routes[job.key] = route{
+					Harness: monitor.harness.Name(), SessionID: outcome.sessionID,
+					StaleSessionIDs: slices.Clone(job.staleIDs),
+				}
 			}
 			stateChanged = true
 		}
 		if outcome.err != nil {
 			cycleErrors = append(cycleErrors, outcome.err)
-			continue
+		} else {
+			result.Dispatches++
+			if state.Threads[job.key] == nil {
+				state.Threads[job.key] = make(map[string]string)
+			}
+			for threadID, fingerprint := range job.fingerprints {
+				state.Threads[job.key][threadID] = fingerprint
+			}
+			stateChanged = true
 		}
-		result.Dispatches++
-		if state.Threads[job.key] == nil {
-			state.Threads[job.key] = make(map[string]string)
+		if stateChanged {
+			if err := saveJSON(monitor.stateFile, state); err != nil {
+				cycleErrors = append(cycleErrors, fmt.Errorf("save state after dispatch %s: %w", job.key, err))
+			} else {
+				stateChanged = false
+			}
 		}
-		for threadID, fingerprint := range job.fingerprints {
-			state.Threads[job.key][threadID] = fingerprint
-		}
-		stateChanged = true
 	}
 	if stateChanged {
 		if err := saveJSON(monitor.stateFile, state); err != nil {
-			return result, err
+			cycleErrors = append(cycleErrors, fmt.Errorf("save final dispatch state: %w", err))
+			return result, errors.Join(cycleErrors...)
 		}
 	}
 	return result, errors.Join(cycleErrors...)
 }
 
-func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob, discoveryErrors []error) []dispatchOutcome {
-	outcomes := make([]dispatchOutcome, len(jobs))
-	for index, err := range discoveryErrors {
-		outcomes[index].err = err
-	}
-	if len(jobs) == 0 {
-		return outcomes
-	}
+func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob, discoveryErrors []error) <-chan dispatchCompletion {
+	completions := make(chan dispatchCompletion)
 	lanes := monitor.dispatchLanes(jobs, discoveryErrors)
-	if len(lanes) == 0 {
-		return outcomes
-	}
-
-	queue := make(chan []queuedDispatch, maxDispatchWorkers)
-	var workers sync.WaitGroup
-	workerCount := min(maxDispatchWorkers, len(lanes))
-	for range workerCount {
-		workers.Go(func() {
-			for lane := range queue {
-				for _, item := range lane {
-					dispatchContext, cancel := context.WithTimeout(ctx, monitor.dispatchTimeout)
-					outcomes[item.index] = monitor.dispatch(dispatchContext, item)
-					cancel()
+	go func() {
+		defer close(completions)
+		if len(lanes) == 0 {
+			return
+		}
+		queue := make(chan []queuedDispatch, maxDispatchWorkers)
+		var workers sync.WaitGroup
+		workerCount := min(maxDispatchWorkers, len(lanes))
+		for range workerCount {
+			workers.Go(func() {
+				for lane := range queue {
+					for _, item := range lane {
+						dispatchContext, cancel := context.WithTimeout(ctx, monitor.dispatchTimeout)
+						outcome := monitor.dispatch(dispatchContext, item)
+						cancel()
+						completions <- dispatchCompletion{index: item.index, outcome: outcome}
+					}
 				}
-			}
-		})
-	}
-	for _, lane := range lanes {
-		queue <- lane
-	}
-	close(queue)
-	workers.Wait()
-	return outcomes
+			})
+		}
+		for _, lane := range lanes {
+			queue <- lane
+		}
+		close(queue)
+		workers.Wait()
+	}()
+	return completions
 }
 
 func (monitor *Monitor) dispatchLanes(jobs []dispatchJob, discoveryErrors []error) [][]queuedDispatch {
@@ -367,8 +391,9 @@ func (monitor *Monitor) resolveRoutes(ctx context.Context, state *stateFile, job
 		job := &jobs[index]
 		current, found := state.Routes[job.key]
 		if found && strings.EqualFold(current.Harness, monitor.harness.Name()) && strings.TrimSpace(current.SessionID) != "" {
+			job.staleIDs = slices.Clone(current.StaleSessionIDs)
 			if current.Stale {
-				job.staleID = strings.TrimSpace(current.SessionID)
+				job.staleIDs = appendStaleSessionID(job.staleIDs, strings.TrimSpace(current.SessionID))
 			} else {
 				job.sessionID = strings.TrimSpace(current.SessionID)
 				continue
@@ -425,11 +450,16 @@ func (monitor *Monitor) resolveRoutes(ctx context.Context, state *stateFile, job
 			errorsByJob[index] = fmt.Errorf("discover task for %s: harness returned an empty session ID", job.key)
 			continue
 		}
-		if job.staleID != "" && strings.EqualFold(job.staleID, discovery.Session.ID) {
+		if slices.ContainsFunc(job.staleIDs, func(staleID string) bool {
+			return strings.EqualFold(staleID, discovery.Session.ID)
+		}) {
 			continue
 		}
 		job.sessionID = discovery.Session.ID
-		state.Routes[job.key] = route{Harness: monitor.harness.Name(), SessionID: discovery.Session.ID}
+		state.Routes[job.key] = route{
+			Harness: monitor.harness.Name(), SessionID: discovery.Session.ID,
+			StaleSessionIDs: slices.Clone(job.staleIDs),
+		}
 		stateChanged = true
 	}
 	if deferredCursor >= 0 && state.DiscoveryCursor != deferredCursor {
@@ -443,13 +473,28 @@ func (monitor *Monitor) resolveRoutes(ctx context.Context, state *stateFile, job
 }
 
 func targetFor(job dispatchJob) harness.Target {
-	return harness.Target{
+	target := harness.Target{
 		Repository:       job.pullRequest.Repository,
 		PullRequest:      job.pullRequest.Number,
 		URL:              job.pullRequest.URL,
 		HeadRef:          job.pullRequest.HeadRef,
 		WorkingDirectory: job.repository.WorkingDirectory,
 	}
+	target.ExcludedSessionIDs = slices.Clone(job.staleIDs)
+	return target
+}
+
+func appendStaleSessionID(sessionIDs []string, sessionID string) []string {
+	for _, existing := range sessionIDs {
+		if strings.EqualFold(existing, sessionID) {
+			return slices.Clone(sessionIDs)
+		}
+	}
+	sessionIDs = append(slices.Clone(sessionIDs), sessionID)
+	if len(sessionIDs) > maxStaleSessionIDs {
+		sessionIDs = slices.Clone(sessionIDs[len(sessionIDs)-maxStaleSessionIDs:])
+	}
+	return sessionIDs
 }
 
 func pruneRepositoryState(state *stateFile, repository string, pullRequests []githubapi.PullRequest) bool {

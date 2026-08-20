@@ -216,7 +216,7 @@ func (server *codexAppServer) discoverBatch(ctx context.Context, targets []Targe
 			if discoveries[index].Err != nil {
 				continue
 			}
-			discoveries[index] = client.discover(target.URL, target.HeadRef)
+			discoveries[index] = client.discover(target)
 			var fatalError fatalAppServerError
 			if errors.As(discoveries[index].Err, &fatalError) {
 				protocolError = discoveries[index].Err
@@ -291,18 +291,16 @@ func newAppServerClient(reader io.Reader, writer io.Writer) *appServerClient {
 	return &appServerClient{encoder: json.NewEncoder(writer), decoder: json.NewDecoder(reader)}
 }
 
-func (client *appServerClient) discover(pullRequestURL, headRef string) Discovery {
-	urlSessions, err := client.searchAll(pullRequestURL)
-	if err != nil {
-		return Discovery{Err: err}
-	}
-	branchSessions, err := client.searchAll(headRef)
+func (client *appServerClient) discover(target Target) Discovery {
+	urlSessions, err := client.searchAll(target.URL)
 	if err != nil {
 		return Discovery{Err: err}
 	}
 	var candidateIDs []string
 	for sessionID := range urlSessions {
-		if !branchSessions[sessionID] {
+		if slices.ContainsFunc(target.ExcludedSessionIDs, func(excluded string) bool {
+			return strings.EqualFold(sessionID, strings.TrimSpace(excluded))
+		}) {
 			continue
 		}
 		candidateIDs = append(candidateIDs, sessionID)
@@ -310,19 +308,19 @@ func (client *appServerClient) discover(pullRequestURL, headRef string) Discover
 	sort.Strings(candidateIDs)
 	var matching []string
 	for _, sessionID := range candidateIDs {
-		qualifies, err := client.hasCreatorFinal(sessionID, pullRequestURL, headRef)
+		qualifies, err := client.hasCreatorFinal(sessionID, target.URL, target.HeadRef)
 		if err != nil {
 			return Discovery{Err: err}
 		}
 		if qualifies {
 			matching = append(matching, sessionID)
+			if len(matching) == 2 {
+				return Discovery{Err: fmt.Errorf("%w: found at least 2 matches", ErrAmbiguousSession)}
+			}
 		}
 	}
 	if len(matching) == 0 {
 		return Discovery{}
-	}
-	if len(matching) > 1 {
-		return Discovery{Err: fmt.Errorf("%w: found %d matches", ErrAmbiguousSession, len(matching))}
 	}
 	if !validSessionID(matching[0]) {
 		return Discovery{Err: fmt.Errorf("Codex discovery returned an invalid session ID")}
