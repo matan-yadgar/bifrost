@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,14 +42,14 @@ type Repository struct {
 }
 
 type Monitor struct {
-	source       Source
-	harness      harness.Harness
-	repositories []Repository
-	stateFile    string
-	mappingFile  string
-	mappingMutex sync.Mutex
-	spawnLocks   keyedMutex
-	sessionLocks keyedMutex
+	source           Source
+	harness          harness.Harness
+	repositories     []Repository
+	stateFile        string
+	mappingDirectory string
+	dispatchTimeout  time.Duration
+	spawnLocks       keyedMutex
+	sessionLocks     keyedMutex
 }
 
 type CycleResult struct {
@@ -64,9 +65,10 @@ type mapping struct {
 	SessionID string `json:"session_id"`
 }
 
-type mappingFile struct {
-	Version      int                `json:"version"`
-	PullRequests map[string]mapping `json:"pull_requests"`
+type mappingRecord struct {
+	Version   int    `json:"version"`
+	Harness   string `json:"harness"`
+	SessionID string `json:"session_id"`
 }
 
 type stateFile struct {
@@ -89,28 +91,33 @@ type queuedDispatch struct {
 
 type keyedMutex struct {
 	mutex sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[string]chan struct{}
 }
 
-func (locks *keyedMutex) lock(key string) func() {
+func (locks *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 	locks.mutex.Lock()
 	if locks.locks == nil {
-		locks.locks = make(map[string]*sync.Mutex)
+		locks.locks = make(map[string]chan struct{})
 	}
 	lock := locks.locks[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = make(chan struct{}, 1)
+		lock <- struct{}{}
 		locks.locks[key] = lock
 	}
 	locks.mutex.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-lock:
+		return func() { lock <- struct{}{} }, nil
+	}
 }
 
-func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath, mappingPath string) *Monitor {
+func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath, mappingDirectory string, dispatchTimeout time.Duration) *Monitor {
 	return &Monitor{
 		source: source, harness: agentHarness, repositories: repositories,
-		stateFile: statePath, mappingFile: mappingPath,
+		stateFile: statePath, mappingDirectory: mappingDirectory, dispatchTimeout: dispatchTimeout,
 	}
 }
 
@@ -244,7 +251,9 @@ func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob
 		workers.Go(func() {
 			for lane := range queue {
 				for _, item := range lane {
-					errorsByJob[item.index] = monitor.dispatch(ctx, item)
+					dispatchContext, cancel := context.WithTimeout(ctx, monitor.dispatchTimeout)
+					errorsByJob[item.index] = monitor.dispatch(dispatchContext, item)
+					cancel()
 				}
 			}
 		})
@@ -258,14 +267,13 @@ func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob
 }
 
 func (monitor *Monitor) dispatchLanes(jobs []dispatchJob) ([][]queuedDispatch, error) {
-	mappings, err := loadMappings(monitor.mappingFile)
-	if err != nil {
-		return nil, fmt.Errorf("load mappings for dispatch queue: %w", err)
-	}
 	laneIndexes := make(map[string]int)
 	var lanes [][]queuedDispatch
 	for index, job := range jobs {
-		mapping := mappings.PullRequests[job.key]
+		mapping, err := monitor.mappingForDispatch(job.key)
+		if err != nil {
+			return nil, err
+		}
 		laneKey := "working-directory:" + filepath.Clean(job.repository.WorkingDirectory)
 		if mapping.SessionID != "" {
 			laneKey = "session:" + strings.ToLower(mapping.SessionID)
@@ -292,7 +300,10 @@ func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) error
 			return err
 		}
 		if mapping.SessionID == "" {
-			unlock := monitor.spawnLocks.lock(filepath.Clean(job.repository.WorkingDirectory))
+			unlock, lockError := monitor.spawnLocks.lock(ctx, filepath.Clean(job.repository.WorkingDirectory))
+			if lockError != nil {
+				return fmt.Errorf("wait to start %s: %w", job.key, lockError)
+			}
 			current, currentError := monitor.mappingForDispatch(job.key)
 			if currentError != nil {
 				unlock()
@@ -307,7 +318,10 @@ func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) error
 			return dispatchError
 		}
 
-		unlock := monitor.sessionLocks.lock(strings.ToLower(mapping.SessionID))
+		unlock, lockError := monitor.sessionLocks.lock(ctx, strings.ToLower(mapping.SessionID))
+		if lockError != nil {
+			return fmt.Errorf("wait for session %s: %w", mapping.SessionID, lockError)
+		}
 		current, currentError := monitor.mappingForDispatch(job.key)
 		if currentError != nil {
 			unlock()
@@ -371,16 +385,18 @@ func (monitor *Monitor) dispatchWithMapping(ctx context.Context, job dispatchJob
 }
 
 func (monitor *Monitor) mappingForDispatch(key string) (mapping, error) {
-	mappings, err := loadMappings(monitor.mappingFile)
+	value, err := loadMapping(monitor.mappingDirectory, key)
 	if err != nil {
 		return mapping{}, fmt.Errorf("load mapping for %s: %w", key, err)
 	}
-	value := mappings.PullRequests[key]
 	return value, nil
 }
 
 func (monitor *Monitor) spawn(ctx context.Context, workingDirectory, prompt string) (harness.Result, error) {
-	unlock := monitor.spawnLocks.lock(filepath.Clean(workingDirectory))
+	unlock, err := monitor.spawnLocks.lock(ctx, filepath.Clean(workingDirectory))
+	if err != nil {
+		return harness.Result{}, err
+	}
 	defer unlock()
 	return monitor.harness.Dispatch(ctx, harness.Request{
 		WorkingDirectory: workingDirectory, Prompt: prompt,
@@ -388,31 +404,25 @@ func (monitor *Monitor) spawn(ctx context.Context, workingDirectory, prompt stri
 }
 
 func (monitor *Monitor) recordMapping(key, sessionID, expectedSessionID string) error {
-	monitor.mappingMutex.Lock()
-	defer monitor.mappingMutex.Unlock()
-	// Reload immediately before replacement so a mapping written while Codex was
-	// running is preserved. External writers must also use atomic replacement.
-	mappings, err := loadMappings(monitor.mappingFile)
+	existing, err := loadMapping(monitor.mappingDirectory, key)
 	if err != nil {
-		return fmt.Errorf("reload mappings: %w", err)
+		return fmt.Errorf("reload mapping: %w", err)
 	}
-	existing := mappings.PullRequests[key].SessionID
-	if existing != "" && !strings.EqualFold(existing, expectedSessionID) {
+	if existing.SessionID != "" && !strings.EqualFold(existing.SessionID, expectedSessionID) {
 		return nil
 	}
-	mappings.PullRequests[key] = mapping{Harness: monitor.harness.Name(), SessionID: sessionID}
-	if err := saveJSON(monitor.mappingFile, mappings); err != nil {
-		return fmt.Errorf("save mappings: %w", err)
+	if err := saveMapping(monitor.mappingDirectory, key, mapping{Harness: monitor.harness.Name(), SessionID: sessionID}); err != nil {
+		return fmt.Errorf("save mapping: %w", err)
 	}
 	return nil
 }
 
 func (monitor *Monitor) currentMappingSession(key string) (string, error) {
-	mappings, err := loadMappings(monitor.mappingFile)
+	value, err := loadMapping(monitor.mappingDirectory, key)
 	if err != nil {
-		return "", fmt.Errorf("reload mappings: %w", err)
+		return "", fmt.Errorf("reload mapping: %w", err)
 	}
-	return mappings.PullRequests[key].SessionID, nil
+	return value.SessionID, nil
 }
 
 func changedThreads(state *stateFile, pullRequest githubapi.PullRequest, threads []githubapi.ReviewThread) ([]githubapi.ReviewThread, bool, map[string]string) {
@@ -531,29 +541,43 @@ func loadState(path string) (*stateFile, error) {
 	return state, nil
 }
 
-func loadMappings(path string) (*mappingFile, error) {
-	mappings := &mappingFile{Version: mappingSchemaVersion, PullRequests: make(map[string]mapping)}
-	if err := loadJSON(path, mappings); err != nil {
-		return nil, fmt.Errorf("load mappings: %w", err)
+func loadMapping(directory, key string) (mapping, error) {
+	path, err := mappingPath(directory, key)
+	if err != nil {
+		return mapping{}, err
 	}
-	if mappings.Version != mappingSchemaVersion {
-		return nil, fmt.Errorf("unsupported mapping version %d", mappings.Version)
+	record := &mappingRecord{Version: mappingSchemaVersion}
+	if err := loadJSON(path, record); err != nil {
+		return mapping{}, err
 	}
-	if mappings.PullRequests == nil {
-		mappings.PullRequests = make(map[string]mapping)
+	if record.Version != mappingSchemaVersion {
+		return mapping{}, fmt.Errorf("unsupported mapping version %d", record.Version)
 	}
-	normalizedMappings := make(map[string]mapping, len(mappings.PullRequests))
-	for key, value := range mappings.PullRequests {
-		normalized := strings.ToLower(strings.TrimSpace(key))
-		value.Harness = strings.TrimSpace(value.Harness)
-		value.SessionID = strings.TrimSpace(value.SessionID)
-		if existing, found := normalizedMappings[normalized]; found && existing != value {
-			return nil, fmt.Errorf("conflicting mappings for %s", normalized)
-		}
-		normalizedMappings[normalized] = value
+	record.Harness = strings.TrimSpace(record.Harness)
+	record.SessionID = strings.TrimSpace(record.SessionID)
+	return mapping{Harness: record.Harness, SessionID: record.SessionID}, nil
+}
+
+func saveMapping(directory, key string, value mapping) error {
+	path, err := mappingPath(directory, key)
+	if err != nil {
+		return err
 	}
-	mappings.PullRequests = normalizedMappings
-	return mappings, nil
+	return saveJSON(path, &mappingRecord{Version: mappingSchemaVersion, Harness: value.Harness, SessionID: value.SessionID})
+}
+
+func mappingPath(directory, key string) (string, error) {
+	repository, numberText, found := strings.Cut(strings.ToLower(strings.TrimSpace(key)), "#")
+	owner, name, repositoryFound := strings.Cut(repository, "/")
+	number, numberError := strconv.Atoi(numberText)
+	if !found || !repositoryFound || !validMappingSegment(owner) || !validMappingSegment(name) || numberError != nil || number <= 0 {
+		return "", fmt.Errorf("invalid pull request key %q", key)
+	}
+	return filepath.Join(directory, owner, name, strconv.Itoa(number)+".json"), nil
+}
+
+func validMappingSegment(value string) bool {
+	return value != "" && value != "." && value != ".." && !strings.ContainsAny(value, `/\\`)
 }
 
 func loadJSON(path string, output any) error {

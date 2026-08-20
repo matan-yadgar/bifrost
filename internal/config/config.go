@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,14 +10,19 @@ import (
 	"time"
 )
 
-const defaultPollInterval = 5 * time.Minute
+const (
+	defaultPollInterval    = 5 * time.Minute
+	defaultDispatchTimeout = 30 * time.Minute
+)
 
 type Config struct {
-	PollInterval string       `json:"poll_interval"`
-	StateFile    string       `json:"state_file"`
-	MappingFile  string       `json:"mapping_file"`
-	Repositories []Repository `json:"repositories"`
-	Harness      Harness      `json:"harness"`
+	PollInterval      string       `json:"poll_interval"`
+	DispatchTimeout   string       `json:"dispatch_timeout"`
+	StateFile         string       `json:"state_file"`
+	MappingDirectory  string       `json:"mapping_directory"`
+	LegacyMappingFile string       `json:"mapping_file,omitempty"`
+	Repositories      []Repository `json:"repositories"`
+	Harness           Harness      `json:"harness"`
 }
 
 type Repository struct {
@@ -32,11 +38,12 @@ type Harness struct {
 }
 
 type Runtime struct {
-	PollInterval time.Duration
-	StateFile    string
-	MappingFile  string
-	Repositories []Repository
-	Harness      Harness
+	PollInterval     time.Duration
+	DispatchTimeout  time.Duration
+	StateFile        string
+	MappingDirectory string
+	Repositories     []Repository
+	Harness          Harness
 }
 
 func DefaultPath() (string, error) {
@@ -70,12 +77,16 @@ func Load(path string) (Runtime, error) {
 	}
 
 	baseDirectory := filepath.Dir(path)
-	pollInterval := defaultPollInterval
-	if strings.TrimSpace(config.PollInterval) != "" {
-		pollInterval, err = time.ParseDuration(config.PollInterval)
-		if err != nil || pollInterval <= 0 {
-			return Runtime{}, fmt.Errorf("poll_interval must be a positive Go duration")
-		}
+	if strings.TrimSpace(config.LegacyMappingFile) != "" {
+		return Runtime{}, fmt.Errorf("mapping_file was replaced by mapping_directory; migrate each PR mapping to mappings/<owner>/<repo>/<number>.json")
+	}
+	pollInterval, err := positiveDuration("poll_interval", config.PollInterval, defaultPollInterval)
+	if err != nil {
+		return Runtime{}, err
+	}
+	dispatchTimeout, err := positiveDuration("dispatch_timeout", config.DispatchTimeout, defaultDispatchTimeout)
+	if err != nil {
+		return Runtime{}, err
 	}
 	if len(config.Repositories) == 0 {
 		return Runtime{}, fmt.Errorf("at least one repository is required")
@@ -126,30 +137,61 @@ func Load(path string) (Runtime, error) {
 	if err != nil {
 		return Runtime{}, fmt.Errorf("state_file: %w", err)
 	}
-	mappingFile := config.MappingFile
-	if strings.TrimSpace(mappingFile) == "" {
-		mappingFile = "mappings.json"
+	mappingDirectory := config.MappingDirectory
+	if strings.TrimSpace(mappingDirectory) == "" {
+		legacyPath := filepath.Join(baseDirectory, "mappings.json")
+		if info, statError := os.Stat(legacyPath); statError == nil && !info.IsDir() {
+			return Runtime{}, fmt.Errorf("legacy mapping file %s exists; migrate it to the mappings directory layout", legacyPath)
+		} else if statError != nil && !errors.Is(statError, os.ErrNotExist) {
+			return Runtime{}, fmt.Errorf("inspect legacy mapping file: %w", statError)
+		}
+		mappingDirectory = "mappings"
 	}
-	mappingFile, err = resolvePath(baseDirectory, mappingFile)
+	mappingDirectory, err = resolvePath(baseDirectory, mappingDirectory)
 	if err != nil {
-		return Runtime{}, fmt.Errorf("mapping_file: %w", err)
+		return Runtime{}, fmt.Errorf("mapping_directory: %w", err)
 	}
-	if stateFile == mappingFile || stateFile == path || mappingFile == path {
-		return Runtime{}, fmt.Errorf("config, state_file, and mapping_file must use different paths")
+	if pathsOverlap(stateFile, path) || pathsOverlap(mappingDirectory, stateFile) || pathsOverlap(mappingDirectory, path) {
+		return Runtime{}, fmt.Errorf("config, state_file, and mapping_directory must use different paths")
 	}
 
 	return Runtime{
-		PollInterval: pollInterval,
-		StateFile:    stateFile,
-		MappingFile:  mappingFile,
-		Repositories: config.Repositories,
-		Harness:      config.Harness,
+		PollInterval:     pollInterval,
+		DispatchTimeout:  dispatchTimeout,
+		StateFile:        stateFile,
+		MappingDirectory: mappingDirectory,
+		Repositories:     config.Repositories,
+		Harness:          config.Harness,
 	}, nil
+}
+
+func positiveDuration(name, value string, defaultValue time.Duration) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return defaultValue, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("%s must be a positive Go duration", name)
+	}
+	return duration, nil
+}
+
+func pathsOverlap(left, right string) bool {
+	return pathContains(left, right) || pathContains(right, left)
+}
+
+func pathContains(directory, path string) bool {
+	relative, err := filepath.Rel(directory, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func validRepository(value string) bool {
 	parts := strings.Split(value, "/")
-	return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	return len(parts) == 2 && validRepositorySegment(parts[0]) && validRepositorySegment(parts[1])
+}
+
+func validRepositorySegment(value string) bool {
+	return value != "" && value != "." && value != ".." && !strings.ContainsAny(value, `\#`)
 }
 
 func normalizeAuthors(authors []string) []string {

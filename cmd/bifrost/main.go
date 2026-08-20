@@ -49,7 +49,7 @@ func main() {
 			Name: repository.Name, Authors: repository.Authors, WorkingDirectory: repository.WorkingDirectory,
 		})
 	}
-	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.MappingFile)
+	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.MappingDirectory, runtimeConfig.DispatchTimeout)
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
@@ -68,7 +68,7 @@ func main() {
 		return
 	}
 
-	log.Printf("bifrost started: interval=%s harness=%s", runtimeConfig.PollInterval, agentHarness.Name())
+	log.Printf("bifrost started: interval=%s dispatch_timeout=%s harness=%s", runtimeConfig.PollInterval, runtimeConfig.DispatchTimeout, agentHarness.Name())
 	if _, err := poll(); err != nil {
 		log.Printf("poll failed: %v", err)
 	}

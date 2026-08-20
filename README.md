@@ -14,6 +14,7 @@ The first harness is Codex CLI. The Go interface in `internal/harness` is the ex
 - Starts a new Codex session and records its ID when the PR has no mapping.
 - Replaces a stale mapping only when Codex reports that the mapped task no longer exists.
 - Marks a thread version delivered only after Codex exits successfully. Resolved threads are forgotten so reopening one emits it again.
+- Cancels a dispatch after 30 minutes by default and terminates its child process tree; timed-out thread versions remain pending.
 - Instructs the agent to validate every comment and document rejected feedback instead of blindly implementing it.
 - Uses a bounded two-worker queue built with Go channels—no queue dependency. Different agent sessions can run in parallel, while messages for the same session run serially. New sessions sharing a configured checkout are started serially.
 
@@ -37,31 +38,31 @@ Use a different config or perform one polling pass:
 bifrost -config /path/to/config.json -once
 ```
 
-`GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state, mapping, and working-directory paths are resolved from the config directory; `~/...` is also supported.
+`GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state, mapping-directory, and working-directory paths are resolved from the config directory; `~/...` is also supported. Set `dispatch_timeout` to another positive [Go duration](https://pkg.go.dev/time#ParseDuration) when a task legitimately needs longer than the default `30m`.
 
 An empty `authors` list monitors every open PR in that repository. Restrict repositories and authors carefully: review comments are untrusted input delivered to an agent with access to the configured checkout. Version 1 does not enforce a reviewer allowlist. Bifrost does not enable `--approve-for-me` by default; add harness arguments only when the repository and reviewers are trusted.
 
 The polling-only `GH_TOKEN` and `GITHUB_TOKEN` environment variables are removed from the Codex child process. This is not a credential sandbox: Codex still runs as the current OS user and may be able to use credentials stored by tools such as `gh`. Use a dedicated, least-privileged local environment for stronger isolation.
 
+Codex stderr is used only for bounded internal error classification. Bifrost does not copy arbitrary child stderr into its normal logs.
+
 ## PR-to-session mappings
 
-The configured mapping file is shared state between Bifrost and whichever tool creates PRs. A Codex task that opens a PR can add its own session mapping:
+Each PR has an independent file under the configured mapping directory. For `owner/repository#42`, a Codex task that opens the PR writes `mappings/owner/repository/42.json`:
 
 ```json
 {
   "version": 1,
-  "pull_requests": {
-    "owner/repository#42": {
-      "harness": "codex",
-      "session_id": "019c0000-0000-7000-8000-000000000000"
-    }
-  }
+  "harness": "codex",
+  "session_id": "019c0000-0000-7000-8000-000000000000"
 }
 ```
 
-Keys are case-insensitive and use `owner/repository#number`. If a key is absent, Bifrost starts `codex exec` in the repository's configured working directory and writes the returned session ID. If a key exists, it uses `codex exec resume` for that session.
+Owner and repository path segments are lowercase. If the PR file is absent, Bifrost starts `codex exec` in the repository's configured working directory and writes the returned session ID. If the file exists, it uses `codex exec resume` for that session.
 
-On macOS and Linux, Bifrost writes its files atomically with user-only permissions. External writers should also replace the mapping file atomically. Bifrost reloads the mapping immediately before adding a newly spawned session so unrelated mappings written during dispatch are usually preserved. Version 1 assumes writers do not replace the mapping file at exactly the same time; atomic replacement protects file integrity but is not a cross-process lock.
+Earlier pre-release configurations used one `mapping_file` (normally `mappings.json`). Bifrost now stops with a migration message when it detects that format; move each entry to the per-PR layout above, then replace `mapping_file` with `mapping_directory`.
+
+On macOS and Linux, Bifrost writes its files atomically with user-only permissions. External writers should also atomically replace only the affected PR file. Independent files prevent concurrent updates for different PRs from overwriting one another.
 
 ## Scope
 

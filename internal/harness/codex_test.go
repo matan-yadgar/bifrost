@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	githubapi "github.com/matan-yadgar/bifrost/internal/github"
 )
@@ -101,34 +100,26 @@ func TestCodexClassifiesMissingMappedSession(t *testing.T) {
 	}
 }
 
-func TestCommandErrorIncludesSanitizedDiagnostic(t *testing.T) {
+func TestCommandErrorClassifiesAuthenticationWithoutExposingStderr(t *testing.T) {
 	t.Parallel()
 	err := &commandError{
 		cause:  errors.New("exit status 1"),
-		stderr: "authentication failed\n\x1b[31mAuthorization\x1b[0m: Basic arbitrary-value\n\"Authorization\":\"Bearer json-auth\"\nHTTP_AUTHORIZATION=Basic prefixed-auth\nJIRA_API_TOKEN=super-secret-value DB_PASSWORD=db-secret \"token\":\"json-secret\" TOKEN\n=split-secret\ncredential ghp_abcdefghijklmnopqrstuvwxyz123456\x1b[31m",
+		stderr: "authentication failed: secret-value",
 	}
 	message := err.Error()
-	if !strings.Contains(message, "authentication failed") || !strings.Contains(message, "[redacted]") {
-		t.Fatalf("diagnostic = %q", message)
+	if message != "exit status 1: Codex authentication failed" {
+		t.Fatalf("error = %q", message)
 	}
-	for _, credential := range []string{"arbitrary-value", "json-auth", "prefixed-auth", "super-secret-value", "db-secret", "json-secret", "split-secret", "ghp_abcdefghijklmnopqrstuvwxyz123456", "\x1b", "[31m"} {
-		if strings.Contains(message, credential) {
-			t.Fatalf("diagnostic leaked credential or control character = %q", message)
-		}
-	}
-	if !strings.Contains(message, "JIRA_API_TOKEN=[redacted]") || !strings.Contains(message, "DB_PASSWORD=[redacted]") {
-		t.Fatalf("diagnostic leaked credential = %q", message)
+	if strings.Contains(message, "secret-value") {
+		t.Fatalf("error exposed stderr = %q", message)
 	}
 }
 
-func TestSanitizeDiagnosticBoundsValidUTF8(t *testing.T) {
+func TestCommandErrorHidesUnclassifiedStderr(t *testing.T) {
 	t.Parallel()
-	diagnostic := sanitizeDiagnostic("useful prefix " + strings.Repeat("界", maxDiagnosticBytes))
-	if len(diagnostic) > maxDiagnosticBytes || !utf8.ValidString(diagnostic) {
-		t.Fatalf("diagnostic length/UTF-8 = %d / %t", len(diagnostic), utf8.ValidString(diagnostic))
-	}
-	if !strings.HasPrefix(diagnostic, "useful prefix") {
-		t.Fatalf("diagnostic lost useful prefix: %q", diagnostic[:min(len(diagnostic), 64)])
+	err := &commandError{cause: errors.New("exit status 2"), stderr: "private diagnostic"}
+	if message := err.Error(); message != "exit status 2" {
+		t.Fatalf("error = %q", message)
 	}
 }
 

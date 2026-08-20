@@ -6,25 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
-	"regexp"
 	"slices"
 	"strings"
-	"unicode"
+	"sync/atomic"
+	"time"
 )
 
 var ErrSessionNotFound = errors.New("Codex session not found")
 
 const (
 	maxStderrCaptureBytes = 64 * 1024
-	maxDiagnosticBytes    = 4 * 1024
-)
-
-var (
-	ansiEscapePattern          = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
-	authorizationPattern       = regexp.MustCompile(`(?im)(["']?[a-z0-9_-]*authorization[a-z0-9_-]*["']?)([ \t]*[:=][ \t]*)[^\r\n]*`)
-	sensitiveAssignmentPattern = regexp.MustCompile(`(?i)(["']?[a-z0-9_-]*(?:password|secret|token|api[_-]?key|access[_-]?key)[a-z0-9_-]*["']?)([[:space:]]*[:=][[:space:]]*)("[^"\r\n]*"|'[^'\r\n]*'|[^ \t\r\n,;}]+)`)
-	credentialPattern          = regexp.MustCompile(`(?i)\b(gh[pousr]_[a-z0-9_]{20,}|github_pat_[a-z0-9_]{20,}|sk-[a-z0-9_-]{20,})\b`)
+	processCleanupTimeout = 5 * time.Second
 )
 
 type Request struct {
@@ -146,7 +140,20 @@ type execRunner struct {
 }
 
 func (runner *execRunner) Run(ctx context.Context, command string, args []string, input string, output func(string)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	process := exec.CommandContext(ctx, command, args...)
+	configureProcess(process)
+	var cleanupFailed atomic.Bool
+	process.Cancel = func() error {
+		err := terminateProcessTree(process.Process)
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			cleanupFailed.Store(true)
+		}
+		return err
+	}
+	process.WaitDelay = processCleanupTimeout
 	process.Stdin = strings.NewReader(input)
 	stderr := &boundedBuffer{limit: maxStderrCaptureBytes}
 	process.Stderr = stderr
@@ -158,18 +165,45 @@ func (runner *execRunner) Run(ctx context.Context, command string, args []string
 	if err := process.Start(); err != nil {
 		return err
 	}
-
+	cleanupFinished := make(chan struct{})
+	var pipeCleanupTimedOut atomic.Bool
+	stopPipeCleanup := context.AfterFunc(ctx, func() {
+		timer := time.NewTimer(processCleanupTimeout)
+		defer timer.Stop()
+		select {
+		case <-cleanupFinished:
+		case <-timer.C:
+			pipeCleanupTimedOut.Store(true)
+			_ = stdout.Close()
+		}
+	})
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
 		output(scanner.Text())
 	}
 	scanErr := scanner.Err()
-	if scanErr != nil && process.Process != nil {
-		_ = process.Process.Kill()
+	if scanErr != nil {
+		if cancelErr := process.Cancel(); cancelErr != nil && !errors.Is(cancelErr, os.ErrProcessDone) {
+			_ = process.Process.Kill()
+		}
 	}
 	waitErr := process.Wait()
+	close(cleanupFinished)
+	stopPipeCleanup()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if cleanupFailed.Load() {
+			return &commandError{cause: fmt.Errorf("%w: Codex process cleanup failed", ctxErr), stderr: stderr.String()}
+		}
+		if pipeCleanupTimedOut.Load() || errors.Is(waitErr, exec.ErrWaitDelay) {
+			return &commandError{cause: fmt.Errorf("%w: Codex process cleanup timed out", ctxErr), stderr: stderr.String()}
+		}
+		return &commandError{cause: ctxErr, stderr: stderr.String()}
+	}
 	if scanErr != nil {
+		if cleanupFailed.Load() {
+			return fmt.Errorf("%w: Codex process cleanup failed", scanErr)
+		}
 		return scanErr
 	}
 	if waitErr != nil {
@@ -184,35 +218,13 @@ type commandError struct {
 }
 
 func (commandError *commandError) Error() string {
-	diagnostic := sanitizeDiagnostic(commandError.stderr)
-	if diagnostic == "" {
-		return commandError.cause.Error()
-	}
-	return fmt.Sprintf("%s: %s", commandError.cause, diagnostic)
-}
-
-func sanitizeDiagnostic(value string) string {
-	value = ansiEscapePattern.ReplaceAllString(value, "")
-	value = strings.Map(func(character rune) rune {
-		if character != '\r' && character != '\n' && character != '\t' && unicode.IsControl(character) {
-			return ' '
+	lowerStderr := strings.ToLower(commandError.stderr)
+	for _, marker := range []string{"authentication failed", "not authenticated", "not logged in", "unauthorized"} {
+		if strings.Contains(lowerStderr, marker) {
+			return fmt.Sprintf("%s: Codex authentication failed", commandError.cause)
 		}
-		return character
-	}, value)
-	value = authorizationPattern.ReplaceAllString(value, "$1$2[redacted]")
-	value = sensitiveAssignmentPattern.ReplaceAllString(value, "$1$2[redacted]")
-	value = credentialPattern.ReplaceAllString(value, "[redacted]")
-	value = strings.Map(func(character rune) rune {
-		if unicode.IsControl(character) {
-			return ' '
-		}
-		return character
-	}, value)
-	value = strings.Join(strings.Fields(value), " ")
-	if len(value) <= maxDiagnosticBytes {
-		return value
 	}
-	return strings.ToValidUTF8(value[:maxDiagnosticBytes], "")
+	return commandError.cause.Error()
 }
 
 func (commandError *commandError) Unwrap() error {
