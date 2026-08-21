@@ -41,6 +41,8 @@ bifrost -config /path/to/config.json -once
 
 `GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state and working-directory paths are resolved from the config directory; `~/...` is also supported. Set `dispatch_timeout` to another positive [Go duration](https://pkg.go.dev/time#ParseDuration) when a task legitimately needs longer than the default `30m`.
 
+Configurations from earlier Bifrost versions may keep `mapping_directory` or `mapping_file`. Valid records are atomically imported into `state.json`; an existing route in `state.json` wins. The legacy files are left untouched and can be removed with the deprecated config fields after a successful startup.
+
 An empty `authors` list monitors every open PR in that repository. Restrict repositories and authors carefully: review comments are untrusted input delivered to an agent with access to the configured checkout. Version 1 does not enforce a reviewer allowlist. Bifrost does not enable `--approve-for-me` by default; add harness arguments only when the repository and reviewers are trusted.
 
 The polling-only `GH_TOKEN` and `GITHUB_TOKEN` environment variables are removed from the Codex child process. This is not a credential sandbox: Codex still runs as the current OS user and may be able to use credentials stored by tools such as `gh`. Use a dedicated, least-privileged local environment for stronger isolation.
@@ -49,7 +51,7 @@ Codex stderr is used only for bounded internal error classification. Bifrost doe
 
 ## Codex task discovery
 
-Bifrost asks the local Codex app server to search active and archived local task history for the exact PR URL and exact head-branch name. A task must occur in both result sets, and paginated turn and item history must show both boundary-delimited strings together in one final assistant response. Legacy history without message phases uses only the terminal assistant message of a completed turn. This excludes user prompts and intermediate commentary from the evidence used to route feedback.
+Bifrost asks the local Codex app server to search active and archived local task history for the exact PR URL, then checks those candidates for the exact head-branch name. Paginated turn and item history must show both boundary-delimited strings together in one final assistant response. Legacy history without message phases uses only the terminal assistant message of a completed turn. This excludes user prompts and intermediate commentary from the evidence used to route feedback.
 
 Use this convention when a Codex task opens a PR: include the exact PR URL and exact head branch in that task's final response. No task-name convention or mapping-file write is needed.
 

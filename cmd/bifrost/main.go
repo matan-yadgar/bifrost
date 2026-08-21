@@ -43,6 +43,9 @@ func main() {
 	default:
 		log.Fatalf("unsupported harness %q", runtimeConfig.Harness.Type)
 	}
+	if err := bridge.ImportLegacyMappings(runtimeConfig.StateFile, runtimeConfig.LegacyMappingDirectory, runtimeConfig.LegacyMappingFile, agentHarness.Name()); err != nil {
+		log.Fatal(err)
+	}
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {
 		repositories = append(repositories, bridge.Repository{

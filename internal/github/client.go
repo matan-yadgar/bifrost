@@ -92,6 +92,7 @@ type PullRequest struct {
 	Title      string
 	URL        string
 	HeadRef    string
+	Author     string
 }
 
 type ReviewThread struct {
@@ -167,14 +168,10 @@ func WithoutAuthTokens(environment []string) []string {
 	return filtered
 }
 
-func (client *Client) OpenPullRequests(ctx context.Context, repository string, authors []string) ([]PullRequest, error) {
+func (client *Client) OpenPullRequests(ctx context.Context, repository string) ([]PullRequest, error) {
 	owner, name, ok := strings.Cut(repository, "/")
 	if !ok {
 		return nil, fmt.Errorf("invalid repository %q", repository)
-	}
-	authorSet := make(map[string]bool, len(authors))
-	for _, author := range authors {
-		authorSet[strings.ToLower(author)] = true
 	}
 
 	var pullRequests []PullRequest
@@ -195,15 +192,13 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string, a
 			return nil, err
 		}
 		for _, pullRequest := range response {
-			if len(authorSet) > 0 && !authorSet[strings.ToLower(pullRequest.User.Login)] {
-				continue
-			}
 			pullRequests = append(pullRequests, PullRequest{
 				Repository: repository,
 				Number:     pullRequest.Number,
 				Title:      pullRequest.Title,
 				URL:        pullRequest.HTMLURL,
 				HeadRef:    pullRequest.Head.Ref,
+				Author:     pullRequest.User.Login,
 			})
 		}
 		if len(response) < githubPageSize {

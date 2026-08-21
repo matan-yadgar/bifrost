@@ -122,6 +122,39 @@ func TestCodexDiscoveryOwnsAppServerProcess(t *testing.T) {
 	}
 }
 
+func TestCodexDiscoveryUsesManagedProcessTransport(t *testing.T) {
+	t.Parallel()
+	const sessionID = "019c0000-0000-7000-8000-000000000009"
+	process := &fakeManagedProcess{
+		input: &writeCloserBuffer{},
+		output: io.NopCloser(strings.NewReader(
+			rpcResult(1, `{}`) +
+				rpcResult(2, searchResult(nil, "")) +
+				rpcResult(3, searchResult([]string{sessionID}, "")) +
+				rpcResult(4, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
+		)),
+	}
+	starter := &fakeProcessStarter{process: process}
+	server := &codexAppServer{command: "codex", environment: []string{"SAFE=value"}, processes: starter}
+
+	discoveries, err := server.Discover(context.Background(), []Target{{
+		URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42",
+	}})
+	if err != nil || len(discoveries) != 1 || !discoveries[0].Found || discoveries[0].Session.ID != sessionID {
+		t.Fatalf("discoveries/error = %#v / %v", discoveries, err)
+	}
+	if starter.request.Command != "codex" || !reflect.DeepEqual(starter.request.Args, []string{"app-server", "--stdio"}) ||
+		!starter.request.Interactive || !reflect.DeepEqual(starter.request.Environment, []string{"SAFE=value"}) {
+		t.Fatalf("process request = %#v", starter.request)
+	}
+	if !process.input.closed {
+		t.Fatal("app-server input was not closed")
+	}
+	if !process.waited {
+		t.Fatal("app-server process was not reaped")
+	}
+}
+
 func runAppServerHelper(mode string) {
 	if !reflect.DeepEqual(os.Args[1:], []string{"app-server", "--stdio"}) || os.Getenv("BIFROST_APP_SERVER_SENTINEL") != "expected" {
 		os.Exit(11)
@@ -375,6 +408,80 @@ func TestAppServerCreatorFinalPaginatesTurns(t *testing.T) {
 	}
 }
 
+func TestCreatorFinalInFullTurnsPaginatesPrimaryPath(t *testing.T) {
+	t.Parallel()
+	responses := strings.NewReader(
+		rpcResult(1, `{"data":[{"id":"turn-2","status":"completed","itemsView":"full","items":[]}],"nextCursor":"older"}`) +
+			rpcResult(2, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
+	)
+	var requests bytes.Buffer
+	client := newAppServerClient(responses, &requests)
+	qualified, err := client.creatorFinalInFullTurns("session", "https://github.com/owner/repo/pull/42", "codex/feature-42")
+	if err != nil || !qualified {
+		t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
+	}
+	emitted := decodeAppServerRequests(t, requests.Bytes())
+	if len(emitted) != 2 || emitted[0].Params["itemsView"] != "full" || emitted[1].Params["itemsView"] != "full" || emitted[1].Params["cursor"] != "older" {
+		t.Fatalf("turn requests = %#v", emitted)
+	}
+}
+
+func TestCreatorFinalInFullTurnsAcceptsLegacyTerminalMessage(t *testing.T) {
+	t.Parallel()
+	const pullRequestURL = "https://github.com/owner/repo/pull/42"
+	const headRef = "codex/feature-42"
+	response := `{"data":[{"id":"turn-1","status":"completed","itemsView":"full","items":[` +
+		`{"type":"agentMessage","phase":null,"text":"earlier"},` +
+		`{"type":"agentMessage","phase":null,"text":"created ` + pullRequestURL + ` from ` + headRef + `"}` +
+		`]}],"nextCursor":null}`
+	client := newAppServerClient(strings.NewReader(rpcResult(1, response)), &bytes.Buffer{})
+	qualified, err := client.creatorFinalInFullTurns("session", pullRequestURL, headRef)
+	if err != nil || !qualified {
+		t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
+	}
+}
+
+func TestCreatorFinalInFullTurnsRejectsLegacyNonterminalMessage(t *testing.T) {
+	t.Parallel()
+	const pullRequestURL = "https://github.com/owner/repo/pull/42"
+	const headRef = "codex/feature-42"
+	response := `{"data":[{"id":"turn-1","status":"completed","itemsView":"full","items":[` +
+		`{"type":"agentMessage","phase":null,"text":"created ` + pullRequestURL + ` from ` + headRef + `"},` +
+		`{"type":"agentMessage","phase":null,"text":"later answer"}` +
+		`]}],"nextCursor":null}`
+	client := newAppServerClient(strings.NewReader(rpcResult(1, response)), &bytes.Buffer{})
+	qualified, err := client.creatorFinalInFullTurns("session", pullRequestURL, headRef)
+	if err != nil || qualified {
+		t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
+	}
+}
+
+func TestCreatorFinalInFullTurnsRequiresExactIdentifierBoundaries(t *testing.T) {
+	t.Parallel()
+	const pullRequestURL = "https://github.com/owner/repo/pull/42"
+	const headRef = "codex/feature-42"
+	for _, testCase := range []struct {
+		name string
+		text string
+	}{
+		{name: "before URL", text: "x" + pullRequestURL + " " + headRef},
+		{name: "after URL", text: pullRequestURL + "0 " + headRef},
+		{name: "before branch", text: pullRequestURL + " x" + headRef},
+		{name: "after branch", text: pullRequestURL + " " + headRef + "-next"},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			response := threadFullTurnsResultJSON("turn-1", testCase.text, stringPointer(finalAssistantMessage))
+			client := newAppServerClient(strings.NewReader(rpcResult(1, response)), &bytes.Buffer{})
+			qualified, err := client.creatorFinalInFullTurns("session", pullRequestURL, headRef)
+			if err != nil || qualified {
+				t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
+			}
+		})
+	}
+}
+
 func TestAppServerCreatorFinalFallsBackWhenFullItemsAreUnloaded(t *testing.T) {
 	t.Parallel()
 	responses := strings.NewReader(
@@ -428,6 +535,49 @@ type appServerRequest struct {
 	Method  string         `json:"method"`
 	Params  map[string]any `json:"params"`
 }
+
+type fakeProcessStarter struct {
+	request processRequest
+	process managedProcess
+}
+
+func (starter *fakeProcessStarter) Start(_ context.Context, request processRequest) (managedProcess, error) {
+	starter.request = request
+	return starter.process, nil
+}
+
+type fakeManagedProcess struct {
+	input    *writeCloserBuffer
+	output   io.ReadCloser
+	exit     processExit
+	canceled bool
+	waited   bool
+}
+
+func (process *fakeManagedProcess) Input() io.WriteCloser { return process.input }
+func (process *fakeManagedProcess) Output() io.ReadCloser { return process.output }
+func (process *fakeManagedProcess) Cancel() {
+	process.canceled = true
+}
+func (process *fakeManagedProcess) Wait() processExit {
+	process.waited = true
+	return process.exit
+}
+
+type writeCloserBuffer struct {
+	bytes.Buffer
+	closed bool
+}
+
+func (buffer *writeCloserBuffer) Close() error {
+	buffer.closed = true
+	return nil
+}
+
+type errorReadCloser struct{ err error }
+
+func (reader errorReadCloser) Read([]byte) (int, error) { return 0, reader.err }
+func (errorReadCloser) Close() error                    { return nil }
 
 func assertExactProtocolRequests(t *testing.T, requests []appServerRequest, creatorSessionID string) {
 	t.Helper()
@@ -656,7 +806,7 @@ func TestExecRunnerUsesSanitizedEnvironment(t *testing.T) {
 		"GITHUB_TOKEN=two",
 	})
 	var lines []string
-	runner := &execRunner{environment: environment}
+	runner := &execRunner{environment: environment, processes: osProcessStarter{}}
 	if err := runner.Run(context.Background(), os.Args[0], []string{"-test.run=TestExecRunnerEnvironmentHelper"}, "", func(line string) {
 		lines = append(lines, line)
 	}); err != nil {
@@ -671,7 +821,7 @@ func TestExecRunnerUsesSanitizedEnvironment(t *testing.T) {
 func TestExecRunnerHonorsEmptyEnvironment(t *testing.T) {
 	t.Parallel()
 	var lines []string
-	runner := &execRunner{environment: []string{}}
+	runner := &execRunner{environment: []string{}, processes: osProcessStarter{}}
 	if err := runner.Run(context.Background(), "/usr/bin/env", nil, "", func(line string) {
 		lines = append(lines, line)
 	}); err != nil {
@@ -679,6 +829,46 @@ func TestExecRunnerHonorsEmptyEnvironment(t *testing.T) {
 	}
 	if len(lines) != 0 {
 		t.Fatalf("child inherited environment: %#v", lines)
+	}
+}
+
+func TestExecRunnerPassesInputThroughManagedProcess(t *testing.T) {
+	t.Parallel()
+	process := &fakeManagedProcess{
+		input:  &writeCloserBuffer{},
+		output: io.NopCloser(strings.NewReader("event\n")),
+	}
+	starter := &fakeProcessStarter{process: process}
+	runner := &execRunner{environment: []string{"SAFE=value"}, processes: starter}
+	var lines []string
+
+	if err := runner.Run(context.Background(), "codex", []string{"exec"}, "review prompt", func(line string) {
+		lines = append(lines, line)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	input, err := io.ReadAll(starter.request.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if starter.request.Command != "codex" || !reflect.DeepEqual(starter.request.Args, []string{"exec"}) ||
+		starter.request.Interactive || string(input) != "review prompt" || !reflect.DeepEqual(lines, []string{"event"}) || !process.waited {
+		t.Fatalf("request/lines/waited = %#v / %#v / %t", starter.request, lines, process.waited)
+	}
+}
+
+func TestExecRunnerCancelsAndWaitsAfterOutputError(t *testing.T) {
+	t.Parallel()
+	outputError := errors.New("read output")
+	process := &fakeManagedProcess{
+		input:  &writeCloserBuffer{},
+		output: errorReadCloser{err: outputError},
+	}
+	runner := &execRunner{processes: &fakeProcessStarter{process: process}}
+
+	err := runner.Run(context.Background(), "codex", nil, "", func(string) {})
+	if !errors.Is(err, outputError) || !process.canceled || !process.waited {
+		t.Fatalf("error/canceled/waited = %v / %t / %t", err, process.canceled, process.waited)
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-func TestOpenPullRequestsFiltersAuthors(t *testing.T) {
+func TestOpenPullRequestsReturnsAuthoritativeOpenSet(t *testing.T) {
 	t.Parallel()
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -52,18 +52,18 @@ func TestOpenPullRequestsFiltersAuthors(t *testing.T) {
 	client := NewClient("")
 	client.restBaseURL = server.URL
 
-	pullRequests, err := client.OpenPullRequests(context.Background(), "owner/repo", []string{"MATAN"})
+	pullRequests, err := client.OpenPullRequests(context.Background(), "owner/repo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pullRequests) != 2 || pullRequests[0].Number != 1 || pullRequests[1].Number != 101 || requests.Load() != 2 {
+	if len(pullRequests) != 101 || pullRequests[0].Number != 1 || pullRequests[100].Number != 101 || requests.Load() != 2 {
 		t.Fatalf("pull requests = %#v", pullRequests)
 	}
-	if pullRequests[0].HeadRef != "codex/feature" {
+	if pullRequests[0].HeadRef != "codex/feature" || pullRequests[0].Author != "matan" || pullRequests[1].Author != "other" {
 		t.Fatalf("first pull request head = %#v", pullRequests[0])
 	}
-	if pullRequests[1].HeadRef != "codex/second" {
-		t.Fatalf("second pull request head = %#v", pullRequests[1])
+	if pullRequests[100].HeadRef != "codex/second" || pullRequests[100].Author != "matan" {
+		t.Fatalf("last pull request = %#v", pullRequests[100])
 	}
 }
 

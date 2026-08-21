@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,7 +27,7 @@ type fakeSource struct {
 	openErrorsByRepo     map[string]error
 }
 
-func (source *fakeSource) OpenPullRequests(_ context.Context, repository string, _ []string) ([]githubapi.PullRequest, error) {
+func (source *fakeSource) OpenPullRequests(_ context.Context, repository string) ([]githubapi.PullRequest, error) {
 	if err := source.openErrorsByRepo[repository]; err != nil {
 		return nil, err
 	}
@@ -89,6 +90,98 @@ func readTestRoute(t *testing.T, statePath, key string) route {
 		t.Fatal(err)
 	}
 	return state.Routes[key]
+}
+
+func TestImportLegacyMappingsAtomicallyMigratesBothFormats(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	mappingDirectory := filepath.Join(directory, "mappings")
+	mappingFile := filepath.Join(directory, "mappings.json")
+	if err := saveJSON(statePath, &stateFile{
+		Version:         stateSchemaVersion,
+		QueueCursor:     7,
+		DiscoveryCursor: 5,
+		Threads:         map[string]map[string]string{"owner/repo#3": {"thread-3": "fingerprint-3"}},
+		Routes:          map[string]route{"owner/repo#3": {Harness: "codex", SessionID: "newer-session"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recordDirectory := filepath.Join(mappingDirectory, "owner", "repo")
+	if err := os.MkdirAll(recordDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(recordDirectory, "1.json"), []byte(`{"version":1,"harness":"codex","session_id":"directory-session"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(recordDirectory, "3.json"), []byte(`{"version":1,"harness":"codex","session_id":"directory-older-session"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aggregateJSON := `{"version":1,"pull_requests":{"Owner/Repo#2":{"harness":"codex","session_id":"file-session"},"owner/repo#3":{"harness":"codex","session_id":"older-session"}}}`
+	if err := os.WriteFile(mappingFile, []byte(aggregateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ImportLegacyMappings(statePath, mappingDirectory, mappingFile, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryRoute := state.Routes["owner/repo#1"]
+	fileRoute := state.Routes["owner/repo#2"]
+	existingRoute := state.Routes["owner/repo#3"]
+	if directoryRoute.Harness != "codex" || directoryRoute.SessionID != "directory-session" ||
+		fileRoute.Harness != "codex" || fileRoute.SessionID != "file-session" ||
+		existingRoute.Harness != "codex" || existingRoute.SessionID != "newer-session" ||
+		state.QueueCursor != 7 || state.DiscoveryCursor != 5 || state.Threads["owner/repo#3"]["thread-3"] != "fingerprint-3" {
+		t.Fatalf("migrated state = %#v", state)
+	}
+	if err := saveJSON(filepath.Join(mappingDirectory, "owner", "repo", "4.json"), &legacyMappingRecord{
+		Version: mappingSchemaVersion, Harness: "codex", SessionID: "late-session",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ImportLegacyMappings(statePath, mappingDirectory, mappingFile, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	state, err = loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateRoute := state.Routes["owner/repo#4"]
+	if lateRoute.Harness != "codex" || lateRoute.SessionID != "late-session" ||
+		state.QueueCursor != 7 || state.DiscoveryCursor != 5 || state.Threads["owner/repo#3"]["thread-3"] != "fingerprint-3" {
+		t.Fatalf("idempotent migration did not import a new legacy record: %#v", state.Routes)
+	}
+}
+
+func TestImportLegacyMappingsDoesNotPartiallySaveInvalidInput(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	mappingDirectory := filepath.Join(directory, "mappings")
+	mappingFile := filepath.Join(directory, "mappings.json")
+	if err := saveJSON(filepath.Join(mappingDirectory, "owner", "repo", "1.json"), &legacyMappingRecord{
+		Version: mappingSchemaVersion, Harness: "codex", SessionID: "valid-session",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveJSON(mappingFile, &legacyMappingFile{Version: mappingSchemaVersion + 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ImportLegacyMappings(statePath, mappingDirectory, mappingFile, "codex"); err == nil {
+		t.Fatal("expected invalid mapping error")
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Routes) != 0 {
+		t.Fatalf("partial migration state = %#v", state)
+	}
 }
 
 func (agentHarness *fakeHarness) Name() string {
@@ -584,6 +677,45 @@ func TestMonitorPrunesClosedPullRequestStateAfterSuccessfulListing(t *testing.T)
 	}
 	if state.Threads["owner/repo#42"] == nil || state.Routes["owner/repo#42"].SessionID != "open-session" || state.Routes["other/repo#1"].SessionID != "other-session" {
 		t.Fatalf("active or unrelated state was pruned: %#v", state)
+	}
+}
+
+func TestMonitorPreservesOpenPullRequestStateWhenAuthorIsFilteredOut(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	pullRequest := reviewSource().pullRequest
+	pullRequest.Author = "other-author"
+	if err := saveJSON(statePath, &stateFile{
+		Version: stateSchemaVersion,
+		Threads: map[string]map[string]string{"owner/repo#42": {"thread": "fingerprint"}},
+		Routes:  map[string]route{"owner/repo#42": {Harness: "codex", SessionID: "preserved-session"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agentHarness := &fakeHarness{}
+	monitor := New(&fakeSource{pullRequest: pullRequest, threads: []githubapi.ReviewThread{reviewThread("new-thread", time.Now())}}, agentHarness,
+		[]Repository{{Name: "Owner/Repo", Authors: []string{"wanted-author"}, WorkingDirectory: directory}}, statePath, time.Minute)
+
+	result, err := monitor.RunOnce(context.Background())
+	if err != nil || result.PullRequests != 0 || result.Threads != 0 || len(agentHarness.requests) != 0 {
+		t.Fatalf("result/error/requests = %#v / %v / %#v", result, err, agentHarness.requests)
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Routes["owner/repo#42"].SessionID != "preserved-session" || state.Threads["owner/repo#42"]["thread"] != "fingerprint" {
+		t.Fatalf("filtered open PR state = %#v", state)
+	}
+}
+
+func TestFilterPullRequestsByAuthorIsCaseInsensitive(t *testing.T) {
+	t.Parallel()
+	pullRequests := []githubapi.PullRequest{{Number: 1, Author: "matan"}, {Number: 2, Author: "other"}}
+	filtered := filterPullRequestsByAuthor(pullRequests, []string{"MATAN"})
+	if len(filtered) != 1 || filtered[0].Number != 1 {
+		t.Fatalf("filtered pull requests = %#v", filtered)
 	}
 }
 

@@ -6,17 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"slices"
 	"strings"
-	"sync/atomic"
-	"time"
-)
-
-const (
-	maxStderrCaptureBytes = 64 * 1024
-	processCleanupTimeout = 5 * time.Second
 )
 
 type sessionDiscoverer interface {
@@ -35,11 +27,12 @@ type Codex struct {
 }
 
 func NewCodex(command string, args, environment []string) *Codex {
+	processes := osProcessStarter{}
 	return &Codex{
 		command:    command,
 		args:       append([]string(nil), args...),
-		runner:     &execRunner{environment: slices.Clone(environment)},
-		discoverer: &codexAppServer{command: command, environment: slices.Clone(environment)},
+		runner:     &execRunner{environment: slices.Clone(environment), processes: processes},
+		discoverer: &codexAppServer{command: command, environment: slices.Clone(environment), processes: processes},
 	}
 }
 
@@ -129,77 +122,46 @@ func sessionIDFromEvent(line string) string {
 
 type execRunner struct {
 	environment []string
+	processes   processStarter
 }
 
 func (runner *execRunner) Run(ctx context.Context, command string, args []string, input string, output func(string)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	process := exec.CommandContext(ctx, command, args...)
-	configureProcess(process)
-	var cleanupFailed atomic.Bool
-	process.Cancel = func() error {
-		err := terminateProcessTree(process.Process)
-		if err != nil && !errors.Is(err, os.ErrProcessDone) {
-			cleanupFailed.Store(true)
-		}
-		return err
-	}
-	process.WaitDelay = processCleanupTimeout
-	process.Stdin = strings.NewReader(input)
-	stderr := &boundedBuffer{limit: maxStderrCaptureBytes}
-	process.Stderr = stderr
-	process.Env = slices.Clone(runner.environment)
-	stdout, err := process.StdoutPipe()
+	process, err := runner.processes.Start(ctx, processRequest{
+		Command: command, Args: args, Environment: runner.environment, Input: strings.NewReader(input),
+	})
 	if err != nil {
 		return err
 	}
-	if err := process.Start(); err != nil {
-		return err
-	}
-	cleanupFinished := make(chan struct{})
-	var pipeCleanupTimedOut atomic.Bool
-	stopPipeCleanup := context.AfterFunc(ctx, func() {
-		timer := time.NewTimer(processCleanupTimeout)
-		defer timer.Stop()
-		select {
-		case <-cleanupFinished:
-		case <-timer.C:
-			pipeCleanupTimedOut.Store(true)
-			_ = stdout.Close()
-		}
-	})
-	scanner := bufio.NewScanner(stdout)
+	scanner := bufio.NewScanner(process.Output())
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
 		output(scanner.Text())
 	}
 	scanErr := scanner.Err()
 	if scanErr != nil {
-		if cancelErr := process.Cancel(); cancelErr != nil && !errors.Is(cancelErr, os.ErrProcessDone) {
-			_ = process.Process.Kill()
-		}
+		process.Cancel()
 	}
-	waitErr := process.Wait()
-	close(cleanupFinished)
-	stopPipeCleanup()
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		if cleanupFailed.Load() {
-			return &commandError{cause: fmt.Errorf("%w: Codex process cleanup failed", ctxErr), stderr: stderr.String()}
+	exit := process.Wait()
+	if exit.ContextError != nil {
+		if exit.CleanupFailed {
+			return &commandError{cause: fmt.Errorf("%w: Codex process cleanup failed", exit.ContextError), stderr: exit.Stderr}
 		}
-		if pipeCleanupTimedOut.Load() || errors.Is(waitErr, exec.ErrWaitDelay) {
-			return &commandError{cause: fmt.Errorf("%w: Codex process cleanup timed out", ctxErr), stderr: stderr.String()}
+		if exit.PipeCleanupTimedOut || errors.Is(exit.WaitError, exec.ErrWaitDelay) {
+			return &commandError{cause: fmt.Errorf("%w: Codex process cleanup timed out", exit.ContextError), stderr: exit.Stderr}
 		}
-		return &commandError{cause: ctxErr, stderr: stderr.String()}
+		return &commandError{cause: exit.ContextError, stderr: exit.Stderr}
 	}
 	if scanErr != nil {
-		if cleanupFailed.Load() {
+		if exit.CleanupFailed {
 			return fmt.Errorf("%w: Codex process cleanup failed", scanErr)
 		}
 		return scanErr
 	}
-	if waitErr != nil {
-		return &commandError{cause: waitErr, stderr: stderr.String()}
+	if exit.WaitError != nil {
+		return &commandError{cause: exit.WaitError, stderr: exit.Stderr}
 	}
 	return nil
 }

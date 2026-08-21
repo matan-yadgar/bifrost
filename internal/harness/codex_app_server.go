@@ -6,12 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"slices"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -56,6 +54,7 @@ var codexTaskSources = []string{
 type codexAppServer struct {
 	command     string
 	environment []string
+	processes   processStarter
 }
 
 type appServerClient struct {
@@ -170,45 +169,16 @@ func (server *codexAppServer) Discover(ctx context.Context, targets []Target) ([
 func (server *codexAppServer) discoverBatch(ctx context.Context, targets []Target, discoveries []Discovery, reconnects int) ([]Discovery, error) {
 	processContext, cancel := context.WithCancel(ctx)
 	defer cancel()
-	process := exec.CommandContext(processContext, server.command, "app-server", "--stdio")
-	configureProcess(process)
-	var cleanupFailed atomic.Bool
-	process.Cancel = func() error {
-		err := terminateProcessTree(process.Process)
-		if err != nil && !errors.Is(err, os.ErrProcessDone) {
-			cleanupFailed.Store(true)
-		}
-		return err
-	}
-	process.WaitDelay = processCleanupTimeout
-	process.Env = slices.Clone(server.environment)
-	process.Stderr = &boundedBuffer{limit: maxStderrCaptureBytes}
-	stdin, err := process.StdinPipe()
+	process, err := server.processes.Start(processContext, processRequest{
+		Command: server.command, Args: []string{"app-server", "--stdio"},
+		Environment: server.environment, Interactive: true,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("open Codex app-server input: %w", err)
-	}
-	stdout, err := process.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("open Codex app-server output: %w", err)
-	}
-	if err := process.Start(); err != nil {
 		return nil, fmt.Errorf("start Codex app-server: %w", err)
 	}
-	cleanupFinished := make(chan struct{})
-	var pipeCleanupTimedOut atomic.Bool
-	stopPipeCleanup := context.AfterFunc(processContext, func() {
-		timer := time.NewTimer(processCleanupTimeout)
-		defer timer.Stop()
-		select {
-		case <-cleanupFinished:
-		case <-timer.C:
-			pipeCleanupTimedOut.Store(true)
-			_ = stdout.Close()
-		}
-	})
 
-	reader := &boundedReader{reader: stdout, remaining: maxAppServerOutputBytes}
-	client := newAppServerClient(reader, stdin)
+	reader := &boundedReader{reader: process.Output(), remaining: maxAppServerOutputBytes}
+	client := newAppServerClient(reader, process.Input())
 	protocolError := client.initialize()
 	fatalTargetIndex := -1
 	if protocolError == nil {
@@ -229,23 +199,21 @@ func (server *codexAppServer) discoverBatch(ctx context.Context, targets []Targe
 	if protocolError != nil {
 		cancel()
 	}
-	_ = stdin.Close()
-	waitError := process.Wait()
-	close(cleanupFinished)
-	stopPipeCleanup()
+	_ = process.Input().Close()
+	exit := process.Wait()
 
 	var discoveryError error
 	if contextErrorBeforeCleanup != nil {
-		discoveryError = discoveryProcessError(contextErrorBeforeCleanup, cleanupFailed.Load(), pipeCleanupTimedOut.Load(), waitError)
+		discoveryError = discoveryProcessError(contextErrorBeforeCleanup, exit.CleanupFailed, exit.PipeCleanupTimedOut, exit.WaitError)
 	} else if protocolError != nil {
-		if cleanupFailed.Load() || pipeCleanupTimedOut.Load() || errors.Is(waitError, exec.ErrWaitDelay) {
+		if exit.CleanupFailed || exit.PipeCleanupTimedOut || errors.Is(exit.WaitError, exec.ErrWaitDelay) {
 			discoveryError = errors.Join(protocolError, fmt.Errorf("Codex app-server cleanup failed"))
 		} else {
 			discoveryError = protocolError
 		}
-	} else if waitError != nil {
-		if processContext.Err() != nil {
-			discoveryError = discoveryProcessError(processContext.Err(), cleanupFailed.Load(), pipeCleanupTimedOut.Load(), waitError)
+	} else if exit.WaitError != nil {
+		if exit.ContextError != nil {
+			discoveryError = discoveryProcessError(exit.ContextError, exit.CleanupFailed, exit.PipeCleanupTimedOut, exit.WaitError)
 		} else {
 			discoveryError = fmt.Errorf("Codex app-server exited unsuccessfully")
 		}
@@ -257,7 +225,7 @@ func (server *codexAppServer) discoverBatch(ctx context.Context, targets []Targe
 		return nil, discoveryError
 	}
 	discoveries[fatalTargetIndex].Err = discoveryError
-	cleanReap := contextErrorBeforeCleanup == nil && !cleanupFailed.Load() && !pipeCleanupTimedOut.Load() && !errors.Is(waitError, exec.ErrWaitDelay)
+	cleanReap := contextErrorBeforeCleanup == nil && !exit.CleanupFailed && !exit.PipeCleanupTimedOut && !errors.Is(exit.WaitError, exec.ErrWaitDelay)
 	remainingNeedsDiscovery := slices.ContainsFunc(discoveries[fatalTargetIndex+1:], func(discovery Discovery) bool {
 		return discovery.Err == nil
 	})
@@ -458,16 +426,14 @@ func creatorFinalInTurn(turn threadTurn, pullRequestURL, headRef string) bool {
 		if item.Type == agentMessageItem {
 			lastAgentMessage = index
 		}
-		if item.Type == agentMessageItem && item.Phase != nil && *item.Phase == finalAssistantMessage &&
-			containsExactIdentifier(item.Text, pullRequestURL) && containsExactIdentifier(item.Text, headRef) {
+		if creatorFinalMessageMatches(item, false, pullRequestURL, headRef) {
 			return true
 		}
 	}
 	if lastAgentMessage < 0 {
 		return false
 	}
-	item := (*turn.Items)[lastAgentMessage]
-	return item.Phase == nil && containsExactIdentifier(item.Text, pullRequestURL) && containsExactIdentifier(item.Text, headRef)
+	return creatorFinalMessageMatches((*turn.Items)[lastAgentMessage], true, pullRequestURL, headRef)
 }
 
 func (client *appServerClient) completedTurns(sessionID string) (map[string]bool, error) {
@@ -532,14 +498,13 @@ func (client *appServerClient) creatorFinalInItems(sessionID string, completedTu
 				continue
 			}
 			lastAgentMessages[entry.TurnID] = entry.Item
-			if entry.Item.Phase != nil && *entry.Item.Phase == finalAssistantMessage &&
-				containsExactIdentifier(entry.Item.Text, pullRequestURL) && containsExactIdentifier(entry.Item.Text, headRef) {
+			if creatorFinalMessageMatches(entry.Item, false, pullRequestURL, headRef) {
 				return true, nil
 			}
 		}
 		if result.NextCursor == nil || *result.NextCursor == "" {
 			for _, item := range lastAgentMessages {
-				if item.Phase == nil && containsExactIdentifier(item.Text, pullRequestURL) && containsExactIdentifier(item.Text, headRef) {
+				if creatorFinalMessageMatches(item, true, pullRequestURL, headRef) {
 					return true, nil
 				}
 			}
@@ -552,6 +517,18 @@ func (client *appServerClient) creatorFinalInItems(sessionID string, completedTu
 		cursor = result.NextCursor
 	}
 	return false, fmt.Errorf("Codex task discovery exceeded %d item pages", maxThreadItemsPages)
+}
+
+func creatorFinalMessageMatches(item threadTurnItem, terminal bool, pullRequestURL, headRef string) bool {
+	if item.Type != agentMessageItem ||
+		!containsExactIdentifier(item.Text, pullRequestURL) ||
+		!containsExactIdentifier(item.Text, headRef) {
+		return false
+	}
+	if item.Phase == nil {
+		return terminal
+	}
+	return *item.Phase == finalAssistantMessage
 }
 
 func containsExactIdentifier(text, identifier string) bool {
