@@ -16,11 +16,17 @@ type Lock struct {
 }
 
 func Acquire(stateFile string) (*Lock, error) {
-	if err := os.MkdirAll(filepath.Dir(stateFile), 0o700); err != nil {
+	stateDirectory := filepath.Dir(stateFile)
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
 	}
+	stateDirectory, err := filepath.EvalSymlinks(stateDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("resolve state directory: %w", err)
+	}
 
-	file := flock.New(stateFile+".lock", flock.SetPermissions(0o600))
+	lockPath := filepath.Join(stateDirectory, filepath.Base(stateFile)) + ".lock"
+	file := flock.New(lockPath, flock.SetPermissions(0o600))
 	locked, err := file.TryLock()
 	if err != nil {
 		return nil, fmt.Errorf("lock state file %q: %w", stateFile, err)

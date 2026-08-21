@@ -2,6 +2,7 @@ package instance
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -56,5 +57,31 @@ func TestAcquireAllowsDistinctStateFiles(t *testing.T) {
 	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAcquireRejectsSymlinkedDirectoryAlias(t *testing.T) {
+	directory := t.TempDir()
+	realDirectory := filepath.Join(directory, "real")
+	if err := os.Mkdir(realDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasDirectory := filepath.Join(directory, "alias")
+	if err := os.Symlink(realDirectory, aliasDirectory); err != nil {
+		t.Skipf("directory symlinks are unavailable: %v", err)
+	}
+
+	first, err := Acquire(filepath.Join(realDirectory, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+
+	second, err := Acquire(filepath.Join(aliasDirectory, "state.json"))
+	if second != nil {
+		_ = second.Close()
+	}
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("alias acquisition error = %v, want ErrAlreadyRunning", err)
 	}
 }
