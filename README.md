@@ -13,6 +13,7 @@ The first harness is Codex CLI. The Go interface in `internal/harness` is the ex
 - Discovers the creating Codex task by searching local task history for the exact PR URL and head branch, then verifies that both occur together in a final assistant response.
 - Resumes the uniquely matching Codex task, or starts a new one when no task matches.
 - Keeps its private PR-to-task route cache in `state.json`; no second actor or mapping configuration is required.
+- Allows only one Bifrost process per state file. A second process exits immediately; the operating system releases the lock if the owner exits or crashes.
 - Clears stale routes for batched re-discovery on the next polling cycle, and removes route and delivery state after a successful scan shows that a PR is no longer open.
 - Marks a thread version delivered only after Codex exits successfully. Resolved threads are forgotten so reopening one emits it again.
 - Cancels a dispatch after 30 minutes by default and terminates its child process tree; timed-out thread versions remain pending.
@@ -40,6 +41,8 @@ bifrost -config /path/to/config.json -once
 ```
 
 `GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state and working-directory paths are resolved from the config directory; `~/...` is also supported. Set `dispatch_timeout` to another positive [Go duration](https://pkg.go.dev/time#ParseDuration) when a task legitimately needs longer than the default `30m`.
+
+Each resolved state file has a neighboring `.lock` file. Processes configured with different state files can run at the same time; processes configured with the same state file cannot.
 
 Configurations from earlier Bifrost versions may keep `mapping_directory` or `mapping_file`. Valid records are atomically imported into `state.json`; an existing route in `state.json` wins. The legacy files are left untouched and can be removed with the deprecated config fields after a successful startup.
 
