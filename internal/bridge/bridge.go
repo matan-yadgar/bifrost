@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,6 +30,9 @@ const (
 	maxDispatchPrompt    = 256 * 1024
 	maxCommentExcerpt    = 2 * 1024
 	maxStaleSessionIDs   = 16
+	routeCached          = "cached"
+	routeDiscovered      = "discovered"
+	routeNew             = "new"
 )
 
 const promptOmissionSuffix = "\n[Additional changed threads omitted from this message; they remain pending for a later poll.]\n"
@@ -50,6 +54,7 @@ type Monitor struct {
 	repositories    []Repository
 	stateFile       string
 	dispatchTimeout time.Duration
+	logger          *log.Logger
 	spawnLocks      keyedMutex
 	sessionLocks    keyedMutex
 }
@@ -101,6 +106,7 @@ type dispatchJob struct {
 	fingerprints map[string]string
 	sessionID    string
 	staleIDs     []string
+	routeChoice  string
 }
 
 type dispatchOutcome struct {
@@ -145,10 +151,10 @@ func (locks *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 	}
 }
 
-func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, dispatchTimeout time.Duration) *Monitor {
+func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, dispatchTimeout time.Duration, logger *log.Logger) *Monitor {
 	return &Monitor{
 		source: source, harness: agentHarness, repositories: repositories,
-		stateFile: statePath, dispatchTimeout: dispatchTimeout,
+		stateFile: statePath, dispatchTimeout: dispatchTimeout, logger: logger,
 	}
 }
 
@@ -167,8 +173,11 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 	sourceScanFailed := false
 	stateChanged := false
 	for _, repository := range monitor.repositories {
+		repositoryStarted := time.Now()
+		monitor.logger.Printf("repository poll started: repository=%s", repository.Name)
 		openPullRequests, err := monitor.source.OpenPullRequests(ctx, repository.Name)
 		if err != nil {
+			monitor.logger.Printf("repository poll failed: repository=%s duration=%s", repository.Name, elapsed(repositoryStarted))
 			cycleErrors = append(cycleErrors, fmt.Errorf("list %s pull requests: %w", repository.Name, err))
 			sourceScanFailed = true
 			continue
@@ -192,6 +201,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 				continue
 			}
 			key := pullRequestKey(pullRequest.Repository, pullRequest.Number)
+			monitor.logger.Printf("feedback changed: pr=%s changed_threads=%d", key, len(changed))
 			if seenJobKeys[key] {
 				continue
 			}
@@ -219,6 +229,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 			}
 			uniqueJobs++
 		}
+		monitor.logger.Printf("repository poll completed: repository=%s open_prs=%d selected_prs=%d duration=%s", repository.Name, len(openPullRequests), len(pullRequests), elapsed(repositoryStarted))
 	}
 	effectiveCursor := queueCursor
 	startedFromPrefix := len(jobs) == 0
@@ -227,6 +238,9 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 	}
 	if startedFromPrefix && len(jobs) > 0 {
 		effectiveCursor = 0
+	}
+	for _, job := range jobs {
+		monitor.logger.Printf("job admitted: pr=%s threads=%d", job.key, len(job.fingerprints))
 	}
 	result.Deferred = uniqueJobs - len(jobs)
 	nextQueueCursor := 0
@@ -326,9 +340,16 @@ func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob
 			workers.Go(func() {
 				for lane := range queue {
 					for _, item := range lane {
+						started := time.Now()
+						monitor.logger.Printf("dispatch started: pr=%s route=%s", item.job.key, item.job.routeChoice)
 						dispatchContext, cancel := context.WithTimeout(ctx, monitor.dispatchTimeout)
 						outcome := monitor.dispatch(dispatchContext, item)
 						cancel()
+						if outcome.err != nil {
+							monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), elapsed(started))
+						} else {
+							monitor.logger.Printf("dispatch succeeded: pr=%s route=%s duration=%s", item.job.key, item.job.routeChoice, elapsed(started))
+						}
 						completions <- dispatchCompletion{index: item.index, outcome: outcome}
 					}
 				}
@@ -429,6 +450,8 @@ func (monitor *Monitor) resolveRoutes(ctx context.Context, state *stateFile, job
 				job.staleIDs = appendStaleSessionID(job.staleIDs, strings.TrimSpace(current.SessionID))
 			} else {
 				job.sessionID = strings.TrimSpace(current.SessionID)
+				job.routeChoice = routeCached
+				monitor.logger.Printf("route selected: pr=%s route=%s", job.key, job.routeChoice)
 				continue
 			}
 		} else if found {
@@ -456,12 +479,14 @@ func (monitor *Monitor) resolveRoutes(ctx context.Context, state *stateFile, job
 	if err != nil {
 		for _, index := range unresolvedIndexes {
 			errorsByJob[index] = fmt.Errorf("discover task for %s: %w", jobs[index].key, err)
+			monitor.logger.Printf("route deferred: pr=%s reason=discovery_failed", jobs[index].key)
 		}
 		return errorsByJob, stateChanged
 	}
 	if len(discoveries) != len(targets) {
 		for _, index := range unresolvedIndexes {
 			errorsByJob[index] = fmt.Errorf("discover task for %s: harness returned %d results for %d targets", jobs[index].key, len(discoveries), len(targets))
+			monitor.logger.Printf("route deferred: pr=%s reason=discovery_failed", jobs[index].key)
 		}
 		return errorsByJob, stateChanged
 	}
@@ -471,24 +496,38 @@ func (monitor *Monitor) resolveRoutes(ctx context.Context, state *stateFile, job
 		job := &jobs[index]
 		if discovery.Err != nil {
 			errorsByJob[index] = fmt.Errorf("discover task for %s: %w", job.key, discovery.Err)
+			reason := "discovery_failed"
+			if errors.Is(discovery.Err, harness.ErrAmbiguousSession) {
+				reason = "ambiguous"
+			} else if errors.Is(discovery.Err, harness.ErrDiscoveryDeferred) {
+				reason = "discovery_deferred"
+			}
+			monitor.logger.Printf("route deferred: pr=%s reason=%s", job.key, reason)
 			if deferredCursor < 0 && errors.Is(discovery.Err, harness.ErrDiscoveryDeferred) {
 				deferredCursor = (discoveryStart + discoveryIndex) % len(unresolvedIndexes)
 			}
 			continue
 		}
 		if !discovery.Found {
+			job.routeChoice = routeNew
+			monitor.logger.Printf("route selected: pr=%s route=%s", job.key, job.routeChoice)
 			continue
 		}
 		if strings.TrimSpace(discovery.Session.ID) == "" {
 			errorsByJob[index] = fmt.Errorf("discover task for %s: harness returned an empty session ID", job.key)
+			monitor.logger.Printf("route deferred: pr=%s reason=invalid_session", job.key)
 			continue
 		}
 		if slices.ContainsFunc(job.staleIDs, func(staleID string) bool {
 			return strings.EqualFold(staleID, discovery.Session.ID)
 		}) {
+			job.routeChoice = routeNew
+			monitor.logger.Printf("route selected: pr=%s route=%s", job.key, job.routeChoice)
 			continue
 		}
 		job.sessionID = discovery.Session.ID
+		job.routeChoice = routeDiscovered
+		monitor.logger.Printf("route selected: pr=%s route=%s", job.key, job.routeChoice)
 		state.Routes[job.key] = route{
 			Harness: monitor.harness.Name(), SessionID: discovery.Session.ID,
 			StaleSessionIDs: slices.Clone(job.staleIDs),
@@ -503,6 +542,23 @@ func (monitor *Monitor) resolveRoutes(ctx context.Context, state *stateFile, job
 		stateChanged = true
 	}
 	return errorsByJob, stateChanged
+}
+
+func elapsed(started time.Time) time.Duration {
+	return time.Since(started).Round(time.Millisecond)
+}
+
+func dispatchFailureReason(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, harness.ErrSessionNotFound) {
+		return "stale_session"
+	}
+	return "failed"
 }
 
 func targetFor(job dispatchJob) harness.Target {
