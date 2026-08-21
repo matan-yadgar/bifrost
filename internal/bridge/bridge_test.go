@@ -1,9 +1,12 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,7 +83,11 @@ func newTestMonitor(source Source, agentHarness harness.Harness, repositories []
 			panic(err)
 		}
 	}
-	return New(source, agentHarness, repositories, statePath, time.Minute)
+	return New(source, agentHarness, repositories, statePath, time.Minute, discardLogger())
+}
+
+func discardLogger() *log.Logger {
+	return log.New(io.Discard, "", 0)
 }
 
 func readTestRoute(t *testing.T, statePath, key string) route {
@@ -225,6 +232,94 @@ func (agentHarness *fakeHarness) Dispatch(_ context.Context, request harness.Req
 		return harness.Result{SessionID: request.SessionID}, dispatchError
 	}
 	return harness.Result{SessionID: startedID}, dispatchError
+}
+
+func TestMonitorLogsOperationalLifecycleWithoutSensitivePayloads(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	pullRequests := make([]githubapi.PullRequest, 5)
+	threads := make(map[int][]githubapi.ReviewThread, len(pullRequests))
+	for index := range pullRequests {
+		number := index + 1
+		pullRequests[index] = githubapi.PullRequest{
+			Repository: "Owner/Repo", Number: number, URL: fmt.Sprintf("https://example.test/pull/%d", number),
+		}
+		threads[number] = []githubapi.ReviewThread{{
+			ID:       fmt.Sprintf("thread-%d", number),
+			Comments: []githubapi.ReviewComment{{Body: "sensitive review body", UpdatedAt: now}},
+		}}
+	}
+	if err := saveJSON(statePath, &stateFile{
+		Version: stateSchemaVersion,
+		Threads: make(map[string]map[string]string),
+		Routes: map[string]route{
+			"owner/repo#1": {Harness: "codex", SessionID: "sensitive-cached-session"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agentHarness := &fakeHarness{
+		discover: func(targets []harness.Target) ([]harness.Discovery, error) {
+			if len(targets) != 4 {
+				t.Fatalf("discovery targets = %d", len(targets))
+			}
+			return []harness.Discovery{
+				{Found: true, Session: harness.Session{ID: "sensitive-discovered-session"}},
+				{Err: harness.ErrAmbiguousSession},
+				{Err: harness.ErrDiscoveryDeferred},
+				{},
+			}, nil
+		},
+		dispatch: func(request harness.Request) (harness.Result, error) {
+			if request.SessionID == "sensitive-cached-session" {
+				return harness.Result{}, errors.New("sensitive child stderr")
+			}
+			if request.SessionID != "" {
+				return harness.Result{SessionID: request.SessionID}, nil
+			}
+			return harness.Result{SessionID: "sensitive-new-session"}, nil
+		},
+	}
+	var output bytes.Buffer
+	monitor := New(
+		&fakeSource{pullRequests: pullRequests, threadsByPullRequest: threads},
+		agentHarness,
+		[]Repository{{Name: "Owner/Repo", WorkingDirectory: directory}},
+		statePath,
+		time.Minute,
+		log.New(&output, "", 0),
+	)
+
+	result, err := monitor.RunOnce(context.Background())
+	if err == nil || result.Dispatches != 2 {
+		t.Fatalf("result/error = %#v / %v", result, err)
+	}
+	logs := output.String()
+	for _, expected := range []string{
+		"repository poll started: repository=Owner/Repo",
+		"repository poll completed: repository=Owner/Repo open_prs=5 selected_prs=5",
+		"feedback changed: pr=owner/repo#1 changed_threads=1",
+		"job admitted: pr=owner/repo#1 threads=1",
+		"route selected: pr=owner/repo#1 route=cached",
+		"route selected: pr=owner/repo#2 route=discovered",
+		"route deferred: pr=owner/repo#3 reason=ambiguous",
+		"route deferred: pr=owner/repo#4 reason=discovery_deferred",
+		"route selected: pr=owner/repo#5 route=new",
+		"dispatch started: pr=owner/repo#1 route=cached",
+		"dispatch failed: pr=owner/repo#1 route=cached reason=failed",
+		"dispatch succeeded: pr=owner/repo#5 route=new",
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Errorf("logs do not contain %q:\n%s", expected, logs)
+		}
+	}
+	for _, sensitive := range []string{"sensitive review body", "sensitive child stderr", "sensitive-cached-session", "sensitive-discovered-session", "sensitive-new-session", "https://example.test"} {
+		if strings.Contains(logs, sensitive) {
+			t.Errorf("logs contain sensitive value %q:\n%s", sensitive, logs)
+		}
+	}
 }
 
 func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
@@ -662,7 +757,7 @@ func TestMonitorPrunesClosedPullRequestStateAfterSuccessfulListing(t *testing.T)
 		t.Fatal(err)
 	}
 	source := &fakeSource{pullRequest: openPullRequest, threads: []githubapi.ReviewThread{openThread}}
-	monitor := New(source, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute)
+	monitor := New(source, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute, discardLogger())
 
 	result, err := monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != 0 {
@@ -695,7 +790,7 @@ func TestMonitorPreservesOpenPullRequestStateWhenAuthorIsFilteredOut(t *testing.
 	}
 	agentHarness := &fakeHarness{}
 	monitor := New(&fakeSource{pullRequest: pullRequest, threads: []githubapi.ReviewThread{reviewThread("new-thread", time.Now())}}, agentHarness,
-		[]Repository{{Name: "Owner/Repo", Authors: []string{"wanted-author"}, WorkingDirectory: directory}}, statePath, time.Minute)
+		[]Repository{{Name: "Owner/Repo", Authors: []string{"wanted-author"}, WorkingDirectory: directory}}, statePath, time.Minute, discardLogger())
 
 	result, err := monitor.RunOnce(context.Background())
 	if err != nil || result.PullRequests != 0 || result.Threads != 0 || len(agentHarness.requests) != 0 {
@@ -730,7 +825,7 @@ func TestMonitorDoesNotPruneRoutesWhenPullRequestListingFails(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	monitor := New(&fakeSource{openError: errors.New("temporary failure")}, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute)
+	monitor := New(&fakeSource{openError: errors.New("temporary failure")}, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute, discardLogger())
 
 	if _, err := monitor.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected listing error")
@@ -768,7 +863,7 @@ func TestMonitorPrunesSuccessfulRepositoryAndPreservesFailedRepository(t *testin
 	monitor := New(source, &fakeHarness{}, []Repository{
 		{Name: "Good/Repo", WorkingDirectory: directory},
 		{Name: "Bad/Repo", WorkingDirectory: directory},
-	}, statePath, time.Minute)
+	}, statePath, time.Minute, discardLogger())
 
 	if _, err := monitor.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected partial listing error")
@@ -1306,7 +1401,7 @@ func TestDispatchTimeoutPreservesSessionAndLeavesFeedbackPending(t *testing.T) {
 	const dispatchTimeout = 250 * time.Millisecond
 	agentHarness := &timeoutHarness{sessionID: "started-session", deadline: make(chan timeoutObservation, 1)}
 	statePath := filepath.Join(directory, "state.json")
-	monitor := New(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, dispatchTimeout)
+	monitor := New(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, dispatchTimeout, discardLogger())
 	type cycleOutcome struct {
 		result CycleResult
 		err    error

@@ -52,7 +52,7 @@ func main() {
 			Name: repository.Name, Authors: repository.Authors, WorkingDirectory: repository.WorkingDirectory,
 		})
 	}
-	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout)
+	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, log.Default())
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
