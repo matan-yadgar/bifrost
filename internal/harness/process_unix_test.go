@@ -16,7 +16,7 @@ func TestExecRunnerTerminatesChildProcessTree(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	runner := &execRunner{}
+	runner := &execRunner{processes: osProcessStarter{}}
 	childPIDs := make(chan int, 1)
 	completed := make(chan error, 1)
 	go func() {
