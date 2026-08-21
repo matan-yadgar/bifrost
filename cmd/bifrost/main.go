@@ -14,6 +14,7 @@ import (
 	"github.com/matan-yadgar/bifrost/internal/config"
 	githubapi "github.com/matan-yadgar/bifrost/internal/github"
 	"github.com/matan-yadgar/bifrost/internal/harness"
+	"github.com/matan-yadgar/bifrost/internal/instance"
 )
 
 func main() {
@@ -29,6 +30,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	instanceLock, err := instance.Acquire(runtimeConfig.StateFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := instanceLock.Close(); err != nil {
+			log.Printf("release instance lock: %v", err)
+		}
+	}()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	token, err := githubapi.AuthToken(ctx)
