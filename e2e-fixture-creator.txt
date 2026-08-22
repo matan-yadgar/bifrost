@@ -1,2 +1,2 @@
 scenario=creator
-status=pending
+status=handled-v1
