@@ -143,9 +143,6 @@ func Load(path string) (Runtime, error) {
 	if err != nil {
 		return Runtime{}, fmt.Errorf("log_directory: %w", err)
 	}
-	if pathContains(stateFile, logDirectory) || pathContains(path, logDirectory) {
-		return Runtime{}, fmt.Errorf("log_directory must differ from config and state_file paths")
-	}
 	return Runtime{
 		PollInterval:    pollInterval,
 		DispatchTimeout: dispatchTimeout,

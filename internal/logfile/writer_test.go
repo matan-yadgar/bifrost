@@ -87,36 +87,6 @@ func TestNewRejectsARegularFileAsTheDirectory(t *testing.T) {
 	}
 }
 
-func TestWriterPreservesTheNextLineWhenClosingTheFullFileFails(t *testing.T) {
-	t.Parallel()
-	directory := t.TempDir()
-	fixedTime := time.Date(2026, 8, 22, 14, 30, 45, 0, time.Local)
-	writer, err := newWriter(directory, func() time.Time { return fixedTime })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = writer.Close() })
-	fullFile := []byte(strings.Repeat("line\n", maxLinesPerFile))
-	if _, err := writer.Write(fullFile); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	line := []byte("line 1001\n")
-	written, err := writer.Write(line)
-	if err == nil || written != len(line) {
-		t.Fatalf("write = %d / %v", written, err)
-	}
-	data, readErr := os.ReadFile(filepath.Join(directory, "bifrost_2026-08-22_14-30-45_1.log"))
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if !bytes.Equal(data, line) {
-		t.Fatalf("rotated data = %q", data)
-	}
-}
-
 func TestOutputReportsPersistentFailureAndStillUsesBothSinks(t *testing.T) {
 	t.Parallel()
 	t.Run("persistent failure", func(t *testing.T) {

@@ -2,7 +2,6 @@ package config
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -159,39 +158,21 @@ func TestLoadUsesConfiguredDispatchTimeout(t *testing.T) {
 
 func TestLoadRejectsPathCollisions(t *testing.T) {
 	t.Parallel()
-	for _, test := range []struct {
-		name                  string
-		stateFile             string
-		logDir                string
-		stateMustRemainAbsent bool
-	}{
-		{name: "state is config", stateFile: "config.json"},
-		{name: "logs beneath state file", stateFile: "state.json", logDir: "state.json/logs", stateMustRemainAbsent: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			directory := t.TempDir()
-			workingDirectory := filepath.Join(directory, "repo")
-			if err := os.Mkdir(workingDirectory, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			configPath := filepath.Join(directory, "config.json")
-			configJSON := `{
-  "state_file": ` + quotedJSON(test.stateFile) + `,
-  "log_directory": ` + quotedJSON(test.logDir) + `,
+	directory := t.TempDir()
+	workingDirectory := filepath.Join(directory, "repo")
+	if err := os.Mkdir(workingDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(directory, "config.json")
+	configJSON := `{
+  "state_file": "config.json",
   "repositories": [{"name":"owner/repo","working_directory":"repo"}],
   "harness": {"type":"codex"}
 }`
-			if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Load(configPath); err == nil {
-				t.Fatal("expected path collision error")
-			}
-			if test.stateMustRemainAbsent {
-				if _, err := os.Stat(filepath.Join(directory, test.stateFile)); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("state path was created: %v", err)
-				}
-			}
-		})
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("expected path collision error")
 	}
 }

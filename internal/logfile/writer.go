@@ -44,7 +44,7 @@ func newWriter(directory string, now func() time.Time) (*writer, error) {
 		return nil, fmt.Errorf("create log directory: %w", err)
 	}
 	writer := &writer{directory: directory, now: now}
-	if _, err := writer.rotate(); err != nil {
+	if err := writer.rotate(); err != nil {
 		return nil, err
 	}
 	return writer, nil
@@ -57,15 +57,10 @@ func (writer *writer) Write(data []byte) (int, error) {
 		return 0, errors.New("log writer is closed")
 	}
 	written := 0
-	var rotationErrors []error
 	for len(data) > 0 {
 		if writer.lineCount == maxLinesPerFile {
-			rotated, err := writer.rotate()
-			if err != nil {
-				if !rotated {
-					return written, errors.Join(append(rotationErrors, err)...)
-				}
-				rotationErrors = append(rotationErrors, err)
+			if err := writer.rotate(); err != nil {
+				return written, err
 			}
 		}
 		chunkLength := len(data)
@@ -75,17 +70,17 @@ func (writer *writer) Write(data []byte) (int, error) {
 		count, err := writer.file.Write(data[:chunkLength])
 		written += count
 		if err != nil {
-			return written, errors.Join(append(rotationErrors, err)...)
+			return written, err
 		}
 		if count != chunkLength {
-			return written, errors.Join(append(rotationErrors, io.ErrShortWrite)...)
+			return written, io.ErrShortWrite
 		}
 		if data[chunkLength-1] == '\n' {
 			writer.lineCount++
 		}
 		data = data[chunkLength:]
 	}
-	return written, errors.Join(rotationErrors...)
+	return written, nil
 }
 
 func (output *output) Write(data []byte) (int, error) {
@@ -116,18 +111,18 @@ func (writer *writer) Close() error {
 	return err
 }
 
-func (writer *writer) rotate() (bool, error) {
+func (writer *writer) rotate() error {
 	file, err := writer.createFile()
 	if err != nil {
-		return false, err
+		return err
 	}
 	previous := writer.file
 	writer.file = file
 	writer.lineCount = 0
 	if previous != nil {
-		return true, previous.Close()
+		return previous.Close()
 	}
-	return true, nil
+	return nil
 }
 
 func (writer *writer) createFile() (*os.File, error) {
