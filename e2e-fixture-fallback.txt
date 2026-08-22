@@ -1,2 +1,2 @@
 scenario=fallback
-status=pending
+status=handled
