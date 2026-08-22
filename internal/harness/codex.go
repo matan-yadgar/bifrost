@@ -46,10 +46,10 @@ func (codex *Codex) Discover(ctx context.Context, targets []Target) ([]Discovery
 
 func (codex *Codex) Dispatch(ctx context.Context, request Request) (Result, error) {
 	args := []string{"exec"}
+	args = append(args, codex.args...)
 	if request.SessionID != "" {
 		args = append(args, "resume")
 	}
-	args = append(args, codex.args...)
 	args = append(args, "--json")
 	if request.SessionID == "" {
 		if strings.TrimSpace(request.WorkingDirectory) == "" {

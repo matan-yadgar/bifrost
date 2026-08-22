@@ -30,6 +30,7 @@ const (
 	maxDispatchPrompt    = 256 * 1024
 	maxCommentExcerpt    = 2 * 1024
 	maxStaleSessionIDs   = 16
+	commentFingerprintV1 = "comments-v1:"
 	routeCached          = "cached"
 	routeDiscovered      = "discovered"
 	routeNew             = "new"
@@ -617,18 +618,22 @@ func changedThreads(state *stateFile, pullRequest githubapi.PullRequest, threads
 	current := make(map[string]bool)
 	fingerprints := make(map[string]string)
 	var changed []githubapi.ReviewThread
+	stateChanged := false
 	for _, thread := range threads {
 		if thread.IsResolved {
 			continue
 		}
 		current[thread.ID] = true
 		fingerprint := fingerprint(thread)
+		if seen[thread.ID] != "" && seen[thread.ID] != fingerprint && matchesLegacyFingerprint(seen[thread.ID], thread) {
+			seen[thread.ID] = fingerprint
+			stateChanged = true
+		}
 		if seen[thread.ID] != fingerprint {
 			changed = append(changed, thread)
 			fingerprints[thread.ID] = fingerprint
 		}
 	}
-	stateChanged := false
 	for threadID := range seen {
 		if !current[threadID] {
 			delete(seen, threadID)
@@ -644,9 +649,33 @@ func changedThreads(state *stateFile, pullRequest githubapi.PullRequest, threads
 }
 
 func fingerprint(thread githubapi.ReviewThread) string {
+	encoded, _ := json.Marshal(thread.Comments)
+	sum := sha256.Sum256(encoded)
+	return commentFingerprintV1 + hex.EncodeToString(sum[:])
+}
+
+func legacyFingerprint(thread githubapi.ReviewThread) string {
 	encoded, _ := json.Marshal(thread)
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
+}
+
+func matchesLegacyFingerprint(stored string, thread githubapi.ReviewThread) bool {
+	if strings.HasPrefix(stored, commentFingerprintV1) {
+		return false
+	}
+	if stored == legacyFingerprint(thread) {
+		return true
+	}
+	if !thread.IsOutdated {
+		return false
+	}
+	activeThread := thread
+	activeThread.IsOutdated = false
+	activeThread.Line = activeThread.OriginalLine
+	activeThread.StartLine = activeThread.OriginalStartLine
+	// Ambiguous legacy mismatches replay once rather than risk losing an edited comment.
+	return stored == legacyFingerprint(activeThread)
 }
 
 func reviewPrompt(pullRequest githubapi.PullRequest, threads []githubapi.ReviewThread) (string, map[string]bool) {

@@ -721,7 +721,7 @@ func TestCodexDispatchStartsAndResumesSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantResume := []string{"exec", "resume", "--approve-for-me", "--json", sessionID, "-"}
+	wantResume := []string{"exec", "--approve-for-me", "resume", "--json", sessionID, "-"}
 	if result.SessionID != sessionID || !reflect.DeepEqual(runner.args, wantResume) {
 		t.Fatalf("resume result/args = %#v / %#v", result, runner.args)
 	}
