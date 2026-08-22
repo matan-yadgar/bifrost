@@ -1,11 +1,43 @@
 package main
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/matan-yadgar/bifrost/internal/bridge"
 )
+
+func TestNewPersistentLoggerMirrorsOutput(t *testing.T) {
+	t.Parallel()
+	directory := filepath.Join(t.TempDir(), "missing", "logs")
+	var terminal bytes.Buffer
+	logger, closer, err := newPersistentLogger(directory, &terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.Print("connected")
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("log files = %d", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(directory, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(terminal.String(), "connected") || !bytes.Contains(data, []byte("connected")) {
+		t.Fatalf("terminal = %q, file = %q", terminal.String(), data)
+	}
+}
 
 func TestIncompleteDeliveryError(t *testing.T) {
 	t.Parallel()

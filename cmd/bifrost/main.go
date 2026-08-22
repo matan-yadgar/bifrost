@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	githubapi "github.com/matan-yadgar/bifrost/internal/github"
 	"github.com/matan-yadgar/bifrost/internal/harness"
 	"github.com/matan-yadgar/bifrost/internal/instance"
+	"github.com/matan-yadgar/bifrost/internal/logfile"
 )
 
 func main() {
@@ -34,16 +36,25 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	logger, persistentLog, err := newPersistentLogger(runtimeConfig.LogDirectory, os.Stderr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := persistentLog.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close log file: %v\n", err)
+		}
+	}()
 	defer func() {
 		if err := instanceLock.Close(); err != nil {
-			log.Printf("release instance lock: %v", err)
+			logger.Printf("release instance lock: %v", err)
 		}
 	}()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	token, err := githubapi.AuthToken(ctx)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 
 	var agentHarness harness.Harness
@@ -51,10 +62,7 @@ func main() {
 	case "codex":
 		agentHarness = harness.NewCodex(runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, githubapi.WithoutAuthTokens(os.Environ()))
 	default:
-		log.Fatalf("unsupported harness %q", runtimeConfig.Harness.Type)
-	}
-	if err := bridge.ImportLegacyMappings(runtimeConfig.StateFile, runtimeConfig.LegacyMappingDirectory, runtimeConfig.LegacyMappingFile, agentHarness.Name()); err != nil {
-		log.Fatal(err)
+		logger.Fatalf("unsupported harness %q", runtimeConfig.Harness.Type)
 	}
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {
@@ -62,42 +70,50 @@ func main() {
 			Name: repository.Name, Authors: repository.Authors, WorkingDirectory: repository.WorkingDirectory,
 		})
 	}
-	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, log.Default())
+	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, logger)
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
 		result, err := monitor.RunOnce(ctx)
-		log.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
+		logger.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
 		return result, err
 	}
 	if *runOnce {
 		result, err := poll()
 		if err != nil {
-			log.Fatal(err)
+			logger.Fatal(err)
 		}
 		if err := incompleteDeliveryError(result); err != nil {
-			log.Fatal(err)
+			logger.Fatal(err)
 		}
 		return
 	}
 
-	log.Printf("bifrost started: interval=%s dispatch_timeout=%s harness=%s", runtimeConfig.PollInterval, runtimeConfig.DispatchTimeout, agentHarness.Name())
+	logger.Printf("bifrost started: interval=%s dispatch_timeout=%s harness=%s log_directory=%s", runtimeConfig.PollInterval, runtimeConfig.DispatchTimeout, agentHarness.Name(), runtimeConfig.LogDirectory)
 	if _, err := poll(); err != nil {
-		log.Printf("poll failed: %v", err)
+		logger.Printf("poll failed: %v", err)
 	}
 	ticker := time.NewTicker(runtimeConfig.PollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "bifrost stopped")
+			logger.Print("bifrost stopped")
 			return
 		case <-ticker.C:
 			if _, err := poll(); err != nil {
-				log.Printf("poll failed: %v", err)
+				logger.Printf("poll failed: %v", err)
 			}
 		}
 	}
+}
+
+func newPersistentLogger(directory string, terminal io.Writer) (*log.Logger, io.WriteCloser, error) {
+	persistentLog, err := logfile.New(directory)
+	if err != nil {
+		return nil, nil, err
+	}
+	return log.New(logfile.NewOutput(terminal, persistentLog), "", log.LstdFlags), persistentLog, nil
 }
 
 func incompleteDeliveryError(result bridge.CycleResult) error {

@@ -14,6 +14,7 @@ The first harness is Codex CLI. The Go interface in `internal/harness` is the ex
 - Resumes the uniquely matching Codex task, or starts a new one when no task matches.
 - Keeps its private PR-to-task route cache in `state.json`; no second actor or mapping configuration is required.
 - Allows only one Bifrost process per state file. A second process exits immediately; the operating system releases the lock if the owner exits or crashes.
+- Writes logs to the configured directory while continuing to show them in the terminal. Every start creates a new file, and files rotate after 1,000 lines.
 - Clears stale routes for batched re-discovery on the next polling cycle, and removes route and delivery state after a successful scan shows that a PR is no longer open.
 - Marks a thread version delivered only after Codex exits successfully. Resolved threads are forgotten so reopening one emits it again.
 - Cancels a dispatch after 30 minutes by default and terminates its child process tree; timed-out thread versions remain pending.
@@ -42,9 +43,9 @@ bifrost -config /path/to/config.json -once
 
 `GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state and working-directory paths are resolved from the config directory; `~/...` is also supported. Set `dispatch_timeout` to another positive [Go duration](https://pkg.go.dev/time#ParseDuration) when a task legitimately needs longer than the default `30m`.
 
-Each resolved state file has a neighboring `.lock` file. Processes configured with different state files can run at the same time; processes configured with the same state file cannot.
+Set `log_directory` to the directory for persistent logs. Relative paths are resolved from the config directory, and existing configs default to `logs` beside the config file. Each process start creates `bifrost_<YYYY-MM-DD_HH-MM-SS>.log`; same-second collisions add `_1`, `_2`, and so on. A new file is created before writing line 1,001. Log retention and deletion are left to the user.
 
-Configurations from earlier Bifrost versions may keep `mapping_directory` or `mapping_file`. Valid records are atomically imported into `state.json`; an existing route in `state.json` wins. The legacy files are left untouched and can be removed with the deprecated config fields after a successful startup.
+Each resolved state file has a neighboring `.lock` file. Processes configured with different state files can run at the same time; processes configured with the same state file cannot.
 
 An empty `authors` list monitors every open PR in that repository. Restrict repositories and authors carefully: review comments are untrusted input delivered to an agent with access to the configured checkout. Version 1 does not enforce a reviewer allowlist. Bifrost does not enable `--approve-for-me` by default; add harness arguments only when the repository and reviewers are trusted.
 
@@ -54,7 +55,7 @@ Codex stderr is used only for bounded internal error classification. Bifrost doe
 
 ## Codex task discovery
 
-Bifrost asks the local Codex app server to search active and archived local task history for the exact PR URL, then checks those candidates for the exact head-branch name. Paginated turn and item history must show both boundary-delimited strings together in one final assistant response. Legacy history without message phases uses only the terminal assistant message of a completed turn. This excludes user prompts and intermediate commentary from the evidence used to route feedback.
+Bifrost asks the local Codex app server to search active and archived local task history for the exact PR URL, then checks those candidates for the exact head-branch name. Paginated turn and item history must show both boundary-delimited strings together in one final assistant response. History without message phases uses only the terminal assistant message of a completed turn. This excludes user prompts and intermediate commentary from the evidence used to route feedback.
 
 Use this convention when a Codex task opens a PR: include the exact PR URL and exact head branch in that task's final response. No task-name convention or mapping-file write is needed.
 

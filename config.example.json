@@ -2,6 +2,7 @@
   "poll_interval": "5m",
   "dispatch_timeout": "30m",
   "state_file": "state.json",
+  "log_directory": "logs",
   "repositories": [
     {
       "name": "owner/repository",
