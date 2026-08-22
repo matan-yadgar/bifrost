@@ -347,7 +347,7 @@ func TestAppServerDiscoveryRequiresOneFinalResponseWithBothIdentifiers(t *testin
 	}
 }
 
-func TestCreatorFinalUsesLegacyTerminalMessageAndExactBoundaries(t *testing.T) {
+func TestCreatorFinalUsesPhaseLessTerminalMessageAndExactBoundaries(t *testing.T) {
 	t.Parallel()
 	const pullRequestURL = "https://github.com/owner/repo/pull/42"
 	const headRef = "codex/feature-42"
@@ -357,12 +357,12 @@ func TestCreatorFinalUsesLegacyTerminalMessageAndExactBoundaries(t *testing.T) {
 		want      bool
 	}{
 		{
-			name:      "legacy terminal answer",
+			name:      "phase-less terminal answer",
 			itemsJSON: threadItemsResultJSON("turn-1", "created "+pullRequestURL+" from "+headRef, nil),
 			want:      true,
 		},
 		{
-			name: "legacy nonterminal answer",
+			name: "phase-less nonterminal answer",
 			itemsJSON: `{"data":[` +
 				`{"turnId":"turn-1","item":{"type":"agentMessage","phase":null,"text":"created ` + pullRequestURL + ` from ` + headRef + `"}},` +
 				`{"turnId":"turn-1","item":{"type":"agentMessage","phase":null,"text":"later answer"}}` +
@@ -426,7 +426,7 @@ func TestCreatorFinalInFullTurnsPaginatesPrimaryPath(t *testing.T) {
 	}
 }
 
-func TestCreatorFinalInFullTurnsAcceptsLegacyTerminalMessage(t *testing.T) {
+func TestCreatorFinalInFullTurnsAcceptsPhaseLessTerminalMessage(t *testing.T) {
 	t.Parallel()
 	const pullRequestURL = "https://github.com/owner/repo/pull/42"
 	const headRef = "codex/feature-42"
@@ -441,7 +441,7 @@ func TestCreatorFinalInFullTurnsAcceptsLegacyTerminalMessage(t *testing.T) {
 	}
 }
 
-func TestCreatorFinalInFullTurnsRejectsLegacyNonterminalMessage(t *testing.T) {
+func TestCreatorFinalInFullTurnsRejectsPhaseLessNonterminalMessage(t *testing.T) {
 	t.Parallel()
 	const pullRequestURL = "https://github.com/owner/repo/pull/42"
 	const headRef = "codex/feature-42"

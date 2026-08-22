@@ -7,12 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +22,6 @@ import (
 
 const (
 	stateSchemaVersion   = 1
-	mappingSchemaVersion = 1
 	maxDispatchWorkers   = 2
 	maxPendingDispatches = 100
 	maxDispatchPrompt    = 256 * 1024
@@ -73,22 +70,6 @@ type route struct {
 	SessionID       string   `json:"session_id"`
 	Stale           bool     `json:"stale,omitempty"`
 	StaleSessionIDs []string `json:"stale_session_ids,omitempty"`
-}
-
-type legacyMapping struct {
-	Harness   string `json:"harness"`
-	SessionID string `json:"session_id"`
-}
-
-type legacyMappingRecord struct {
-	Version   int    `json:"version"`
-	Harness   string `json:"harness"`
-	SessionID string `json:"session_id"`
-}
-
-type legacyMappingFile struct {
-	Version      int                      `json:"version"`
-	PullRequests map[string]legacyMapping `json:"pull_requests"`
 }
 
 type stateFile struct {
@@ -625,10 +606,6 @@ func changedThreads(state *stateFile, pullRequest githubapi.PullRequest, threads
 		}
 		current[thread.ID] = true
 		fingerprint := fingerprint(thread)
-		if seen[thread.ID] != "" && seen[thread.ID] != fingerprint && matchesLegacyFingerprint(seen[thread.ID], thread) {
-			seen[thread.ID] = fingerprint
-			stateChanged = true
-		}
 		if seen[thread.ID] != fingerprint {
 			changed = append(changed, thread)
 			fingerprints[thread.ID] = fingerprint
@@ -652,30 +629,6 @@ func fingerprint(thread githubapi.ReviewThread) string {
 	encoded, _ := json.Marshal(thread.Comments)
 	sum := sha256.Sum256(encoded)
 	return commentFingerprintV1 + hex.EncodeToString(sum[:])
-}
-
-func legacyFingerprint(thread githubapi.ReviewThread) string {
-	encoded, _ := json.Marshal(thread)
-	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:])
-}
-
-func matchesLegacyFingerprint(stored string, thread githubapi.ReviewThread) bool {
-	if strings.HasPrefix(stored, commentFingerprintV1) {
-		return false
-	}
-	if stored == legacyFingerprint(thread) {
-		return true
-	}
-	if !thread.IsOutdated {
-		return false
-	}
-	activeThread := thread
-	activeThread.IsOutdated = false
-	activeThread.Line = activeThread.OriginalLine
-	activeThread.StartLine = activeThread.OriginalStartLine
-	// Ambiguous legacy mismatches replay once rather than risk losing an edited comment.
-	return stored == legacyFingerprint(activeThread)
 }
 
 func reviewPrompt(pullRequest githubapi.PullRequest, threads []githubapi.ReviewThread) (string, map[string]bool) {
@@ -738,165 +691,6 @@ func displayLine(thread githubapi.ReviewThread) string {
 
 func pullRequestKey(repository string, number int) string {
 	return strings.ToLower(repository) + "#" + fmt.Sprint(number)
-}
-
-func ImportLegacyMappings(statePath, mappingDirectory, mappingFile, harnessName string) error {
-	if mappingDirectory == "" && mappingFile == "" {
-		return nil
-	}
-	state, err := loadState(statePath)
-	if err != nil {
-		return err
-	}
-	imported := make(map[string]route)
-	if err := loadLegacyMappingDirectory(mappingDirectory, harnessName, state.Routes, imported); err != nil {
-		return fmt.Errorf("import mapping_directory: %w", err)
-	}
-	if err := loadLegacyMappingFile(mappingFile, harnessName, state.Routes, imported); err != nil {
-		return fmt.Errorf("import mapping_file: %w", err)
-	}
-	changed := false
-	for key, importedRoute := range imported {
-		if _, found := state.Routes[key]; !found {
-			state.Routes[key] = importedRoute
-			changed = true
-		}
-	}
-	if !changed {
-		return nil
-	}
-	if err := saveJSON(statePath, state); err != nil {
-		return fmt.Errorf("save imported mappings: %w", err)
-	}
-	return nil
-}
-
-func loadLegacyMappingDirectory(directory, harnessName string, currentRoutes, imported map[string]route) error {
-	if directory == "" {
-		return nil
-	}
-	info, err := os.Stat(directory)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("%s is not a directory", directory)
-	}
-	directory, err = filepath.EvalSymlinks(directory)
-	if err != nil {
-		return err
-	}
-	return filepath.WalkDir(directory, func(path string, entry fs.DirEntry, walkError error) error {
-		if walkError != nil {
-			return walkError
-		}
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			return nil
-		}
-		if !entry.Type().IsRegular() {
-			return fmt.Errorf("mapping record %s must be a regular file", path)
-		}
-		key, err := legacyMappingKey(directory, path)
-		if err != nil {
-			return err
-		}
-		if _, found := currentRoutes[key]; found {
-			return nil
-		}
-		record := &legacyMappingRecord{Version: mappingSchemaVersion}
-		if err := loadJSON(path, record); err != nil {
-			return err
-		}
-		return addLegacyMapping(imported, key, record.Harness, record.SessionID, record.Version, harnessName)
-	})
-}
-
-func loadLegacyMappingFile(path, harnessName string, currentRoutes, imported map[string]route) error {
-	if path == "" {
-		return nil
-	}
-	info, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file", path)
-	}
-	mappings := &legacyMappingFile{Version: mappingSchemaVersion, PullRequests: make(map[string]legacyMapping)}
-	if err := loadJSON(path, mappings); err != nil {
-		return err
-	}
-	if mappings.Version != mappingSchemaVersion {
-		return fmt.Errorf("unsupported mapping version %d", mappings.Version)
-	}
-	for key, mapping := range mappings.PullRequests {
-		normalized, err := normalizePullRequestKey(key)
-		if err != nil {
-			return err
-		}
-		if _, found := currentRoutes[normalized]; found {
-			continue
-		}
-		if err := addLegacyMapping(imported, normalized, mapping.Harness, mapping.SessionID, mappings.Version, harnessName); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func addLegacyMapping(imported map[string]route, key, mappedHarness, sessionID string, version int, configuredHarness string) error {
-	if version != mappingSchemaVersion {
-		return fmt.Errorf("unsupported mapping version %d", version)
-	}
-	mappedHarness = strings.TrimSpace(mappedHarness)
-	if mappedHarness == "" {
-		mappedHarness = configuredHarness
-	}
-	if !strings.EqualFold(mappedHarness, configuredHarness) {
-		return fmt.Errorf("mapping %s uses unsupported harness %q", key, mappedHarness)
-	}
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return fmt.Errorf("mapping %s has an empty session ID", key)
-	}
-	value := route{Harness: configuredHarness, SessionID: sessionID}
-	if existing, found := imported[key]; found &&
-		(!strings.EqualFold(existing.Harness, value.Harness) || !strings.EqualFold(existing.SessionID, value.SessionID)) {
-		return fmt.Errorf("conflicting mappings for %s", key)
-	}
-	imported[key] = value
-	return nil
-}
-
-func legacyMappingKey(directory, path string) (string, error) {
-	relative, err := filepath.Rel(directory, path)
-	if err != nil {
-		return "", err
-	}
-	parts := strings.Split(filepath.ToSlash(relative), "/")
-	if len(parts) != 3 || filepath.Ext(parts[2]) != ".json" {
-		return "", fmt.Errorf("invalid mapping record path %s", path)
-	}
-	return normalizePullRequestKey(parts[0] + "/" + parts[1] + "#" + strings.TrimSuffix(parts[2], ".json"))
-}
-
-func normalizePullRequestKey(key string) (string, error) {
-	repository, numberText, found := strings.Cut(strings.ToLower(strings.TrimSpace(key)), "#")
-	owner, name, repositoryFound := strings.Cut(repository, "/")
-	number, numberError := strconv.Atoi(numberText)
-	validSegment := func(value string) bool {
-		return value != "" && value != "." && value != ".." && !strings.ContainsAny(value, `/\\`)
-	}
-	if !found || !repositoryFound || !validSegment(owner) || !validSegment(name) || numberError != nil || number <= 0 {
-		return "", fmt.Errorf("invalid pull request key %q", key)
-	}
-	return pullRequestKey(owner+"/"+name, number), nil
 }
 
 func loadState(path string) (*stateFile, error) {

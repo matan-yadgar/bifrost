@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -97,98 +96,6 @@ func readTestRoute(t *testing.T, statePath, key string) route {
 		t.Fatal(err)
 	}
 	return state.Routes[key]
-}
-
-func TestImportLegacyMappingsAtomicallyMigratesBothFormats(t *testing.T) {
-	t.Parallel()
-	directory := t.TempDir()
-	statePath := filepath.Join(directory, "state.json")
-	mappingDirectory := filepath.Join(directory, "mappings")
-	mappingFile := filepath.Join(directory, "mappings.json")
-	if err := saveJSON(statePath, &stateFile{
-		Version:         stateSchemaVersion,
-		QueueCursor:     7,
-		DiscoveryCursor: 5,
-		Threads:         map[string]map[string]string{"owner/repo#3": {"thread-3": "fingerprint-3"}},
-		Routes:          map[string]route{"owner/repo#3": {Harness: "codex", SessionID: "newer-session"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	recordDirectory := filepath.Join(mappingDirectory, "owner", "repo")
-	if err := os.MkdirAll(recordDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(recordDirectory, "1.json"), []byte(`{"version":1,"harness":"codex","session_id":"directory-session"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(recordDirectory, "3.json"), []byte(`{"version":1,"harness":"codex","session_id":"directory-older-session"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	aggregateJSON := `{"version":1,"pull_requests":{"Owner/Repo#2":{"harness":"codex","session_id":"file-session"},"owner/repo#3":{"harness":"codex","session_id":"older-session"}}}`
-	if err := os.WriteFile(mappingFile, []byte(aggregateJSON), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := ImportLegacyMappings(statePath, mappingDirectory, mappingFile, "codex"); err != nil {
-		t.Fatal(err)
-	}
-	state, err := loadState(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	directoryRoute := state.Routes["owner/repo#1"]
-	fileRoute := state.Routes["owner/repo#2"]
-	existingRoute := state.Routes["owner/repo#3"]
-	if directoryRoute.Harness != "codex" || directoryRoute.SessionID != "directory-session" ||
-		fileRoute.Harness != "codex" || fileRoute.SessionID != "file-session" ||
-		existingRoute.Harness != "codex" || existingRoute.SessionID != "newer-session" ||
-		state.QueueCursor != 7 || state.DiscoveryCursor != 5 || state.Threads["owner/repo#3"]["thread-3"] != "fingerprint-3" {
-		t.Fatalf("migrated state = %#v", state)
-	}
-	if err := saveJSON(filepath.Join(mappingDirectory, "owner", "repo", "4.json"), &legacyMappingRecord{
-		Version: mappingSchemaVersion, Harness: "codex", SessionID: "late-session",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := ImportLegacyMappings(statePath, mappingDirectory, mappingFile, "codex"); err != nil {
-		t.Fatal(err)
-	}
-	state, err = loadState(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lateRoute := state.Routes["owner/repo#4"]
-	if lateRoute.Harness != "codex" || lateRoute.SessionID != "late-session" ||
-		state.QueueCursor != 7 || state.DiscoveryCursor != 5 || state.Threads["owner/repo#3"]["thread-3"] != "fingerprint-3" {
-		t.Fatalf("idempotent migration did not import a new legacy record: %#v", state.Routes)
-	}
-}
-
-func TestImportLegacyMappingsDoesNotPartiallySaveInvalidInput(t *testing.T) {
-	t.Parallel()
-	directory := t.TempDir()
-	statePath := filepath.Join(directory, "state.json")
-	mappingDirectory := filepath.Join(directory, "mappings")
-	mappingFile := filepath.Join(directory, "mappings.json")
-	if err := saveJSON(filepath.Join(mappingDirectory, "owner", "repo", "1.json"), &legacyMappingRecord{
-		Version: mappingSchemaVersion, Harness: "codex", SessionID: "valid-session",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := saveJSON(mappingFile, &legacyMappingFile{Version: mappingSchemaVersion + 1}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := ImportLegacyMappings(statePath, mappingDirectory, mappingFile, "codex"); err == nil {
-		t.Fatal("expected invalid mapping error")
-	}
-	state, err := loadState(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Routes) != 0 {
-		t.Fatalf("partial migration state = %#v", state)
-	}
 }
 
 func (agentHarness *fakeHarness) Name() string {
@@ -407,80 +314,6 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 	result, err = monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != 1 {
 		t.Fatalf("reopened result/error = %#v / %v", result, err)
-	}
-}
-
-func TestMonitorMigratesLegacyThreadFingerprint(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name                string
-		legacyFingerprint   string
-		body                string
-		updatedAt           time.Time
-		isOutdated          bool
-		originalLine        int
-		currentLine         int
-		expectedDispatches  int
-		expectedFingerprint string
-	}{
-		{
-			name: "unchanged active thread", legacyFingerprint: "98bc123313a857e7f882b58a533c191ba145f0dfa248a630e7f1a4eedf25f593",
-			body: "consider this", updatedAt: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC),
-			expectedFingerprint: "comments-v1:e913daafc0cacbe22e05c49927d69c2d230afad0bae72ec067733ac870aa7e31",
-		},
-		{
-			name: "location metadata only", legacyFingerprint: "54c1f3b399138043070ae6bb8f7b606d84ec5407e21fcf3690a8d68af1aefe79",
-			body: "consider this", updatedAt: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC), isOutdated: true, originalLine: 12,
-			expectedFingerprint: "comments-v1:e913daafc0cacbe22e05c49927d69c2d230afad0bae72ec067733ac870aa7e31",
-		},
-		{
-			name: "comment changed", legacyFingerprint: "54c1f3b399138043070ae6bb8f7b606d84ec5407e21fcf3690a8d68af1aefe79",
-			body: "updated request", updatedAt: time.Date(2026, 8, 20, 12, 1, 0, 0, time.UTC), isOutdated: true, originalLine: 12, expectedDispatches: 1,
-			expectedFingerprint: "comments-v1:a7c1c9d2af3063fa40887747e601a6df9ed284ff0c5f4a540ce16dd4291f2a53",
-		},
-		{
-			name: "ambiguous shifted line", legacyFingerprint: "54c1f3b399138043070ae6bb8f7b606d84ec5407e21fcf3690a8d68af1aefe79",
-			body: "consider this", updatedAt: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC), originalLine: 12, currentLine: 13, expectedDispatches: 1,
-			expectedFingerprint: "comments-v1:e913daafc0cacbe22e05c49927d69c2d230afad0bae72ec067733ac870aa7e31",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			directory := t.TempDir()
-			statePath := filepath.Join(directory, "state.json")
-			source := reviewSource()
-			source.threads[0].IsOutdated = test.isOutdated
-			if test.originalLine != 0 {
-				source.threads[0].OriginalLine = &test.originalLine
-			}
-			if test.currentLine != 0 {
-				source.threads[0].Line = &test.currentLine
-			}
-			source.threads[0].Comments[0].Body = test.body
-			source.threads[0].Comments[0].UpdatedAt = test.updatedAt
-			if err := saveJSON(statePath, &stateFile{
-				Version: stateSchemaVersion,
-				Threads: map[string]map[string]string{
-					"owner/repo#42": {source.threads[0].ID: test.legacyFingerprint},
-				},
-			}); err != nil {
-				t.Fatal(err)
-			}
-			agentHarness := &fakeHarness{}
-			monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
-
-			result, err := monitor.RunOnce(context.Background())
-			if err != nil || result.Dispatches != test.expectedDispatches || len(agentHarness.requests) != test.expectedDispatches {
-				t.Fatalf("result/error/requests = %#v / %v / %#v", result, err, agentHarness.requests)
-			}
-			state, err := loadState(statePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if migrated := state.Threads["owner/repo#42"][source.threads[0].ID]; migrated != test.expectedFingerprint {
-				t.Fatalf("migrated fingerprint = %q", migrated)
-			}
-		})
 	}
 }
 
