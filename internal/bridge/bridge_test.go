@@ -366,6 +366,16 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 		t.Fatalf("unchanged result/error = %#v / %v", result, err)
 	}
 
+	line := 12
+	startLine := 10
+	source.threads[0].IsOutdated = true
+	source.threads[0].Line = &line
+	source.threads[0].StartLine = &startLine
+	result, err = monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 0 {
+		t.Fatalf("location-only update result/error = %#v / %v", result, err)
+	}
+
 	source.threads[0].Comments[0].Body = "updated request"
 	source.threads[0].Comments[0].UpdatedAt = now.Add(time.Minute)
 	result, err = monitor.RunOnce(context.Background())
@@ -374,6 +384,18 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 	}
 	if agentHarness.requests[1].SessionID != agentHarness.startedID {
 		t.Fatalf("updated thread did not resume cached session: %#v", agentHarness.requests[1])
+	}
+
+	source.threads[0].Comments = append(source.threads[0].Comments, githubapi.ReviewComment{
+		ID: "comment-3", Author: "reviewer", Body: "follow-up reply", URL: "https://example/comment/3",
+		CreatedAt: now.Add(2 * time.Minute), UpdatedAt: now.Add(2 * time.Minute),
+	})
+	result, err = monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 1 {
+		t.Fatalf("reply result/error = %#v / %v", result, err)
+	}
+	if request := agentHarness.requests[2]; request.SessionID != agentHarness.startedID || !strings.Contains(request.Prompt, "follow-up reply") {
+		t.Fatalf("reply did not resume cached session with updated prompt: %#v", request)
 	}
 
 	source.threads[0].IsResolved = true
@@ -385,6 +407,80 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 	result, err = monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != 1 {
 		t.Fatalf("reopened result/error = %#v / %v", result, err)
+	}
+}
+
+func TestMonitorMigratesLegacyThreadFingerprint(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name                string
+		legacyFingerprint   string
+		body                string
+		updatedAt           time.Time
+		isOutdated          bool
+		originalLine        int
+		currentLine         int
+		expectedDispatches  int
+		expectedFingerprint string
+	}{
+		{
+			name: "unchanged active thread", legacyFingerprint: "98bc123313a857e7f882b58a533c191ba145f0dfa248a630e7f1a4eedf25f593",
+			body: "consider this", updatedAt: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC),
+			expectedFingerprint: "comments-v1:e913daafc0cacbe22e05c49927d69c2d230afad0bae72ec067733ac870aa7e31",
+		},
+		{
+			name: "location metadata only", legacyFingerprint: "54c1f3b399138043070ae6bb8f7b606d84ec5407e21fcf3690a8d68af1aefe79",
+			body: "consider this", updatedAt: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC), isOutdated: true, originalLine: 12,
+			expectedFingerprint: "comments-v1:e913daafc0cacbe22e05c49927d69c2d230afad0bae72ec067733ac870aa7e31",
+		},
+		{
+			name: "comment changed", legacyFingerprint: "54c1f3b399138043070ae6bb8f7b606d84ec5407e21fcf3690a8d68af1aefe79",
+			body: "updated request", updatedAt: time.Date(2026, 8, 20, 12, 1, 0, 0, time.UTC), isOutdated: true, originalLine: 12, expectedDispatches: 1,
+			expectedFingerprint: "comments-v1:a7c1c9d2af3063fa40887747e601a6df9ed284ff0c5f4a540ce16dd4291f2a53",
+		},
+		{
+			name: "ambiguous shifted line", legacyFingerprint: "54c1f3b399138043070ae6bb8f7b606d84ec5407e21fcf3690a8d68af1aefe79",
+			body: "consider this", updatedAt: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC), originalLine: 12, currentLine: 13, expectedDispatches: 1,
+			expectedFingerprint: "comments-v1:e913daafc0cacbe22e05c49927d69c2d230afad0bae72ec067733ac870aa7e31",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			statePath := filepath.Join(directory, "state.json")
+			source := reviewSource()
+			source.threads[0].IsOutdated = test.isOutdated
+			if test.originalLine != 0 {
+				source.threads[0].OriginalLine = &test.originalLine
+			}
+			if test.currentLine != 0 {
+				source.threads[0].Line = &test.currentLine
+			}
+			source.threads[0].Comments[0].Body = test.body
+			source.threads[0].Comments[0].UpdatedAt = test.updatedAt
+			if err := saveJSON(statePath, &stateFile{
+				Version: stateSchemaVersion,
+				Threads: map[string]map[string]string{
+					"owner/repo#42": {source.threads[0].ID: test.legacyFingerprint},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			agentHarness := &fakeHarness{}
+			monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
+
+			result, err := monitor.RunOnce(context.Background())
+			if err != nil || result.Dispatches != test.expectedDispatches || len(agentHarness.requests) != test.expectedDispatches {
+				t.Fatalf("result/error/requests = %#v / %v / %#v", result, err, agentHarness.requests)
+			}
+			state, err := loadState(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if migrated := state.Threads["owner/repo#42"][source.threads[0].ID]; migrated != test.expectedFingerprint {
+				t.Fatalf("migrated fingerprint = %q", migrated)
+			}
+		})
 	}
 }
 
