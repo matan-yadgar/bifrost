@@ -349,6 +349,56 @@ func TestMonitorDiscoversExistingTaskBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestMonitorRetainsDiscoveredChildWhenFirstDispatchFails(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const childSessionID = "019c0000-0000-7000-8000-000000000019"
+	transientError := errors.New("transient dispatch failure")
+	attempts := 0
+	agentHarness := &fakeHarness{
+		discoveredID: childSessionID,
+		dispatch: func(request harness.Request) (harness.Result, error) {
+			attempts++
+			if attempts == 1 {
+				return harness.Result{SessionID: request.SessionID}, transientError
+			}
+			return harness.Result{SessionID: request.SessionID}, nil
+		},
+	}
+	source := reviewSource()
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, nil)
+
+	result, err := monitor.RunOnce(context.Background())
+	if !errors.Is(err, transientError) || result.Dispatches != 0 {
+		t.Fatalf("first result/error = %#v / %v", result, err)
+	}
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Routes["owner/repo#42"].SessionID != childSessionID || state.Threads["owner/repo#42"] != nil {
+		t.Fatalf("state after failure = %#v", state)
+	}
+
+	result, err = monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 1 || agentHarness.discoverCalls != 1 || len(agentHarness.requests) != 2 {
+		t.Fatalf("second result/error/discovery/requests = %#v / %v / %d / %#v", result, err, agentHarness.discoverCalls, agentHarness.requests)
+	}
+	for _, request := range agentHarness.requests {
+		if request.SessionID != childSessionID {
+			t.Fatalf("dispatch request = %#v", request)
+		}
+	}
+	state, err = loadState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Threads["owner/repo#42"][source.threads[0].ID] != fingerprint(source.threads[0]) {
+		t.Fatalf("state after retry = %#v", state)
+	}
+}
+
 func TestMonitorDiscoversUnroutedJobsInOneBatch(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
