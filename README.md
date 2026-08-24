@@ -11,7 +11,7 @@ The first harness is Codex CLI. The Go interface in `internal/harness` is the ex
 - Emits existing unresolved threads on the first run, then only new or changed thread versions.
 - Batches all changed threads for one PR into one message.
 - Discovers the creating Codex task by searching local task history for the exact PR URL and head branch, then verifies that both occur together in a final assistant response.
-- Resumes the uniquely matching Codex task, or starts a new one when no task matches.
+- Forks the uniquely matching Codex task and resumes that child, or starts a new task when no task matches.
 - Keeps its private PR-to-task route cache in `state.json`; no second actor or mapping configuration is required.
 - Allows only one Bifrost process per state file. A second process exits immediately; the operating system releases the lock if the owner exits or crashes.
 - Writes logs to the configured directory while continuing to show them in the terminal. Every start creates a new file, and files rotate after 1,000 lines.
@@ -59,11 +59,11 @@ Bifrost asks the local Codex app server to search active and archived local task
 
 Use this convention when a Codex task opens a PR: include the exact PR URL and exact head branch in that task's final response. No task-name convention or mapping-file write is needed.
 
-If exactly one task matches, Bifrost resumes it. If none match, Bifrost starts a new task in the configured working directory. If multiple tasks match or discovery is unavailable, Bifrost reports the error and leaves the review feedback pending rather than guessing or creating a duplicate task.
+If exactly one task matches, Bifrost creates a persistent Codex fork containing its history and sends review feedback to that child. This avoids competing with the Desktop app for ownership of the creator task. Forks are named `Bifrost: owner/repo#number` so they can be recovered after a route is pruned. If none match, Bifrost starts a new task in the configured working directory. If multiple tasks match or discovery is unavailable, Bifrost reports the error and leaves the review feedback pending rather than guessing or creating a duplicate task.
 
 This convention is a practical local discovery heuristic, not an authenticated GitHub-to-Codex identity link. A different task whose final response deliberately includes both exact values can still create ambiguity or a false match. Use Bifrost only with trusted local Codex task history; a future harness with authoritative task metadata should validate that metadata in its adapter.
 
-Successful discovery and newly started task IDs are cached under `routes` in `state.json`. This is private Bifrost state, not an integration contract for PR-creating tasks. The cache avoids repeated discovery and is pruned with delivery fingerprints when a successfully listed repository no longer reports the PR as open.
+Forked and newly started task IDs are cached under `routes` in `state.json`. Later feedback resumes the cached Bifrost-owned task rather than creating another fork. This is private Bifrost state, not an integration contract for PR-creating tasks. The cache avoids repeated discovery and is pruned with delivery fingerprints when a successfully listed repository no longer reports the PR as open.
 
 The harness interface separates discovery from dispatch. Codex currently implements discovery through the experimental local `codex app-server --stdio` API and dispatch through `codex exec`; a future Claude or Grok adapter can implement the same Go interface without changing GitHub polling or queue behavior. A Codex CLI update may require a small app-server adapter update while that API remains experimental.
 

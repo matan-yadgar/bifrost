@@ -31,6 +31,7 @@ const (
 	maxAppServerReconnects    = 3
 	finalAssistantMessage     = "final_answer"
 	agentMessageItem          = "agentMessage"
+	bifrostTaskNamePrefix     = "Bifrost: "
 )
 
 var (
@@ -73,15 +74,24 @@ type rpcResponse struct {
 	} `json:"error"`
 }
 
+type threadSearchThread struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type threadSearchItem struct {
-	Thread struct {
-		ID string `json:"id"`
-	} `json:"thread"`
+	Thread threadSearchThread `json:"thread"`
 }
 
 type threadSearchResult struct {
 	Data       *[]threadSearchItem `json:"data"`
 	NextCursor *string             `json:"nextCursor"`
+}
+
+type threadForkResult struct {
+	Thread struct {
+		ID string `json:"id"`
+	} `json:"thread"`
 }
 
 type threadTurn struct {
@@ -264,25 +274,41 @@ func (client *appServerClient) discover(target Target) Discovery {
 	if err != nil {
 		return Discovery{Err: err}
 	}
-	var candidateIDs []string
-	for sessionID := range urlSessions {
+	var candidates []threadSearchThread
+	for sessionID, candidate := range urlSessions {
 		if slices.ContainsFunc(target.ExcludedSessionIDs, func(excluded string) bool {
 			return strings.EqualFold(sessionID, strings.TrimSpace(excluded))
 		}) {
 			continue
 		}
-		candidateIDs = append(candidateIDs, sessionID)
+		candidates = append(candidates, candidate)
 	}
-	sort.Strings(candidateIDs)
-	var matching []string
-	for _, sessionID := range candidateIDs {
-		qualifies, err := client.hasCreatorFinal(sessionID, target.URL, target.HeadRef)
+	sort.Slice(candidates, func(left, right int) bool { return candidates[left].ID < candidates[right].ID })
+	taskName := bifrostTaskName(target)
+	for _, candidate := range candidates {
+		if candidate.Name != taskName {
+			continue
+		}
+		qualifies, err := client.hasCreatorFinal(candidate.ID, target.URL, target.HeadRef)
 		if err != nil {
 			return Discovery{Err: err}
 		}
 		if qualifies {
-			matching = append(matching, sessionID)
-			if len(matching) == 2 {
+			return Discovery{Session: Session{ID: candidate.ID}, Found: true}
+		}
+	}
+	var matching []string
+	for _, candidate := range candidates {
+		if candidate.Name == taskName {
+			continue
+		}
+		qualifies, err := client.hasCreatorFinal(candidate.ID, target.URL, target.HeadRef)
+		if err != nil {
+			return Discovery{Err: err}
+		}
+		if qualifies {
+			matching = append(matching, candidate.ID)
+			if len(matching) > 1 {
 				return Discovery{Err: fmt.Errorf("%w: found at least 2 matches", ErrAmbiguousSession)}
 			}
 		}
@@ -290,10 +316,38 @@ func (client *appServerClient) discover(target Target) Discovery {
 	if len(matching) == 0 {
 		return Discovery{}
 	}
-	if !validSessionID(matching[0]) {
-		return Discovery{Err: fmt.Errorf("Codex discovery returned an invalid session ID")}
+	forkedSessionID, err := client.fork(matching[0], taskName)
+	if err != nil {
+		return Discovery{Err: err}
 	}
-	return Discovery{Session: Session{ID: matching[0]}, Found: true}
+	return Discovery{Session: Session{ID: forkedSessionID}, Found: true}
+}
+
+func bifrostTaskName(target Target) string {
+	return fmt.Sprintf("%s%s#%d", bifrostTaskNamePrefix, strings.ToLower(target.Repository), target.PullRequest)
+}
+
+func (client *appServerClient) fork(sessionID, taskName string) (string, error) {
+	var result threadForkResult
+	if err := client.request("thread/fork", map[string]any{"threadId": sessionID}, &result); err != nil {
+		return "", err
+	}
+	if !validSessionID(result.Thread.ID) {
+		return "", fmt.Errorf("Codex app-server returned an invalid forked thread ID")
+	}
+	if strings.EqualFold(result.Thread.ID, sessionID) {
+		return "", fmt.Errorf("Codex app-server returned the creator thread as the fork")
+	}
+	var nameResult struct{}
+	if err := client.request("thread/name/set", map[string]any{
+		"threadId": result.Thread.ID,
+		"name":     taskName,
+	}, &nameResult); err != nil {
+		var deleteResult struct{}
+		deleteError := client.request("thread/delete", map[string]any{"threadId": result.Thread.ID}, &deleteResult)
+		return "", errors.Join(err, deleteError)
+	}
+	return result.Thread.ID, nil
 }
 
 func (client *appServerClient) initialize() error {
@@ -312,8 +366,8 @@ func (client *appServerClient) initialize() error {
 	return nil
 }
 
-func (client *appServerClient) searchAll(term string) (map[string]bool, error) {
-	sessions := make(map[string]bool)
+func (client *appServerClient) searchAll(term string) (map[string]threadSearchThread, error) {
+	sessions := make(map[string]threadSearchThread)
 	for _, archived := range []bool{false, true} {
 		if err := client.search(term, archived, sessions); err != nil {
 			return nil, err
@@ -322,7 +376,7 @@ func (client *appServerClient) searchAll(term string) (map[string]bool, error) {
 	return sessions, nil
 }
 
-func (client *appServerClient) search(term string, archived bool, sessions map[string]bool) error {
+func (client *appServerClient) search(term string, archived bool, sessions map[string]threadSearchThread) error {
 	var cursor *string
 	seenCursors := make(map[string]bool)
 	for page := 0; page < maxThreadSearchPages; page++ {
@@ -346,7 +400,7 @@ func (client *appServerClient) search(term string, archived bool, sessions map[s
 			if !validSessionID(item.Thread.ID) {
 				return fmt.Errorf("Codex app-server returned an invalid thread ID")
 			}
-			sessions[item.Thread.ID] = true
+			sessions[item.Thread.ID] = item.Thread
 			if len(sessions) > maxDiscoveryCandidates {
 				return fmt.Errorf("Codex task discovery exceeded %d candidates", maxDiscoveryCandidates)
 			}
