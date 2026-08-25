@@ -1860,6 +1860,9 @@ func TestReviewPromptBoundsUntrustedCommentText(t *testing.T) {
 	if !strings.HasPrefix(prompt, "New or updated unresolved inline review feedback") || !strings.Contains(prompt, "comment-prefix") {
 		t.Fatalf("prompt lost required content: %s", prompt[:min(len(prompt), 200)])
 	}
+	if !strings.Contains(prompt, "verify through GitHub that the pull request is still open") || !strings.Contains(prompt, "If it is merged or closed, do not edit files, commit, push, or resolve review threads") {
+		t.Fatalf("prompt lost closed pull request guard")
+	}
 	if len(included) == 0 || len(included) >= len(threads) {
 		t.Fatalf("included threads = %d", len(included))
 	}
