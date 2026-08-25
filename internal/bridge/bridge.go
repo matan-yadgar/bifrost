@@ -21,16 +21,17 @@ import (
 )
 
 const (
-	stateSchemaVersion   = 1
-	maxDispatchWorkers   = 2
-	maxPendingDispatches = 100
-	maxDispatchPrompt    = 256 * 1024
-	maxCommentExcerpt    = 2 * 1024
-	maxStaleSessionIDs   = 16
-	commentFingerprintV1 = "comments-v1:"
-	routeCached          = "cached"
-	routeDiscovered      = "discovered"
-	routeNew             = "new"
+	stateSchemaVersion        = 1
+	maxDispatchWorkers        = 2
+	maxPendingDispatches      = 100
+	maxDispatchPrompt         = 256 * 1024
+	maxCommentExcerpt         = 2 * 1024
+	maxStaleSessionIDs        = 16
+	dispatchHeartbeatInterval = 30 * time.Second
+	commentFingerprintV1      = "comments-v1:"
+	routeCached               = "cached"
+	routeDiscovered           = "discovered"
+	routeNew                  = "new"
 )
 
 const promptOmissionSuffix = "\n[Additional changed threads omitted from this message; they remain pending for a later poll.]\n"
@@ -47,14 +48,16 @@ type Repository struct {
 }
 
 type Monitor struct {
-	source          Source
-	harness         harness.Harness
-	repositories    []Repository
-	stateFile       string
-	dispatchTimeout time.Duration
-	logger          *log.Logger
-	spawnLocks      keyedMutex
-	sessionLocks    keyedMutex
+	source             Source
+	harness            harness.Harness
+	repositories       []Repository
+	stateFile          string
+	dispatchTimeout    time.Duration
+	heartbeatInterval  time.Duration
+	newHeartbeatTicker func(time.Duration) (<-chan time.Time, func())
+	logger             *log.Logger
+	spawnLocks         keyedMutex
+	sessionLocks       keyedMutex
 }
 
 type CycleResult struct {
@@ -136,8 +139,14 @@ func (locks *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, dispatchTimeout time.Duration, logger *log.Logger) *Monitor {
 	return &Monitor{
 		source: source, harness: agentHarness, repositories: repositories,
-		stateFile: statePath, dispatchTimeout: dispatchTimeout, logger: logger,
+		stateFile: statePath, dispatchTimeout: dispatchTimeout, heartbeatInterval: dispatchHeartbeatInterval,
+		newHeartbeatTicker: newHeartbeatTicker, logger: logger,
 	}
+}
+
+func newHeartbeatTicker(interval time.Duration) (<-chan time.Time, func()) {
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop
 }
 
 func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
@@ -235,16 +244,17 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 	}
 	discoveryErrors, routesChanged := monitor.resolveRoutes(ctx, state, jobs)
 	stateChanged = stateChanged || routesChanged
+	for _, discoveryError := range discoveryErrors {
+		if discoveryError != nil {
+			result.Deferred++
+			cycleErrors = append(cycleErrors, discoveryError)
+		}
+	}
 	if stateChanged {
 		if err := saveJSON(monitor.stateFile, state); err != nil {
 			return result, err
 		}
 		stateChanged = false
-	}
-	for _, discoveryError := range discoveryErrors {
-		if discoveryError != nil {
-			cycleErrors = append(cycleErrors, discoveryError)
-		}
 	}
 	for completion := range monitor.runDispatchQueue(ctx, jobs, discoveryErrors) {
 		job := jobs[completion.index]
@@ -325,7 +335,7 @@ func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob
 						started := time.Now()
 						monitor.logger.Printf("dispatch started: pr=%s route=%s", item.job.key, item.job.routeChoice)
 						dispatchContext, cancel := context.WithTimeout(ctx, monitor.dispatchTimeout)
-						outcome := monitor.dispatch(dispatchContext, item)
+						outcome := monitor.dispatchWithHeartbeat(dispatchContext, item, started)
 						cancel()
 						if outcome.err != nil {
 							monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), elapsed(started))
@@ -344,6 +354,23 @@ func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob
 		workers.Wait()
 	}()
 	return completions
+}
+
+func (monitor *Monitor) dispatchWithHeartbeat(ctx context.Context, item queuedDispatch, started time.Time) dispatchOutcome {
+	outcomes := make(chan dispatchOutcome, 1)
+	go func() {
+		outcomes <- monitor.dispatch(ctx, item)
+	}()
+	heartbeats, stopHeartbeat := monitor.newHeartbeatTicker(monitor.heartbeatInterval)
+	defer stopHeartbeat()
+	for {
+		select {
+		case outcome := <-outcomes:
+			return outcome
+		case heartbeat := <-heartbeats:
+			monitor.logger.Printf("dispatch still running: pr=%s route=%s elapsed=%s", item.job.key, item.job.routeChoice, heartbeat.Sub(started).Round(time.Millisecond))
+		}
+	}
 }
 
 func (monitor *Monitor) dispatchLanes(jobs []dispatchJob, discoveryErrors []error) [][]queuedDispatch {
