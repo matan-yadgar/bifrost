@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -200,7 +201,7 @@ func TestMonitorLogsOperationalLifecycleWithoutSensitivePayloads(t *testing.T) {
 	)
 
 	result, err := monitor.RunOnce(context.Background())
-	if err == nil || result.Dispatches != 2 {
+	if err == nil || result.Dispatches != 2 || result.Deferred != 2 {
 		t.Fatalf("result/error = %#v / %v", result, err)
 	}
 	logs := output.String()
@@ -226,6 +227,140 @@ func TestMonitorLogsOperationalLifecycleWithoutSensitivePayloads(t *testing.T) {
 		if strings.Contains(logs, sensitive) {
 			t.Errorf("logs contain sensitive value %q:\n%s", sensitive, logs)
 		}
+	}
+}
+
+type channelLogWriter struct {
+	lines chan string
+}
+
+func (writer channelLogWriter) Write(content []byte) (int, error) {
+	writer.lines <- string(content)
+	return len(content), nil
+}
+
+func TestMonitorLogsHeartbeatForEveryActiveDispatch(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseDispatches := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseDispatches)
+	agentHarness := &fakeHarness{dispatch: func(request harness.Request) (harness.Result, error) {
+		<-release
+		return harness.Result{SessionID: request.SessionID}, nil
+	}}
+	routes := map[string]route{
+		"owner/repo#1": {Harness: "codex", SessionID: "019c0000-0000-7000-8000-000000000030"},
+		"owner/repo#2": {Harness: "codex", SessionID: "019c0000-0000-7000-8000-000000000031"},
+	}
+	monitor := newTestMonitor(
+		sourceWithPullRequests(2), agentHarness,
+		[]Repository{{Name: "Owner/Repo", WorkingDirectory: directory}},
+		statePath,
+		routes,
+	)
+	if monitor.heartbeatInterval != 30*time.Second {
+		t.Fatalf("heartbeat interval = %s", monitor.heartbeatInterval)
+	}
+	type testHeartbeatTicker struct {
+		interval time.Duration
+		ticks    chan time.Time
+		stopped  chan struct{}
+	}
+	createdTickers := make(chan testHeartbeatTicker, 2)
+	monitor.newHeartbeatTicker = func(interval time.Duration) (<-chan time.Time, func()) {
+		ticks := make(chan time.Time, 1)
+		stopped := make(chan struct{})
+		createdTickers <- testHeartbeatTicker{interval: interval, ticks: ticks, stopped: stopped}
+		return ticks, func() { close(stopped) }
+	}
+	lines := make(chan string, 32)
+	monitor.logger = log.New(channelLogWriter{lines: lines}, "", 0)
+	completed := make(chan struct {
+		result CycleResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := monitor.RunOnce(context.Background())
+		completed <- struct {
+			result CycleResult
+			err    error
+		}{result: result, err: err}
+	}()
+	var tickers []testHeartbeatTicker
+	for range 2 {
+		select {
+		case ticker := <-createdTickers:
+			if ticker.interval != 30*time.Second {
+				t.Fatalf("ticker interval = %s", ticker.interval)
+			}
+			tickers = append(tickers, ticker)
+			ticker.ticks <- time.Now().Add(time.Second)
+		case <-time.After(time.Second):
+			t.Fatal("dispatch ticker was not created")
+		}
+	}
+	seen := make(map[string]bool)
+	for len(seen) < 2 {
+		select {
+		case line := <-lines:
+			for _, key := range []string{"owner/repo#1", "owner/repo#2"} {
+				prefix := "dispatch still running: pr=" + key + " route=cached elapsed="
+				if !strings.HasPrefix(line, prefix) {
+					continue
+				}
+				duration, err := time.ParseDuration(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
+				if err != nil || duration <= 0 {
+					t.Fatalf("heartbeat line = %q", line)
+				}
+				seen[key] = true
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("heartbeats = %#v", seen)
+		}
+	}
+	releaseDispatches()
+	select {
+	case outcome := <-completed:
+		if outcome.err != nil || outcome.result.Dispatches != 2 {
+			t.Fatalf("result/error = %#v / %v", outcome.result, outcome.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dispatches did not finish")
+	}
+	for _, ticker := range tickers {
+		select {
+		case <-ticker.stopped:
+		default:
+			t.Fatal("dispatch ticker was not stopped")
+		}
+	}
+}
+
+func TestMonitorCountsDiscoveryDeferralBeforeStateSaveFailure(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	agentHarness := &fakeHarness{discover: func(targets []harness.Target) ([]harness.Discovery, error) {
+		if err := os.Remove(statePath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(statePath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return []harness.Discovery{{Err: harness.ErrAmbiguousSession}}, nil
+	}}
+	monitor := newTestMonitor(
+		reviewSource(), agentHarness,
+		[]Repository{{Name: "Owner/Repo", WorkingDirectory: directory}},
+		statePath,
+		map[string]route{"owner/repo#99": {Harness: "codex", SessionID: "stale-session"}},
+	)
+	result, err := monitor.RunOnce(context.Background())
+	if err == nil || result.Deferred != 1 {
+		t.Fatalf("result/error = %#v / %v", result, err)
 	}
 }
 
