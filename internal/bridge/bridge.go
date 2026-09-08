@@ -29,6 +29,7 @@ const (
 	maxStaleSessionIDs        = 16
 	dispatchHeartbeatInterval = 30 * time.Second
 	commentFingerprintV1      = "comments-v1:"
+	taskNameDescriptionPrefix = "Bifrost task:"
 	routeCached               = "cached"
 	routeDiscovered           = "discovered"
 	routeNew                  = "new"
@@ -574,12 +575,23 @@ func targetFor(job dispatchJob) harness.Target {
 	target := harness.Target{
 		Repository:       job.pullRequest.Repository,
 		PullRequest:      job.pullRequest.Number,
-		URL:              job.pullRequest.URL,
-		HeadRef:          job.pullRequest.HeadRef,
+		TaskName:         taskNameFromDescription(job.pullRequest.Body),
 		WorkingDirectory: job.repository.WorkingDirectory,
 	}
 	target.ExcludedSessionIDs = slices.Clone(job.staleIDs)
 	return target
+}
+
+func taskNameFromDescription(description string) string {
+	for line := range strings.SplitSeq(description, "\n") {
+		line = strings.TrimSpace(line)
+		if taskName, found := strings.CutPrefix(line, taskNameDescriptionPrefix); found {
+			if taskName = strings.TrimSpace(taskName); taskName != "" {
+				return taskName
+			}
+		}
+	}
+	return ""
 }
 
 func appendStaleSessionID(sessionIDs []string, sessionID string) []string {

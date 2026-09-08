@@ -472,7 +472,7 @@ func TestMonitorDiscoversExistingTaskBeforeDispatch(t *testing.T) {
 		t.Fatalf("discovery targets = %#v", agentHarness.targets)
 	}
 	target := agentHarness.targets[0]
-	if target.Repository != source.pullRequest.Repository || target.PullRequest != source.pullRequest.Number || target.URL != source.pullRequest.URL || target.HeadRef != source.pullRequest.HeadRef || target.WorkingDirectory != directory {
+	if target.Repository != source.pullRequest.Repository || target.PullRequest != source.pullRequest.Number || target.TaskName != "Implement feature" || target.WorkingDirectory != directory {
 		t.Fatalf("discovery target = %#v", target)
 	}
 	state, err := loadState(statePath)
@@ -531,6 +531,20 @@ func TestMonitorRetainsDiscoveredChildWhenFirstDispatchFails(t *testing.T) {
 	}
 	if state.Threads["owner/repo#42"][source.threads[0].ID] != fingerprint(source.threads[0]) {
 		t.Fatalf("state after retry = %#v", state)
+	}
+}
+
+func TestTaskNameFromDynamicPullRequestDescription(t *testing.T) {
+	t.Parallel()
+	description := "## Summary\n\nAdds the feature.\n\nBifrost task: Implement feature: phase 2\n\n## Testing\n- go test ./...\n"
+	if taskName := taskNameFromDescription(description); taskName != "Implement feature: phase 2" {
+		t.Fatalf("task name = %q", taskName)
+	}
+	if taskName := taskNameFromDescription("Bifrost task:   \nOther content\nBifrost task: Valid task"); taskName != "Valid task" {
+		t.Fatalf("task name after empty marker = %q", taskName)
+	}
+	if taskName := taskNameFromDescription("## Summary\n\nNo routing metadata here.\n"); taskName != "" {
+		t.Fatalf("missing task name = %q", taskName)
 	}
 }
 
@@ -1946,7 +1960,7 @@ func reviewThread(id string, now time.Time) githubapi.ReviewThread {
 func reviewSource() *fakeSource {
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	return &fakeSource{
-		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", URL: "https://example/pr/42", HeadRef: "codex/feature-42"},
+		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", Body: "## Summary\n\nBifrost task: Implement feature\n", URL: "https://example/pr/42", HeadRef: "codex/feature-42"},
 		threads:     []githubapi.ReviewThread{reviewThread("thread-1", now)},
 	}
 }

@@ -90,6 +90,7 @@ type PullRequest struct {
 	Repository string
 	Number     int
 	Title      string
+	Body       string
 	URL        string
 	HeadRef    string
 	Author     string
@@ -180,6 +181,7 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string) (
 		var response []struct {
 			Number  int    `json:"number"`
 			Title   string `json:"title"`
+			Body    string `json:"body"`
 			HTMLURL string `json:"html_url"`
 			User    struct {
 				Login string `json:"login"`
@@ -196,6 +198,7 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string) (
 				Repository: repository,
 				Number:     pullRequest.Number,
 				Title:      pullRequest.Title,
+				Body:       pullRequest.Body,
 				URL:        pullRequest.HTMLURL,
 				HeadRef:    pullRequest.Head.Ref,
 				Author:     pullRequest.User.Login,

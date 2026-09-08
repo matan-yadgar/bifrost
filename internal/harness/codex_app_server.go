@@ -8,36 +8,23 @@ import (
 	"io"
 	"os/exec"
 	"slices"
-	"sort"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 )
 
 const (
 	codexDiscoveryBaseTimeout = 30 * time.Second
 	codexDiscoveryPerTarget   = 3 * time.Second
 	maxCodexDiscoveryTimeout  = 5 * time.Minute
-	threadSearchPageSize      = 100
-	threadTurnsPageSize       = 100
-	threadItemsPageSize       = 100
-	maxThreadSearchPages      = 100
-	maxThreadTurnsPages       = 100
-	maxThreadItemsPages       = 100
-	maxDiscoveryCandidates    = 1000
+	threadListPageSize        = 100
+	maxThreadListPages        = 100
 	maxIgnoredRPCMessages     = 100
 	maxAppServerOutputBytes   = 64 * 1024 * 1024
 	maxAppServerReconnects    = 3
-	finalAssistantMessage     = "final_answer"
-	agentMessageItem          = "agentMessage"
 	bifrostTaskNamePrefix     = "Bifrost: "
 )
 
-var (
-	errAppServerOutputLimit     = errors.New("Codex app-server output limit exceeded")
-	errFullTurnItemsUnavailable = errors.New("Codex app-server did not hydrate completed turn items")
-)
+var errAppServerOutputLimit = errors.New("Codex app-server output limit exceeded")
 
 var codexTaskSources = []string{
 	"cli",
@@ -59,9 +46,11 @@ type codexAppServer struct {
 }
 
 type appServerClient struct {
-	encoder *json.Encoder
-	decoder *json.Decoder
-	nextID  int
+	encoder        *json.Encoder
+	decoder        *json.Decoder
+	nextID         int
+	sessionsByName map[string]map[string]bool
+	sessionsLoaded bool
 }
 
 type rpcResponse struct {
@@ -69,22 +58,17 @@ type rpcResponse struct {
 	ID      int             `json:"id"`
 	Result  json.RawMessage `json:"result"`
 	Error   *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
+		Code int `json:"code"`
 	} `json:"error"`
 }
 
-type threadSearchThread struct {
+type threadListThread struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
-type threadSearchItem struct {
-	Thread threadSearchThread `json:"thread"`
-}
-
-type threadSearchResult struct {
-	Data       *[]threadSearchItem `json:"data"`
+type threadListResult struct {
+	Data       *[]threadListThread `json:"data"`
 	NextCursor *string             `json:"nextCursor"`
 }
 
@@ -94,42 +78,13 @@ type threadForkResult struct {
 	} `json:"thread"`
 }
 
-type threadTurn struct {
-	ID        string            `json:"id"`
-	Status    string            `json:"status"`
-	Items     *[]threadTurnItem `json:"items"`
-	ItemsView string            `json:"itemsView"`
-}
-
-type threadTurnItem struct {
-	Type  string  `json:"type"`
-	Text  string  `json:"text"`
-	Phase *string `json:"phase"`
-}
-
-type threadTurnsResult struct {
-	Data       *[]threadTurn `json:"data"`
-	NextCursor *string       `json:"nextCursor"`
-}
-
-type threadItemEntry struct {
-	TurnID string         `json:"turnId"`
-	Item   threadTurnItem `json:"item"`
-}
-
-type threadItemsResult struct {
-	Data       *[]threadItemEntry `json:"data"`
-	NextCursor *string            `json:"nextCursor"`
-}
-
 type fatalAppServerError struct{ err error }
 
 func (err fatalAppServerError) Error() string { return err.err.Error() }
 func (err fatalAppServerError) Unwrap() error { return err.err }
 
 type rpcRequestError struct {
-	code    int
-	message string
+	code int
 }
 
 func (err rpcRequestError) Error() string {
@@ -157,8 +112,8 @@ func (server *codexAppServer) Discover(ctx context.Context, targets []Target) ([
 	discoveries := make([]Discovery, len(targets))
 	validTargets := 0
 	for index, target := range targets {
-		if strings.TrimSpace(target.URL) == "" || strings.TrimSpace(target.HeadRef) == "" {
-			discoveries[index].Err = fmt.Errorf("pull request URL and head branch are required for Codex task discovery")
+		if strings.TrimSpace(target.Repository) == "" || target.PullRequest <= 0 {
+			discoveries[index].Err = fmt.Errorf("repository and pull request number are required for Codex task discovery")
 			continue
 		}
 		validTargets++
@@ -270,53 +225,21 @@ func newAppServerClient(reader io.Reader, writer io.Writer) *appServerClient {
 }
 
 func (client *appServerClient) discover(target Target) Discovery {
-	urlSessions, err := client.searchAll(target.URL)
+	creatorTaskName := strings.TrimSpace(target.TaskName)
+	if creatorTaskName == "" {
+		return Discovery{}
+	}
+	creatorSessions, err := client.exactNamedSessions(creatorTaskName, target.ExcludedSessionIDs)
 	if err != nil {
 		return Discovery{Err: err}
 	}
-	var candidates []threadSearchThread
-	for sessionID, candidate := range urlSessions {
-		if slices.ContainsFunc(target.ExcludedSessionIDs, func(excluded string) bool {
-			return strings.EqualFold(sessionID, strings.TrimSpace(excluded))
-		}) {
-			continue
-		}
-		candidates = append(candidates, candidate)
+	if len(creatorSessions) > 1 {
+		return Discovery{Err: fmt.Errorf("%w: found at least 2 tasks named %q", ErrAmbiguousSession, creatorTaskName)}
 	}
-	sort.Slice(candidates, func(left, right int) bool { return candidates[left].ID < candidates[right].ID })
-	taskName := bifrostTaskName(target)
-	for _, candidate := range candidates {
-		if candidate.Name != taskName {
-			continue
-		}
-		qualifies, err := client.hasCreatorFinal(candidate.ID, target.URL, target.HeadRef)
-		if err != nil {
-			return Discovery{Err: err}
-		}
-		if qualifies {
-			return Discovery{Session: Session{ID: candidate.ID}, Found: true}
-		}
-	}
-	var matching []string
-	for _, candidate := range candidates {
-		if candidate.Name == taskName {
-			continue
-		}
-		qualifies, err := client.hasCreatorFinal(candidate.ID, target.URL, target.HeadRef)
-		if err != nil {
-			return Discovery{Err: err}
-		}
-		if qualifies {
-			matching = append(matching, candidate.ID)
-			if len(matching) > 1 {
-				return Discovery{Err: fmt.Errorf("%w: found at least 2 matches", ErrAmbiguousSession)}
-			}
-		}
-	}
-	if len(matching) == 0 {
+	if len(creatorSessions) == 0 {
 		return Discovery{}
 	}
-	forkedSessionID, err := client.fork(matching[0], taskName)
+	forkedSessionID, err := client.fork(creatorSessions[0], bifrostTaskName(target))
 	if err != nil {
 		return Discovery{Err: err}
 	}
@@ -366,258 +289,78 @@ func (client *appServerClient) initialize() error {
 	return nil
 }
 
-func (client *appServerClient) searchAll(term string) (map[string]threadSearchThread, error) {
-	sessions := make(map[string]threadSearchThread)
-	for _, archived := range []bool{false, true} {
-		if err := client.search(term, archived, sessions); err != nil {
-			return nil, err
-		}
+func (client *appServerClient) exactNamedSessions(name string, excludedSessionIDs []string) ([]string, error) {
+	if err := client.loadNamedSessions(); err != nil {
+		return nil, err
 	}
-	return sessions, nil
+	matching := make([]string, 0, len(client.sessionsByName[name]))
+	for sessionID := range client.sessionsByName[name] {
+		if slices.ContainsFunc(excludedSessionIDs, func(excluded string) bool {
+			return strings.EqualFold(sessionID, strings.TrimSpace(excluded))
+		}) {
+			continue
+		}
+		matching = append(matching, sessionID)
+	}
+	return matching, nil
 }
 
-func (client *appServerClient) search(term string, archived bool, sessions map[string]threadSearchThread) error {
+func (client *appServerClient) loadNamedSessions() error {
+	if client.sessionsLoaded {
+		return nil
+	}
+	sessions := make(map[string]map[string]bool)
+	for _, archived := range []bool{false, true} {
+		if err := client.listSessions(archived, sessions); err != nil {
+			return err
+		}
+	}
+	client.sessionsByName = sessions
+	client.sessionsLoaded = true
+	return nil
+}
+
+func (client *appServerClient) listSessions(archived bool, sessions map[string]map[string]bool) error {
 	var cursor *string
 	seenCursors := make(map[string]bool)
-	for page := 0; page < maxThreadSearchPages; page++ {
+	for page := 0; page < maxThreadListPages; page++ {
 		params := map[string]any{
-			"searchTerm":  term,
-			"limit":       threadSearchPageSize,
+			"limit":       threadListPageSize,
 			"archived":    archived,
 			"sourceKinds": codexTaskSources,
 		}
 		if cursor != nil {
 			params["cursor"] = *cursor
 		}
-		var result threadSearchResult
-		if err := client.request("thread/search", params, &result); err != nil {
+		var result threadListResult
+		if err := client.request("thread/list", params, &result); err != nil {
 			return err
 		}
 		if result.Data == nil {
-			return fmt.Errorf("Codex app-server returned malformed thread search data")
+			return fmt.Errorf("Codex app-server returned malformed thread list data")
 		}
-		for _, item := range *result.Data {
-			if !validSessionID(item.Thread.ID) {
+		for _, thread := range *result.Data {
+			if !validSessionID(thread.ID) {
 				return fmt.Errorf("Codex app-server returned an invalid thread ID")
 			}
-			sessions[item.Thread.ID] = item.Thread
-			if len(sessions) > maxDiscoveryCandidates {
-				return fmt.Errorf("Codex task discovery exceeded %d candidates", maxDiscoveryCandidates)
+			if thread.Name == "" {
+				continue
 			}
+			if sessions[thread.Name] == nil {
+				sessions[thread.Name] = make(map[string]bool)
+			}
+			sessions[thread.Name][thread.ID] = true
 		}
 		if result.NextCursor == nil || *result.NextCursor == "" {
 			return nil
 		}
 		if seenCursors[*result.NextCursor] {
-			return fmt.Errorf("Codex app-server repeated a thread search cursor")
+			return fmt.Errorf("Codex app-server repeated a thread list cursor")
 		}
 		seenCursors[*result.NextCursor] = true
 		cursor = result.NextCursor
 	}
-	return fmt.Errorf("Codex task discovery exceeded %d search pages", maxThreadSearchPages)
-}
-
-func (client *appServerClient) hasCreatorFinal(sessionID, pullRequestURL, headRef string) (bool, error) {
-	qualified, err := client.creatorFinalInFullTurns(sessionID, pullRequestURL, headRef)
-	var requestError rpcRequestError
-	fallback := errors.Is(err, errFullTurnItemsUnavailable) ||
-		(errors.As(err, &requestError) && (requestError.code == -32602 ||
-			(requestError.code == -32600 && !strings.Contains(strings.ToLower(requestError.message), "unknown variant"))))
-	if err == nil || !fallback {
-		return qualified, err
-	}
-	completedTurns, err := client.completedTurns(sessionID)
-	if err != nil || len(completedTurns) == 0 {
-		return false, err
-	}
-	return client.creatorFinalInItems(sessionID, completedTurns, pullRequestURL, headRef)
-}
-
-func (client *appServerClient) creatorFinalInFullTurns(sessionID, pullRequestURL, headRef string) (bool, error) {
-	var cursor *string
-	seenCursors := make(map[string]bool)
-	for page := 0; page < maxThreadTurnsPages; page++ {
-		params := map[string]any{
-			"threadId": sessionID, "limit": threadTurnsPageSize,
-			"sortDirection": "desc", "itemsView": "full",
-		}
-		if cursor != nil {
-			params["cursor"] = *cursor
-		}
-		var result threadTurnsResult
-		if err := client.request("thread/turns/list", params, &result); err != nil {
-			return false, err
-		}
-		if result.Data == nil {
-			return false, fmt.Errorf("Codex app-server returned malformed thread turns data")
-		}
-		for _, turn := range *result.Data {
-			if turn.Status == "completed" && (turn.Items == nil || (turn.ItemsView != "" && turn.ItemsView != "full")) {
-				return false, errFullTurnItemsUnavailable
-			}
-			if creatorFinalInTurn(turn, pullRequestURL, headRef) {
-				return true, nil
-			}
-		}
-		if result.NextCursor == nil || *result.NextCursor == "" {
-			return false, nil
-		}
-		if seenCursors[*result.NextCursor] {
-			return false, fmt.Errorf("Codex app-server repeated a thread turns cursor")
-		}
-		seenCursors[*result.NextCursor] = true
-		cursor = result.NextCursor
-	}
-	return false, fmt.Errorf("Codex task discovery exceeded %d turn pages", maxThreadTurnsPages)
-}
-
-func creatorFinalInTurn(turn threadTurn, pullRequestURL, headRef string) bool {
-	if turn.Status != "completed" || turn.Items == nil {
-		return false
-	}
-	lastAgentMessage := -1
-	for index, item := range *turn.Items {
-		if item.Type == agentMessageItem {
-			lastAgentMessage = index
-		}
-		if creatorFinalMessageMatches(item, false, pullRequestURL, headRef) {
-			return true
-		}
-	}
-	if lastAgentMessage < 0 {
-		return false
-	}
-	return creatorFinalMessageMatches((*turn.Items)[lastAgentMessage], true, pullRequestURL, headRef)
-}
-
-func (client *appServerClient) completedTurns(sessionID string) (map[string]bool, error) {
-	completedTurns := make(map[string]bool)
-	var cursor *string
-	seenCursors := make(map[string]bool)
-	for page := 0; page < maxThreadTurnsPages; page++ {
-		params := map[string]any{
-			"threadId": sessionID, "limit": threadTurnsPageSize,
-			"sortDirection": "desc", "itemsView": "notLoaded",
-		}
-		if cursor != nil {
-			params["cursor"] = *cursor
-		}
-		var result threadTurnsResult
-		if err := client.request("thread/turns/list", params, &result); err != nil {
-			return nil, err
-		}
-		if result.Data == nil {
-			return nil, fmt.Errorf("Codex app-server returned malformed thread turns data")
-		}
-		for _, turn := range *result.Data {
-			if strings.TrimSpace(turn.ID) == "" {
-				return nil, fmt.Errorf("Codex app-server returned a turn without an ID")
-			}
-			if turn.Status == "completed" {
-				completedTurns[turn.ID] = true
-			}
-		}
-		if result.NextCursor == nil || *result.NextCursor == "" {
-			return completedTurns, nil
-		}
-		if seenCursors[*result.NextCursor] {
-			return nil, fmt.Errorf("Codex app-server repeated a thread turns cursor")
-		}
-		seenCursors[*result.NextCursor] = true
-		cursor = result.NextCursor
-	}
-	return nil, fmt.Errorf("Codex task discovery exceeded %d turn pages", maxThreadTurnsPages)
-}
-
-func (client *appServerClient) creatorFinalInItems(sessionID string, completedTurns map[string]bool, pullRequestURL, headRef string) (bool, error) {
-	lastAgentMessages := make(map[string]threadTurnItem)
-	var cursor *string
-	seenCursors := make(map[string]bool)
-	for page := 0; page < maxThreadItemsPages; page++ {
-		params := map[string]any{
-			"threadId": sessionID, "limit": threadItemsPageSize, "sortDirection": "asc",
-		}
-		if cursor != nil {
-			params["cursor"] = *cursor
-		}
-		var result threadItemsResult
-		if err := client.request("thread/items/list", params, &result); err != nil {
-			return false, err
-		}
-		if result.Data == nil {
-			return false, fmt.Errorf("Codex app-server returned malformed thread items data")
-		}
-		for _, entry := range *result.Data {
-			if !completedTurns[entry.TurnID] || entry.Item.Type != agentMessageItem {
-				continue
-			}
-			lastAgentMessages[entry.TurnID] = entry.Item
-			if creatorFinalMessageMatches(entry.Item, false, pullRequestURL, headRef) {
-				return true, nil
-			}
-		}
-		if result.NextCursor == nil || *result.NextCursor == "" {
-			for _, item := range lastAgentMessages {
-				if creatorFinalMessageMatches(item, true, pullRequestURL, headRef) {
-					return true, nil
-				}
-			}
-			return false, nil
-		}
-		if seenCursors[*result.NextCursor] {
-			return false, fmt.Errorf("Codex app-server repeated a thread items cursor")
-		}
-		seenCursors[*result.NextCursor] = true
-		cursor = result.NextCursor
-	}
-	return false, fmt.Errorf("Codex task discovery exceeded %d item pages", maxThreadItemsPages)
-}
-
-func creatorFinalMessageMatches(item threadTurnItem, terminal bool, pullRequestURL, headRef string) bool {
-	if item.Type != agentMessageItem ||
-		!containsExactIdentifier(item.Text, pullRequestURL) ||
-		!containsExactIdentifier(item.Text, headRef) {
-		return false
-	}
-	if item.Phase == nil {
-		return terminal
-	}
-	return *item.Phase == finalAssistantMessage
-}
-
-func containsExactIdentifier(text, identifier string) bool {
-	for offset := 0; ; {
-		index := strings.Index(text[offset:], identifier)
-		if index < 0 {
-			return false
-		}
-		start := offset + index
-		end := start + len(identifier)
-		if identifierBoundaryBefore(text, start) && identifierBoundaryAfter(text, end) {
-			return true
-		}
-		offset = start + 1
-	}
-}
-
-func identifierBoundaryBefore(text string, index int) bool {
-	if index == 0 {
-		return true
-	}
-	runeValue, _ := utf8.DecodeLastRuneInString(text[:index])
-	return !identifierRune(runeValue)
-}
-
-func identifierBoundaryAfter(text string, index int) bool {
-	if index == len(text) {
-		return true
-	}
-	runeValue, _ := utf8.DecodeRuneInString(text[index:])
-	return !identifierRune(runeValue)
-}
-
-func identifierRune(runeValue rune) bool {
-	return unicode.IsLetter(runeValue) || unicode.IsDigit(runeValue) || strings.ContainsRune("-._/", runeValue)
+	return fmt.Errorf("Codex task discovery exceeded %d list pages", maxThreadListPages)
 }
 
 func (client *appServerClient) request(method string, params any, result any) error {
@@ -643,7 +386,7 @@ func (client *appServerClient) request(method string, params any, result any) er
 			return fmt.Errorf("Codex app-server returned an invalid JSON-RPC version")
 		}
 		if response.Error != nil {
-			return rpcRequestError{code: response.Error.Code, message: response.Error.Message}
+			return rpcRequestError{code: response.Error.Code}
 		}
 		if len(response.Result) == 0 || string(response.Result) == "null" {
 			return fmt.Errorf("Codex app-server returned an empty result")
