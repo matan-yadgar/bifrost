@@ -32,15 +32,13 @@ func TestMain(testingMain *testing.M) {
 }
 
 func TestCodexDiscoveryOwnsAppServerProcess(t *testing.T) {
-	target := Target{Repository: "owner/repo", PullRequest: 42, URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42"}
+	target := Target{Repository: "owner/repo", PullRequest: 42, TaskName: "Implement feature"}
 	readyPath := filepath.Join(t.TempDir(), "app-server-ready")
-	startsPath := filepath.Join(t.TempDir(), "app-server-starts")
 	newCodex := func(mode string) *Codex {
 		return NewCodex(os.Args[0], nil, []string{
 			appServerHelperEnvironment + "=" + mode,
 			"BIFROST_APP_SERVER_SENTINEL=expected",
 			"BIFROST_APP_SERVER_READY=" + readyPath,
-			"BIFROST_APP_SERVER_STARTS=" + startsPath,
 		})
 	}
 
@@ -95,33 +93,47 @@ func TestCodexDiscoveryOwnsAppServerProcess(t *testing.T) {
 		t.Fatalf("failure error = %v", err)
 	}
 
-	discoveries, err = newCodex("partial").Discover(context.Background(), []Target{
-		{URL: "https://github.com/owner/repo/pull/41", HeadRef: "codex/feature-41"},
-		target,
-	})
-	if err != nil || len(discoveries) != 2 || discoveries[0].Err == nil || !discoveries[1].Found || discoveries[1].Session.ID != appServerForkedSessionID {
-		t.Fatalf("partial discoveries/error = %#v / %v", discoveries, err)
-	}
+}
 
-	discoveries, err = newCodex("fatal-partial").Discover(context.Background(), []Target{
+func TestCodexDiscoveryReconnectsAfterPartialBatchFailure(t *testing.T) {
+	t.Parallel()
+	firstProcess := &fakeManagedProcess{
+		input: &writeCloserBuffer{},
+		output: io.NopCloser(strings.NewReader(
+			rpcResult(1, `{}`) +
+				rpcResult(2, threadListResultJSON([]namedSession{
+					{ID: appServerCreatorSessionID, Name: "Implement feature"},
+					{ID: "019c0000-0000-7000-8000-000000000008", Name: "Broken task"},
+				}, "")) +
+				rpcResult(3, threadListResultJSON(nil, "")) +
+				rpcResult(4, threadForkResultJSON(appServerForkedSessionID)) +
+				rpcResult(5, `{}`),
+		)),
+		exit: processExit{WaitError: errors.New("app-server exited")},
+	}
+	secondProcess := &fakeManagedProcess{
+		input: &writeCloserBuffer{},
+		output: io.NopCloser(strings.NewReader(
+			rpcResult(1, `{}`) +
+				rpcResult(2, threadListResultJSON([]namedSession{{ID: appServerCreatorSessionID, Name: "Implement feature"}}, "")) +
+				rpcResult(3, threadListResultJSON(nil, "")) +
+				rpcResult(4, threadForkResultJSON(appServerForkedSessionID)) +
+				rpcResult(5, `{}`),
+		)),
+	}
+	starter := &sequenceProcessStarter{processes: []managedProcess{firstProcess, secondProcess}}
+	server := &codexAppServer{command: "codex", processes: starter}
+	target := Target{Repository: "owner/repo", PullRequest: 42, TaskName: "Implement feature"}
+	discoveries, err := server.Discover(context.Background(), []Target{
 		target,
-		{URL: "https://github.com/owner/repo/pull/41", HeadRef: "codex/feature-41"},
+		{Repository: "owner/repo", PullRequest: 41, TaskName: "Broken task"},
 		target,
 	})
 	if err != nil || len(discoveries) != 3 || !discoveries[0].Found || discoveries[1].Err == nil || !discoveries[2].Found {
-		t.Fatalf("fatal partial discoveries/error = %#v / %v / %v / %v", discoveries, discoveries[1].Err, discoveries[2].Err, err)
+		t.Fatalf("discoveries/error = %#v / %v", discoveries, err)
 	}
-	startsBefore, err := os.ReadFile(startsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	discoveries, err = newCodex("fatal-last").Discover(context.Background(), []Target{
-		target,
-		{URL: "https://github.com/owner/repo/pull/41", HeadRef: "codex/feature-41"},
-	})
-	startsAfter, readError := os.ReadFile(startsPath)
-	if readError != nil || err != nil || len(discoveries) != 2 || !discoveries[0].Found || discoveries[1].Err == nil || len(startsAfter) != len(startsBefore)+1 {
-		t.Fatalf("fatal-last discoveries/error/starts = %#v / %v / %d->%d", discoveries, err, len(startsBefore), len(startsAfter))
+	if starter.starts != 2 {
+		t.Fatalf("app-server starts = %d", starter.starts)
 	}
 }
 
@@ -131,11 +143,10 @@ func TestCodexDiscoveryUsesManagedProcessTransport(t *testing.T) {
 		input: &writeCloserBuffer{},
 		output: io.NopCloser(strings.NewReader(
 			rpcResult(1, `{}`) +
-				rpcResult(2, searchResult(nil, "")) +
-				rpcResult(3, searchResult([]string{appServerCreatorSessionID}, "")) +
-				rpcResult(4, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))) +
-				rpcResult(5, threadForkResultJSON(appServerForkedSessionID)) +
-				rpcResult(6, `{}`),
+				rpcResult(2, threadListResultJSON([]namedSession{{ID: appServerCreatorSessionID, Name: "Implement feature"}}, "")) +
+				rpcResult(3, threadListResultJSON(nil, "")) +
+				rpcResult(4, threadForkResultJSON(appServerForkedSessionID)) +
+				rpcResult(5, `{}`),
 		)),
 	}
 	starter := &fakeProcessStarter{process: process}
@@ -143,7 +154,7 @@ func TestCodexDiscoveryUsesManagedProcessTransport(t *testing.T) {
 
 	discoveries, err := server.Discover(context.Background(), []Target{{
 		Repository: "owner/repo", PullRequest: 42,
-		URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42",
+		TaskName: "Implement feature",
 	}})
 	if err != nil || len(discoveries) != 1 || !discoveries[0].Found || discoveries[0].Session.ID != appServerForkedSessionID {
 		t.Fatalf("discoveries/error = %#v / %v", discoveries, err)
@@ -172,15 +183,6 @@ func runAppServerHelper(mode string) {
 			os.Exit(16)
 		}
 	}
-	if startsPath := os.Getenv("BIFROST_APP_SERVER_STARTS"); startsPath != "" {
-		file, err := os.OpenFile(startsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-		if err != nil {
-			os.Exit(17)
-		}
-		if _, err := file.WriteString("x"); err != nil || file.Close() != nil {
-			os.Exit(18)
-		}
-	}
 	if mode == "hang" {
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		os.Exit(0)
@@ -198,36 +200,12 @@ func runAppServerHelper(mode string) {
 		case "initialize":
 			_ = encoder.Encode(map[string]any{"id": request.ID, "result": map[string]any{}})
 		case "initialized":
-		case "thread/search":
-			if mode == "partial" && strings.Contains(fmt.Sprint(request.Params["searchTerm"]), "/pull/41") {
-				_ = encoder.Encode(map[string]any{"id": request.ID, "error": map[string]any{"code": -32000}})
-				continue
-			}
-			if strings.HasPrefix(mode, "fatal-") && strings.Contains(fmt.Sprint(request.Params["searchTerm"]), "/pull/41") {
-				_ = os.Stdout.Close()
-				_, _ = io.Copy(io.Discard, os.Stdin)
-				os.Exit(15)
-			}
+		case "thread/list":
 			data := []any{}
 			if request.Params["archived"] == true {
-				data = append(data, map[string]any{"thread": map[string]string{"id": appServerCreatorSessionID}})
+				data = append(data, map[string]string{"id": appServerCreatorSessionID, "name": "Implement feature"})
 			}
 			_ = encoder.Encode(map[string]any{"id": request.ID, "result": map[string]any{"data": data, "nextCursor": nil}})
-		case "thread/turns/list":
-			turn := map[string]any{"id": "turn-1", "status": "completed", "itemsView": request.Params["itemsView"]}
-			if request.Params["itemsView"] == "full" {
-				text := "created https://github.com/owner/repo/pull/42 from codex/feature-42"
-				turn["items"] = []any{map[string]any{"type": agentMessageItem, "phase": finalAssistantMessage, "text": text}}
-			}
-			result := map[string]any{"data": []any{turn}, "nextCursor": nil}
-			_ = encoder.Encode(map[string]any{"id": request.ID, "result": result})
-		case "thread/items/list":
-			text := "created https://github.com/owner/repo/pull/42 from codex/feature-42"
-			result := map[string]any{"data": []any{map[string]any{
-				"turnId": "turn-1",
-				"item":   map[string]any{"type": agentMessageItem, "phase": finalAssistantMessage, "text": text},
-			}}, "nextCursor": nil}
-			_ = encoder.Encode(map[string]any{"id": request.ID, "result": result})
 		case "thread/fork":
 			if !reflect.DeepEqual(request.Params, map[string]any{"threadId": appServerCreatorSessionID}) {
 				os.Exit(19)
@@ -254,20 +232,18 @@ func runAppServerHelper(mode string) {
 	os.Exit(0)
 }
 
-func TestAppServerDiscoveryUsesURLCandidatesAcrossPages(t *testing.T) {
+func TestAppServerDiscoveryUsesExactTaskNameAcrossPages(t *testing.T) {
 	t.Parallel()
 	const creatorSessionID = "019c0000-0000-7000-8000-000000000001"
-	const reviewerSessionID = "019c0000-0000-7000-8000-000000000002"
+	const partialNameSessionID = "019c0000-0000-7000-8000-000000000002"
 	const forkedSessionID = "019c0000-0000-7000-8000-000000000003"
 	responses := strings.NewReader(
 		rpcResult(1, `{}`) +
-			rpcResult(2, searchResult([]string{reviewerSessionID}, "next")) +
-			rpcResult(3, searchResult(nil, "")) +
-			rpcResult(4, searchResult([]string{creatorSessionID}, "")) +
-			rpcResult(5, threadFullTurnsResultJSON("turn-1", "created https://github.com/owner/repo/pull/42 from codex/feature-42", stringPointer(finalAssistantMessage))) +
-			rpcResult(6, threadFullTurnsResultJSON("turn-2", "reviewed https://github.com/owner/repo/pull/42", stringPointer(finalAssistantMessage))) +
-			rpcResult(7, threadForkResultJSON(forkedSessionID)) +
-			rpcResult(8, `{}`),
+			rpcResult(2, threadListResultJSON([]namedSession{{ID: partialNameSessionID, Name: "Implement feature later"}}, "next")) +
+			rpcResult(3, threadListResultJSON([]namedSession{{ID: creatorSessionID, Name: "Implement feature"}}, "")) +
+			rpcResult(4, threadListResultJSON(nil, "")) +
+			rpcResult(5, threadForkResultJSON(forkedSessionID)) +
+			rpcResult(6, `{}`),
 	)
 	var requests bytes.Buffer
 	client := newAppServerClient(responses, &requests)
@@ -275,7 +251,7 @@ func TestAppServerDiscoveryUsesURLCandidatesAcrossPages(t *testing.T) {
 	if err := client.initialize(); err != nil {
 		t.Fatal(err)
 	}
-	discovery := client.discover(Target{Repository: "owner/repo", PullRequest: 42, URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42"})
+	discovery := client.discover(Target{Repository: "owner/repo", PullRequest: 42, TaskName: "Implement feature"})
 	if discovery.Err != nil {
 		t.Fatal(discovery.Err)
 	}
@@ -283,67 +259,97 @@ func TestAppServerDiscoveryUsesURLCandidatesAcrossPages(t *testing.T) {
 		t.Fatalf("discovery = %#v", discovery)
 	}
 	emitted := decodeAppServerRequests(t, requests.Bytes())
-	if len(emitted) != 9 {
+	if len(emitted) != 7 {
 		t.Fatalf("request count = %d: %#v", len(emitted), emitted)
 	}
-	wantMethods := []string{"initialize", "initialized", "thread/search", "thread/search", "thread/search", "thread/turns/list", "thread/turns/list", "thread/fork", "thread/name/set"}
+	wantMethods := []string{"initialize", "initialized", "thread/list", "thread/list", "thread/list", "thread/fork", "thread/name/set"}
 	for index, method := range wantMethods {
 		if emitted[index].Method != method {
 			t.Fatalf("request %d method = %q", index, emitted[index].Method)
 		}
 	}
-	assertExactProtocolRequests(t, emitted, creatorSessionID)
-	if !reflect.DeepEqual(emitted[7].Params, map[string]any{"threadId": creatorSessionID}) {
-		t.Fatalf("fork request = %#v", emitted[7])
+	assertExactProtocolRequests(t, emitted)
+	if !reflect.DeepEqual(emitted[5].Params, map[string]any{"threadId": creatorSessionID}) {
+		t.Fatalf("fork request = %#v", emitted[5])
 	}
-	if !reflect.DeepEqual(emitted[8].Params, map[string]any{"threadId": forkedSessionID, "name": "Bifrost: owner/repo#42"}) {
-		t.Fatalf("name request = %#v", emitted[8])
+	if !reflect.DeepEqual(emitted[6].Params, map[string]any{"threadId": forkedSessionID, "name": "Bifrost: owner/repo#42"}) {
+		t.Fatalf("name request = %#v", emitted[6])
 	}
 }
 
-func TestAppServerDiscoveryReusesBifrostFork(t *testing.T) {
+func TestAppServerDiscoveryLoadsTasksOncePerBatch(t *testing.T) {
 	t.Parallel()
-	const creatorSessionID = "019c0000-0000-7000-8000-000000000001"
-	const forkedSessionID = "019c0000-0000-7000-8000-000000000002"
+	const firstCreatorSessionID = "019c0000-0000-7000-8000-000000000001"
+	const secondCreatorSessionID = "019c0000-0000-7000-8000-000000000002"
+	const firstForkedSessionID = "019c0000-0000-7000-8000-000000000003"
+	const secondForkedSessionID = "019c0000-0000-7000-8000-000000000004"
 	responses := strings.NewReader(
-		rpcResult(1, fmt.Sprintf(
-			`{"data":[{"thread":{"id":%q}},{"thread":{"id":%q,"name":"Bifrost: owner/repo#42"}}],"nextCursor":null}`,
-			creatorSessionID,
-			forkedSessionID,
-		)) +
-			rpcResult(2, searchResult(nil, "")) +
-			rpcResult(3, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
+		rpcResult(1, threadListResultJSON([]namedSession{
+			{ID: firstCreatorSessionID, Name: "Implement first feature"},
+			{ID: secondCreatorSessionID, Name: "Implement second feature"},
+		}, "")) +
+			rpcResult(2, threadListResultJSON(nil, "")) +
+			rpcResult(3, threadForkResultJSON(firstForkedSessionID)) +
+			rpcResult(4, `{}`) +
+			rpcResult(5, threadForkResultJSON(secondForkedSessionID)) +
+			rpcResult(6, `{}`),
+	)
+	var requests bytes.Buffer
+	client := newAppServerClient(responses, &requests)
+
+	first := client.discover(Target{Repository: "owner/repo", PullRequest: 41, TaskName: "Implement first feature"})
+	second := client.discover(Target{Repository: "owner/repo", PullRequest: 42, TaskName: "Implement second feature"})
+	if first.Err != nil || !first.Found || first.Session.ID != firstForkedSessionID {
+		t.Fatalf("first discovery = %#v", first)
+	}
+	if second.Err != nil || !second.Found || second.Session.ID != secondForkedSessionID {
+		t.Fatalf("second discovery = %#v", second)
+	}
+	emitted := decodeAppServerRequests(t, requests.Bytes())
+	if len(emitted) != 6 {
+		t.Fatalf("requests = %#v", emitted)
+	}
+	wantMethods := []string{"thread/list", "thread/list", "thread/fork", "thread/name/set", "thread/fork", "thread/name/set"}
+	for index, method := range wantMethods {
+		if emitted[index].Method != method {
+			t.Fatalf("request %d method = %q", index, emitted[index].Method)
+		}
+	}
+}
+
+func TestAppServerDiscoveryDoesNotTreatBifrostTitleAsRoute(t *testing.T) {
+	t.Parallel()
+	const unrelatedSessionID = "019c0000-0000-7000-8000-000000000002"
+	responses := strings.NewReader(
+		rpcResult(1, threadListResultJSON([]namedSession{{ID: unrelatedSessionID, Name: "Bifrost: owner/repo#42"}}, "")) +
+			rpcResult(2, threadListResultJSON(nil, "")),
 	)
 	var requests bytes.Buffer
 	client := newAppServerClient(responses, &requests)
 	discovery := client.discover(Target{
 		Repository: "owner/repo", PullRequest: 42,
-		URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42",
+		TaskName: "Implement feature",
 	})
-	if discovery.Err != nil || !discovery.Found || discovery.Session.ID != forkedSessionID {
+	if discovery.Err != nil || discovery.Found || discovery.Session.ID != "" {
 		t.Fatalf("discovery = %#v", discovery)
 	}
 	emitted := decodeAppServerRequests(t, requests.Bytes())
-	if len(emitted) != 3 || emitted[2].Method != "thread/turns/list" || emitted[2].Params["threadId"] != forkedSessionID {
+	if len(emitted) != 2 || emitted[0].Method != "thread/list" || emitted[1].Method != "thread/list" {
 		t.Fatalf("requests = %#v", emitted)
 	}
 }
 
-func TestAppServerDiscoveryDoesNotTrustBifrostNameWithoutCreatorFinal(t *testing.T) {
+func TestAppServerDiscoveryRequiresExactTaskName(t *testing.T) {
 	t.Parallel()
 	const namedSessionID = "019c0000-0000-7000-8000-000000000002"
 	responses := strings.NewReader(
-		rpcResult(1, fmt.Sprintf(
-			`{"data":[{"thread":{"id":%q,"name":"Bifrost: owner/repo#42"}}],"nextCursor":null}`,
-			namedSessionID,
-		)) +
-			rpcResult(2, searchResult(nil, "")) +
-			rpcResult(3, threadFullTurnsResultJSON("turn-1", "unrelated final response", stringPointer(finalAssistantMessage))),
+		rpcResult(1, threadListResultJSON([]namedSession{{ID: namedSessionID, Name: "Implement feature later"}}, "")) +
+			rpcResult(2, threadListResultJSON(nil, "")),
 	)
 	client := newAppServerClient(responses, &bytes.Buffer{})
 	discovery := client.discover(Target{
 		Repository: "owner/repo", PullRequest: 42,
-		URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42",
+		TaskName: "Implement feature",
 	})
 	if discovery.Err != nil || discovery.Found || discovery.Session.ID != "" {
 		t.Fatalf("discovery = %#v", discovery)
@@ -353,17 +359,16 @@ func TestAppServerDiscoveryDoesNotTrustBifrostNameWithoutCreatorFinal(t *testing
 func TestAppServerDiscoveryRejectsInvalidForkResponses(t *testing.T) {
 	t.Parallel()
 	const creatorSessionID = "019c0000-0000-7000-8000-000000000001"
-	prefix := rpcResult(1, searchResult([]string{creatorSessionID}, "")) +
-		rpcResult(2, searchResult(nil, "")) +
-		rpcResult(3, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage)))
+	prefix := rpcResult(1, threadListResultJSON([]namedSession{{ID: creatorSessionID, Name: "Implement feature"}}, "")) +
+		rpcResult(2, threadListResultJSON(nil, ""))
 	for _, testCase := range []struct {
 		name     string
 		response string
 	}{
-		{name: "RPC error", response: rpcError(4, -32600, "fork failed")},
-		{name: "missing thread", response: rpcResult(4, `{}`)},
-		{name: "invalid ID", response: rpcResult(4, threadForkResultJSON("invalid"))},
-		{name: "creator ID", response: rpcResult(4, threadForkResultJSON(creatorSessionID))},
+		{name: "RPC error", response: rpcError(3, -32600, "fork failed")},
+		{name: "missing thread", response: rpcResult(3, `{}`)},
+		{name: "invalid ID", response: rpcResult(3, threadForkResultJSON("invalid"))},
+		{name: "creator ID", response: rpcResult(3, threadForkResultJSON(creatorSessionID))},
 	} {
 		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
@@ -372,13 +377,13 @@ func TestAppServerDiscoveryRejectsInvalidForkResponses(t *testing.T) {
 			client := newAppServerClient(strings.NewReader(prefix+testCase.response), &requests)
 			discovery := client.discover(Target{
 				Repository: "owner/repo", PullRequest: 42,
-				URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42",
+				TaskName: "Implement feature",
 			})
 			if discovery.Err == nil || discovery.Found || discovery.Session.ID != "" {
 				t.Fatalf("discovery = %#v", discovery)
 			}
 			emitted := decodeAppServerRequests(t, requests.Bytes())
-			if len(emitted) != 4 || emitted[3].Method != "thread/fork" {
+			if len(emitted) != 3 || emitted[2].Method != "thread/fork" {
 				t.Fatalf("requests = %#v", emitted)
 			}
 		})
@@ -404,25 +409,23 @@ func TestAppServerForkDeletesChildWhenNamingFails(t *testing.T) {
 	}
 }
 
-func TestAppServerDiscoveryRejectsAmbiguousURLCandidates(t *testing.T) {
+func TestAppServerDiscoveryRejectsAmbiguousExactTaskNames(t *testing.T) {
 	t.Parallel()
 	const firstSessionID = "019c0000-0000-7000-8000-000000000001"
 	const secondSessionID = "019c0000-0000-7000-8000-000000000002"
-	const unreadableSessionID = "019c0000-0000-7000-8000-000000000003"
-	sessions := []string{firstSessionID, secondSessionID, unreadableSessionID}
 	responses := strings.NewReader(
-		rpcResult(1, `{}`) +
-			rpcResult(2, searchResult(sessions, "")) + rpcResult(3, searchResult(nil, "")) +
-			rpcResult(4, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))) +
-			rpcResult(5, threadFullTurnsResultJSON("turn-2", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
+		rpcResult(1, threadListResultJSON([]namedSession{{ID: firstSessionID, Name: "Implement feature"}}, "")) +
+			rpcResult(2, threadListResultJSON([]namedSession{{ID: secondSessionID, Name: "Implement feature"}}, "")),
 	)
-	client := newAppServerClient(responses, &bytes.Buffer{})
-	if err := client.initialize(); err != nil {
-		t.Fatal(err)
-	}
-	discovery := client.discover(Target{URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42"})
+	var requests bytes.Buffer
+	client := newAppServerClient(responses, &requests)
+	discovery := client.discover(Target{Repository: "owner/repo", PullRequest: 42, TaskName: "Implement feature"})
 	if !errors.Is(discovery.Err, ErrAmbiguousSession) {
 		t.Fatalf("error = %v", discovery.Err)
+	}
+	emitted := decodeAppServerRequests(t, requests.Bytes())
+	if len(emitted) != 2 || emitted[0].Method != "thread/list" || emitted[1].Method != "thread/list" {
+		t.Fatalf("requests = %#v", emitted)
 	}
 }
 
@@ -433,222 +436,58 @@ func TestAppServerDiscoveryExcludesKnownStaleSessionBeforeAmbiguity(t *testing.T
 	const replacementSessionID = "019c0000-0000-7000-8000-000000000002"
 	const forkedSessionID = "019c0000-0000-7000-8000-000000000003"
 	responses := strings.NewReader(
-		rpcResult(1, `{}`) +
-			rpcResult(2, searchResult([]string{olderStaleSessionID, staleSessionID, replacementSessionID}, "")) +
-			rpcResult(3, searchResult(nil, "")) +
-			rpcResult(4, threadFullTurnsResultJSON("turn-2", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))) +
-			rpcResult(5, threadForkResultJSON(forkedSessionID)) +
-			rpcResult(6, `{}`),
+		rpcResult(1, threadListResultJSON([]namedSession{
+			{ID: olderStaleSessionID, Name: "Implement feature"},
+			{ID: staleSessionID, Name: "Implement feature"},
+			{ID: replacementSessionID, Name: "Implement feature"},
+		}, "")) +
+			rpcResult(2, threadListResultJSON(nil, "")) +
+			rpcResult(3, threadForkResultJSON(forkedSessionID)) +
+			rpcResult(4, "{}"),
 	)
 	var requests bytes.Buffer
 	client := newAppServerClient(responses, &requests)
-	if err := client.initialize(); err != nil {
-		t.Fatal(err)
-	}
 	discovery := client.discover(Target{
 		Repository: "owner/repo", PullRequest: 42,
-		URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42",
+		TaskName:           "Implement feature",
 		ExcludedSessionIDs: []string{olderStaleSessionID, staleSessionID},
 	})
 	if discovery.Err != nil || !discovery.Found || discovery.Session.ID != forkedSessionID {
 		t.Fatalf("discovery = %#v", discovery)
 	}
 	emitted := decodeAppServerRequests(t, requests.Bytes())
-	if len(emitted) != 7 || emitted[4].Params["threadId"] != replacementSessionID || emitted[5].Method != "thread/fork" || emitted[5].Params["threadId"] != replacementSessionID || emitted[6].Method != "thread/name/set" {
+	if len(emitted) != 4 || emitted[2].Method != "thread/fork" || emitted[2].Params["threadId"] != replacementSessionID || emitted[3].Method != "thread/name/set" {
 		t.Fatalf("requests = %#v", emitted)
 	}
 }
 
-func TestAppServerDiscoveryRequiresOneFinalResponseWithBothIdentifiers(t *testing.T) {
+func TestAppServerDiscoveryWithoutTaskNameStartsNewTask(t *testing.T) {
 	t.Parallel()
-	const sessionID = "019c0000-0000-7000-8000-000000000003"
-	turnsResult := `{"data":[{"id":"turn-1","status":"completed","items":[` +
-		`{"type":"agentMessage","phase":"final_answer","text":"https://github.com/owner/repo/pull/42"},` +
-		`{"type":"agentMessage","phase":"final_answer","text":"codex/feature-42"},` +
-		`{"type":"agentMessage","phase":"commentary","text":"https://github.com/owner/repo/pull/42 codex/feature-42"}` +
-		`]}],"nextCursor":null}`
-	responses := strings.NewReader(
-		rpcResult(1, `{}`) +
-			rpcResult(2, searchResult([]string{sessionID}, "")) + rpcResult(3, searchResult(nil, "")) +
-			rpcResult(4, turnsResult),
-	)
-	client := newAppServerClient(responses, &bytes.Buffer{})
-	if err := client.initialize(); err != nil {
-		t.Fatal(err)
-	}
-	discovery := client.discover(Target{URL: "https://github.com/owner/repo/pull/42", HeadRef: "codex/feature-42"})
-	if discovery.Err != nil || discovery.Found {
+	var requests bytes.Buffer
+	client := newAppServerClient(strings.NewReader(""), &requests)
+	discovery := client.discover(Target{Repository: "owner/repo", PullRequest: 42})
+	if discovery.Err != nil || discovery.Found || discovery.Session.ID != "" {
 		t.Fatalf("discovery = %#v", discovery)
 	}
-}
-
-func TestCreatorFinalUsesPhaseLessTerminalMessageAndExactBoundaries(t *testing.T) {
-	t.Parallel()
-	const pullRequestURL = "https://github.com/owner/repo/pull/42"
-	const headRef = "codex/feature-42"
-	for _, testCase := range []struct {
-		name      string
-		itemsJSON string
-		want      bool
-	}{
-		{
-			name:      "phase-less terminal answer",
-			itemsJSON: threadItemsResultJSON("turn-1", "created "+pullRequestURL+" from "+headRef, nil),
-			want:      true,
-		},
-		{
-			name: "phase-less nonterminal answer",
-			itemsJSON: `{"data":[` +
-				`{"turnId":"turn-1","item":{"type":"agentMessage","phase":null,"text":"created ` + pullRequestURL + ` from ` + headRef + `"}},` +
-				`{"turnId":"turn-1","item":{"type":"agentMessage","phase":null,"text":"later answer"}}` +
-				`],"nextCursor":null}`,
-			want: false,
-		},
-		{
-			name:      "identifier prefixes",
-			itemsJSON: threadItemsResultJSON("turn-1", "created "+pullRequestURL+"0 from "+headRef+"-next", stringPointer(finalAssistantMessage)),
-			want:      false,
-		},
-	} {
-		testCase := testCase
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-			client := newAppServerClient(strings.NewReader(rpcResult(1, testCase.itemsJSON)), &bytes.Buffer{})
-			got, err := client.creatorFinalInItems("session", map[string]bool{"turn-1": true}, pullRequestURL, headRef)
-			if err != nil || got != testCase.want {
-				t.Fatalf("creatorFinalInItems() = %v, %v; want %v", got, err, testCase.want)
-			}
-		})
-	}
-}
-
-func TestAppServerCreatorFinalPaginatesTurns(t *testing.T) {
-	t.Parallel()
-	responses := strings.NewReader(
-		rpcError(1, -32600, "itemsView full is unavailable for paginated history") +
-			rpcResult(2, `{"data":[{"id":"turn-1","status":"completed"}],"nextCursor":"older"}`) +
-			rpcResult(3, threadTurnsResultJSON("turn-2")) +
-			rpcResult(4, `{"data":[],"nextCursor":"older-items"}`) +
-			rpcResult(5, threadItemsResultJSON("turn-2", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
-	)
-	var requests bytes.Buffer
-	client := newAppServerClient(responses, &requests)
-	qualified, err := client.hasCreatorFinal("019c0000-0000-7000-8000-000000000003", "https://github.com/owner/repo/pull/42", "codex/feature-42")
-	if err != nil || !qualified {
-		t.Fatalf("qualified/error = %v / %v", qualified, err)
-	}
 	emitted := decodeAppServerRequests(t, requests.Bytes())
-	if len(emitted) != 5 || emitted[0].Params["itemsView"] != "full" || emitted[1].Params["itemsView"] != "notLoaded" || emitted[2].Params["cursor"] != "older" || emitted[4].Params["cursor"] != "older-items" {
-		t.Fatalf("turn requests = %#v", emitted)
+	if len(emitted) != 0 {
+		t.Fatalf("requests = %#v", emitted)
 	}
 }
 
-func TestCreatorFinalInFullTurnsPaginatesPrimaryPath(t *testing.T) {
-	t.Parallel()
-	responses := strings.NewReader(
-		rpcResult(1, `{"data":[{"id":"turn-2","status":"completed","itemsView":"full","items":[]}],"nextCursor":"older"}`) +
-			rpcResult(2, threadFullTurnsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
-	)
-	var requests bytes.Buffer
-	client := newAppServerClient(responses, &requests)
-	qualified, err := client.creatorFinalInFullTurns("session", "https://github.com/owner/repo/pull/42", "codex/feature-42")
-	if err != nil || !qualified {
-		t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
-	}
-	emitted := decodeAppServerRequests(t, requests.Bytes())
-	if len(emitted) != 2 || emitted[0].Params["itemsView"] != "full" || emitted[1].Params["itemsView"] != "full" || emitted[1].Params["cursor"] != "older" {
-		t.Fatalf("turn requests = %#v", emitted)
-	}
-}
-
-func TestCreatorFinalInFullTurnsAcceptsPhaseLessTerminalMessage(t *testing.T) {
-	t.Parallel()
-	const pullRequestURL = "https://github.com/owner/repo/pull/42"
-	const headRef = "codex/feature-42"
-	response := `{"data":[{"id":"turn-1","status":"completed","itemsView":"full","items":[` +
-		`{"type":"agentMessage","phase":null,"text":"earlier"},` +
-		`{"type":"agentMessage","phase":null,"text":"created ` + pullRequestURL + ` from ` + headRef + `"}` +
-		`]}],"nextCursor":null}`
-	client := newAppServerClient(strings.NewReader(rpcResult(1, response)), &bytes.Buffer{})
-	qualified, err := client.creatorFinalInFullTurns("session", pullRequestURL, headRef)
-	if err != nil || !qualified {
-		t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
-	}
-}
-
-func TestCreatorFinalInFullTurnsRejectsPhaseLessNonterminalMessage(t *testing.T) {
-	t.Parallel()
-	const pullRequestURL = "https://github.com/owner/repo/pull/42"
-	const headRef = "codex/feature-42"
-	response := `{"data":[{"id":"turn-1","status":"completed","itemsView":"full","items":[` +
-		`{"type":"agentMessage","phase":null,"text":"created ` + pullRequestURL + ` from ` + headRef + `"},` +
-		`{"type":"agentMessage","phase":null,"text":"later answer"}` +
-		`]}],"nextCursor":null}`
-	client := newAppServerClient(strings.NewReader(rpcResult(1, response)), &bytes.Buffer{})
-	qualified, err := client.creatorFinalInFullTurns("session", pullRequestURL, headRef)
-	if err != nil || qualified {
-		t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
-	}
-}
-
-func TestCreatorFinalInFullTurnsRequiresExactIdentifierBoundaries(t *testing.T) {
-	t.Parallel()
-	const pullRequestURL = "https://github.com/owner/repo/pull/42"
-	const headRef = "codex/feature-42"
-	for _, testCase := range []struct {
-		name string
-		text string
-	}{
-		{name: "before URL", text: "x" + pullRequestURL + " " + headRef},
-		{name: "after URL", text: pullRequestURL + "0 " + headRef},
-		{name: "before branch", text: pullRequestURL + " x" + headRef},
-		{name: "after branch", text: pullRequestURL + " " + headRef + "-next"},
-	} {
-		testCase := testCase
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-			response := threadFullTurnsResultJSON("turn-1", testCase.text, stringPointer(finalAssistantMessage))
-			client := newAppServerClient(strings.NewReader(rpcResult(1, response)), &bytes.Buffer{})
-			qualified, err := client.creatorFinalInFullTurns("session", pullRequestURL, headRef)
-			if err != nil || qualified {
-				t.Fatalf("creatorFinalInFullTurns() = %v, %v", qualified, err)
-			}
-		})
-	}
-}
-
-func TestAppServerCreatorFinalFallsBackWhenFullItemsAreUnloaded(t *testing.T) {
-	t.Parallel()
-	responses := strings.NewReader(
-		rpcResult(1, `{"data":[{"id":"turn-1","status":"completed","items":[],"itemsView":"notLoaded"}],"nextCursor":null}`) +
-			rpcResult(2, threadTurnsResultJSON("turn-1")) +
-			rpcResult(3, threadItemsResultJSON("turn-1", "https://github.com/owner/repo/pull/42 codex/feature-42", stringPointer(finalAssistantMessage))),
-	)
-	var requests bytes.Buffer
-	client := newAppServerClient(responses, &requests)
-	qualified, err := client.hasCreatorFinal("019c0000-0000-7000-8000-000000000003", "https://github.com/owner/repo/pull/42", "codex/feature-42")
-	if err != nil || !qualified {
-		t.Fatalf("qualified/error = %v / %v", qualified, err)
-	}
-	emitted := decodeAppServerRequests(t, requests.Bytes())
-	if len(emitted) != 3 || emitted[0].Params["itemsView"] != "full" || emitted[1].Params["itemsView"] != "notLoaded" || emitted[2].Method != "thread/items/list" {
-		t.Fatalf("fallback requests = %#v", emitted)
-	}
-}
-
-func TestAppServerProtocolRejectsMalformedSearchDataAndRepeatedCursor(t *testing.T) {
+func TestAppServerProtocolRejectsMalformedListDataAndRepeatedCursor(t *testing.T) {
 	t.Parallel()
 	for _, testCase := range []struct {
 		name      string
 		responses string
 	}{
-		{name: "missing data", responses: rpcResult(1, `{}`)},
-		{name: "repeated cursor", responses: rpcResult(1, searchResult(nil, "same")) + rpcResult(2, searchResult(nil, "same"))},
+		{name: "missing data", responses: rpcResult(1, "{}")},
+		{name: "repeated cursor", responses: rpcResult(1, threadListResultJSON(nil, "same")) + rpcResult(2, threadListResultJSON(nil, "same"))},
 	} {
 		testCase := testCase
 		t.Run(testCase.name, func(t *testing.T) {
 			client := newAppServerClient(strings.NewReader(testCase.responses), &bytes.Buffer{})
-			if err := client.search("term", false, make(map[string]threadSearchThread)); err == nil {
+			if err := client.listSessions(false, make(map[string]map[string]bool)); err == nil {
 				t.Fatal("expected protocol error")
 			}
 		})
@@ -679,6 +518,20 @@ type fakeProcessStarter struct {
 func (starter *fakeProcessStarter) Start(_ context.Context, request processRequest) (managedProcess, error) {
 	starter.request = request
 	return starter.process, nil
+}
+
+type sequenceProcessStarter struct {
+	processes []managedProcess
+	starts    int
+}
+
+func (starter *sequenceProcessStarter) Start(_ context.Context, _ processRequest) (managedProcess, error) {
+	if starter.starts >= len(starter.processes) {
+		return nil, errors.New("unexpected process start")
+	}
+	process := starter.processes[starter.starts]
+	starter.starts++
+	return process, nil
 }
 
 type fakeManagedProcess struct {
@@ -714,7 +567,7 @@ type errorReadCloser struct{ err error }
 func (reader errorReadCloser) Read([]byte) (int, error) { return 0, reader.err }
 func (errorReadCloser) Close() error                    { return nil }
 
-func assertExactProtocolRequests(t *testing.T, requests []appServerRequest, creatorSessionID string) {
+func assertExactProtocolRequests(t *testing.T, requests []appServerRequest) {
 	t.Helper()
 	for index, request := range requests {
 		if request.JSONRPC != nil {
@@ -726,32 +579,27 @@ func assertExactProtocolRequests(t *testing.T, requests []appServerRequest, crea
 	if !reflect.DeepEqual(clientInfo, map[string]any{"name": "bifrost", "version": "1"}) || capabilities["experimentalApi"] != true {
 		t.Fatalf("initialize request = %#v", requests[0])
 	}
-	wantSearches := []struct {
-		term     string
+	wantLists := []struct {
 		archived bool
 		cursor   string
 	}{
-		{term: "https://github.com/owner/repo/pull/42", archived: false},
-		{term: "https://github.com/owner/repo/pull/42", archived: false, cursor: "next"},
-		{term: "https://github.com/owner/repo/pull/42", archived: true},
+		{archived: false},
+		{archived: false, cursor: "next"},
+		{archived: true},
 	}
 	wantSources := make([]any, len(codexTaskSources))
 	for index, source := range codexTaskSources {
 		wantSources[index] = source
 	}
-	for index, want := range wantSearches {
+	for index, want := range wantLists {
 		params := requests[index+2].Params
-		if params["searchTerm"] != want.term || params["archived"] != want.archived || params["limit"] != float64(threadSearchPageSize) || !reflect.DeepEqual(params["sourceKinds"], wantSources) {
-			t.Fatalf("search request %d = %#v", index, params)
+		if _, found := params["searchTerm"]; found || params["archived"] != want.archived || params["limit"] != float64(threadListPageSize) || !reflect.DeepEqual(params["sourceKinds"], wantSources) {
+			t.Fatalf("list request %d = %#v", index, params)
 		}
 		cursor, found := params["cursor"]
 		if (want.cursor == "" && found) || (want.cursor != "" && cursor != want.cursor) {
-			t.Fatalf("search request %d cursor = %#v", index, cursor)
+			t.Fatalf("list request %d cursor = %#v", index, cursor)
 		}
-	}
-	turnsParams := requests[5].Params
-	if turnsParams["threadId"] != creatorSessionID || turnsParams["limit"] != float64(threadTurnsPageSize) || turnsParams["sortDirection"] != "desc" || turnsParams["itemsView"] != "full" {
-		t.Fatalf("turns request = %#v", turnsParams)
 	}
 }
 
@@ -778,44 +626,25 @@ func rpcError(id, code int, message string) string {
 	return fmt.Sprintf(`{"id":%d,"error":{"code":%d,"message":%q}}`+"\n", id, code, message)
 }
 
-func searchResult(sessionIDs []string, nextCursor string) string {
-	items := make([]string, 0, len(sessionIDs))
-	for _, sessionID := range sessionIDs {
-		items = append(items, fmt.Sprintf(`{"thread":{"id":%q}}`, sessionID))
+type namedSession struct {
+	ID   string
+	Name string
+}
+
+func threadListResultJSON(sessions []namedSession, nextCursor string) string {
+	items := make([]string, 0, len(sessions))
+	for _, session := range sessions {
+		items = append(items, fmt.Sprintf("{\"id\":%q,\"name\":%q}", session.ID, session.Name))
 	}
 	cursor := "null"
 	if nextCursor != "" {
 		cursor = fmt.Sprintf("%q", nextCursor)
 	}
-	return fmt.Sprintf(`{"data":[%s],"nextCursor":%s}`, strings.Join(items, ","), cursor)
-}
-
-func threadTurnsResultJSON(turnID string) string {
-	return fmt.Sprintf(`{"data":[{"id":%q,"status":"completed"}],"nextCursor":null}`, turnID)
-}
-
-func threadFullTurnsResultJSON(turnID, finalText string, phase *string) string {
-	phaseJSON := "null"
-	if phase != nil {
-		phaseJSON = fmt.Sprintf("%q", *phase)
-	}
-	return fmt.Sprintf(`{"data":[{"id":%q,"status":"completed","itemsView":"full","items":[{"type":"agentMessage","phase":%s,"text":%q}]}],"nextCursor":null}`, turnID, phaseJSON, finalText)
-}
-
-func threadItemsResultJSON(turnID, finalText string, phase *string) string {
-	phaseJSON := "null"
-	if phase != nil {
-		phaseJSON = fmt.Sprintf("%q", *phase)
-	}
-	return fmt.Sprintf(`{"data":[{"turnId":%q,"item":{"type":"agentMessage","phase":%s,"text":%q}}],"nextCursor":null}`, turnID, phaseJSON, finalText)
+	return fmt.Sprintf("{\"data\":[%s],\"nextCursor\":%s}", strings.Join(items, ","), cursor)
 }
 
 func threadForkResultJSON(sessionID string) string {
 	return fmt.Sprintf(`{"thread":{"id":%q}}`, sessionID)
-}
-
-func stringPointer(value string) *string {
-	return &value
 }
 
 type fakeRunner struct {

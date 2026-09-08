@@ -27,7 +27,7 @@ func TestOpenPullRequestsReturnsAuthoritativeOpenSet(t *testing.T) {
 		}
 		page := request.URL.Query().Get("page")
 		if page == "2" {
-			_, _ = fmt.Fprint(writer, `[{"number":101,"title":"mine too","html_url":"https://example/pr/101","user":{"login":"matan"},"head":{"ref":"codex/second"}}]`)
+			_, _ = fmt.Fprint(writer, `[{"number":101,"title":"mine too","body":"Bifrost task: Second task","html_url":"https://example/pr/101","user":{"login":"matan"},"head":{"ref":"codex/second"}}]`)
 			return
 		}
 		if page != "1" {
@@ -41,7 +41,7 @@ func TestOpenPullRequestsReturnsAuthoritativeOpenSet(t *testing.T) {
 				login = "matan"
 			}
 			rows[index] = map[string]any{
-				"number": index + 1, "title": "pr", "html_url": fmt.Sprintf("https://example/pr/%d", index+1),
+				"number": index + 1, "title": "pr", "body": "Bifrost task: Build feature", "html_url": fmt.Sprintf("https://example/pr/%d", index+1),
 				"user": map[string]string{"login": login},
 				"head": map[string]any{"ref": "codex/feature"},
 			}
@@ -59,10 +59,10 @@ func TestOpenPullRequestsReturnsAuthoritativeOpenSet(t *testing.T) {
 	if len(pullRequests) != 101 || pullRequests[0].Number != 1 || pullRequests[100].Number != 101 || requests.Load() != 2 {
 		t.Fatalf("pull requests = %#v", pullRequests)
 	}
-	if pullRequests[0].HeadRef != "codex/feature" || pullRequests[0].Author != "matan" || pullRequests[1].Author != "other" {
+	if pullRequests[0].HeadRef != "codex/feature" || pullRequests[0].Body != "Bifrost task: Build feature" || pullRequests[0].Author != "matan" || pullRequests[1].Author != "other" {
 		t.Fatalf("first pull request head = %#v", pullRequests[0])
 	}
-	if pullRequests[100].HeadRef != "codex/second" || pullRequests[100].Author != "matan" {
+	if pullRequests[100].HeadRef != "codex/second" || pullRequests[100].Body != "Bifrost task: Second task" || pullRequests[100].Author != "matan" {
 		t.Fatalf("last pull request = %#v", pullRequests[100])
 	}
 }

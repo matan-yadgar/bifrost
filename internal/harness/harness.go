@@ -14,8 +14,7 @@ var ErrDiscoveryDeferred = errors.New("harness discovery deferred after a batch 
 type Target struct {
 	Repository       string
 	PullRequest      int
-	URL              string
-	HeadRef          string
+	TaskName         string
 	WorkingDirectory string
 	// ExcludedSessionIDs must be removed from candidates before ambiguity is evaluated.
 	ExcludedSessionIDs []string
