@@ -6,23 +6,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"time"
+)
+
+const (
+	codexLaunchTimeout         = 30 * time.Second
+	launchPollInterval         = 25 * time.Millisecond
+	maxLaunchOutputBytes int64 = 1024 * 1024
 )
 
 type sessionDiscoverer interface {
 	Discover(context.Context, []Target) ([]Discovery, error)
 }
 
-type commandRunner interface {
-	Run(context.Context, string, []string, string, func(string)) error
+type commandLauncher interface {
+	Launch(context.Context, string, []string, string, func(string) bool) error
 }
 
 type Codex struct {
 	command    string
 	args       []string
-	runner     commandRunner
+	runner     commandLauncher
 	discoverer sessionDiscoverer
 }
 
@@ -64,10 +73,16 @@ func (codex *Codex) Dispatch(ctx context.Context, request Request) (Result, erro
 	}
 
 	sessionID := request.SessionID
-	err := codex.runner.Run(ctx, codex.command, args, request.Prompt, func(line string) {
-		if sessionID == "" {
-			sessionID = sessionIDFromEvent(line)
+	err := codex.runner.Launch(ctx, codex.command, args, request.Prompt, func(line string) bool {
+		reportedSessionID := sessionIDFromEvent(line)
+		if reportedSessionID == "" {
+			return false
 		}
+		if sessionID != "" && !strings.EqualFold(sessionID, reportedSessionID) {
+			return false
+		}
+		sessionID = reportedSessionID
+		return true
 	})
 	if err != nil {
 		if request.SessionID != "" && isSessionNotFound(err) {
@@ -125,6 +140,140 @@ type execRunner struct {
 	processes   processStarter
 }
 
+// Launch returns once Codex acknowledges the thread. Its stdio is file-backed
+// so the task can continue when a one-shot Bifrost process exits.
+func (runner *execRunner) Launch(ctx context.Context, command string, args []string, input string, started func(string) bool) error {
+	launchContext, cancel := context.WithTimeout(ctx, codexLaunchTimeout)
+	defer cancel()
+	if err := launchContext.Err(); err != nil {
+		return err
+	}
+	inputFile, outputPath, err := createLaunchFiles(input)
+	if err != nil {
+		return err
+	}
+	defer closeAndRemove(inputFile)
+	outputFile, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		_ = os.Remove(outputPath)
+		return err
+	}
+	defer closeAndRemove(outputFile)
+	process := exec.Command(command, args...)
+	configureProcess(process)
+	process.Env = slices.Clone(runner.environment)
+	process.Stdin = inputFile
+	process.Stdout = outputFile
+	process.Stderr = outputFile
+	if err := process.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- process.Wait() }()
+	ticker := time.NewTicker(launchPollInterval)
+	defer ticker.Stop()
+	for {
+		acknowledged, outputErr := launchAcknowledged(outputPath, started)
+		if outputErr != nil {
+			return waitForLaunchExit(process, done, outputErr, outputPath)
+		}
+		if acknowledged {
+			if err := launchContext.Err(); err != nil {
+				return waitForLaunchExit(process, done, err, outputPath)
+			}
+			go reapLaunchedCommand(done, inputFile.Name(), outputFile.Name())
+			return nil
+		}
+		select {
+		case waitErr := <-done:
+			return commandRunError(processExit{WaitError: waitErr, Stderr: readLaunchOutput(outputPath)}, nil)
+		case <-launchContext.Done():
+			return waitForLaunchExit(process, done, launchContext.Err(), outputPath)
+		case <-ticker.C:
+		}
+	}
+}
+
+func closeAndRemove(file *os.File) {
+	path := file.Name()
+	_ = file.Close()
+	_ = os.Remove(path)
+}
+
+func createLaunchFiles(input string) (*os.File, string, error) {
+	inputFile, err := os.CreateTemp("", "bifrost-codex-input-*")
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := io.WriteString(inputFile, input); err != nil {
+		inputFile.Close()
+		os.Remove(inputFile.Name())
+		return nil, "", err
+	}
+	if _, err := inputFile.Seek(0, io.SeekStart); err != nil {
+		inputFile.Close()
+		os.Remove(inputFile.Name())
+		return nil, "", err
+	}
+	outputFile, err := os.CreateTemp("", "bifrost-codex-output-*")
+	if err != nil {
+		inputFile.Close()
+		os.Remove(inputFile.Name())
+		return nil, "", err
+	}
+	outputPath := outputFile.Name()
+	outputFile.Close()
+	return inputFile, outputPath, nil
+}
+
+func launchAcknowledged(outputPath string, started func(string) bool) (bool, error) {
+	output, err := readLaunchOutputBytes(outputPath)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if started(line) {
+			return true, nil
+		}
+	}
+	if int64(len(output)) > maxLaunchOutputBytes {
+		return false, fmt.Errorf("Codex launch output exceeded %d bytes before acknowledgement", maxLaunchOutputBytes)
+	}
+	return false, nil
+}
+
+func waitForLaunchExit(process *exec.Cmd, done <-chan error, cause error, stderrPath string) error {
+	cleanupErr := terminateCommand(process.Process)
+	waitErr := <-done
+	return commandRunError(processExit{
+		WaitError: waitErr, ContextError: cause, CleanupFailed: cleanupErr != nil, Stderr: readLaunchOutput(stderrPath),
+	}, nil)
+}
+
+func reapLaunchedCommand(done <-chan error, paths ...string) {
+	<-done
+	for _, path := range paths {
+		_ = os.Remove(path)
+	}
+}
+
+func readLaunchOutput(path string) string {
+	output, err := readLaunchOutputBytes(path)
+	if err != nil {
+		return ""
+	}
+	return string(output)
+}
+
+func readLaunchOutputBytes(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(io.LimitReader(file, maxLaunchOutputBytes+1))
+}
+
 func (runner *execRunner) Run(ctx context.Context, command string, args []string, input string, output func(string)) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -144,7 +293,10 @@ func (runner *execRunner) Run(ctx context.Context, command string, args []string
 	if scanErr != nil {
 		process.Cancel()
 	}
-	exit := process.Wait()
+	return commandRunError(process.Wait(), scanErr)
+}
+
+func commandRunError(exit processExit, scanErr error) error {
 	if exit.ContextError != nil {
 		if exit.CleanupFailed {
 			return &commandError{cause: fmt.Errorf("%w: Codex process cleanup failed", exit.ContextError), stderr: exit.Stderr}

@@ -665,6 +665,18 @@ func (runner *fakeRunner) Run(_ context.Context, command string, args []string, 
 	return runner.err
 }
 
+func (runner *fakeRunner) Launch(_ context.Context, command string, args []string, input string, started func(string) bool) error {
+	runner.command = command
+	runner.args = append([]string(nil), args...)
+	runner.input = input
+	for _, line := range runner.lines {
+		if started(line) {
+			return nil
+		}
+	}
+	return runner.err
+}
+
 func TestCodexDispatchStartsAndResumesSessions(t *testing.T) {
 	t.Parallel()
 	const sessionID = "019c0000-0000-7000-8000-000000000001"
@@ -684,7 +696,7 @@ func TestCodexDispatchStartsAndResumesSessions(t *testing.T) {
 		t.Fatalf("start command/args/input = %q / %#v / %q", runner.command, runner.args, runner.input)
 	}
 
-	runner.lines = nil
+	runner.lines = []string{`{"type":"thread.started","thread_id":"` + sessionID + `"}`}
 	result, err = codex.Dispatch(context.Background(), Request{SessionID: sessionID, Prompt: "more review"})
 	if err != nil {
 		t.Fatal(err)
@@ -698,15 +710,29 @@ func TestCodexDispatchStartsAndResumesSessions(t *testing.T) {
 func TestCodexReturnsStartedSessionWhenRunFails(t *testing.T) {
 	t.Parallel()
 	const sessionID = "019c0000-0000-7000-8000-000000000002"
-	runner := &fakeRunner{
-		lines: []string{`{"type":"thread.started","thread_id":"` + sessionID + `"}`},
-		err:   errors.New("failed"),
-	}
+	runner := &fakeRunner{err: errors.New("failed")}
 	codex := NewCodex("codex", nil, nil)
 	codex.runner = runner
 
 	result, err := codex.Dispatch(context.Background(), Request{WorkingDirectory: "/repo", Prompt: "review"})
-	if err == nil || result.SessionID != sessionID {
+	if err == nil || result.SessionID != "" {
+		t.Fatalf("result/error = %#v / %v", result, err)
+	}
+}
+
+func TestCodexDispatchWaitsForMatchingThreadStartedEvent(t *testing.T) {
+	t.Parallel()
+	const sessionID = "019c0000-0000-7000-8000-000000000004"
+	runner := &fakeRunner{lines: []string{
+		`{"type":"turn.started"}`,
+		`{"type":"thread.started","thread_id":"019c0000-0000-7000-8000-000000000005"}`,
+		`{"type":"thread.started","thread_id":"` + sessionID + `"}`,
+	}}
+	codex := NewCodex("codex", nil, nil)
+	codex.runner = runner
+
+	result, err := codex.Dispatch(context.Background(), Request{SessionID: sessionID, Prompt: "review"})
+	if err != nil || result.SessionID != sessionID {
 		t.Fatalf("result/error = %#v / %v", result, err)
 	}
 }

@@ -62,14 +62,11 @@ func (osProcessStarter) Start(ctx context.Context, request processRequest) (mana
 	configureProcess(command)
 	cleanupFailed := &atomic.Bool{}
 	command.Cancel = func() error {
-		err := terminateProcessTree(command.Process)
+		err := terminateCommand(command.Process)
 		if err == nil || errors.Is(err, os.ErrProcessDone) {
 			return err
 		}
 		cleanupFailed.Store(true)
-		if rootError := command.Process.Kill(); rootError != nil && !errors.Is(rootError, os.ErrProcessDone) {
-			return errors.Join(err, rootError)
-		}
 		return err
 	}
 	command.WaitDelay = processCleanupTimeout
@@ -117,6 +114,17 @@ func (osProcessStarter) Start(ctx context.Context, request processRequest) (mana
 		cleanupFailed: cleanupFailed, pipeCleanupTimedOut: pipeCleanupTimedOut,
 		cleanupFinished: cleanupFinished, stopPipeCleanup: stopPipeCleanup,
 	}, nil
+}
+
+func terminateCommand(process *os.Process) error {
+	err := terminateProcessTree(process)
+	if err == nil || errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	if rootError := process.Kill(); rootError != nil && !errors.Is(rootError, os.ErrProcessDone) {
+		return errors.Join(err, rootError)
+	}
+	return err
 }
 
 func (process *osManagedProcess) Input() io.WriteCloser { return process.input }
