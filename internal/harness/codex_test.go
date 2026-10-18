@@ -709,7 +709,6 @@ func TestCodexDispatchStartsAndResumesSessions(t *testing.T) {
 
 func TestCodexReturnsStartedSessionWhenRunFails(t *testing.T) {
 	t.Parallel()
-	const sessionID = "019c0000-0000-7000-8000-000000000002"
 	runner := &fakeRunner{err: errors.New("failed")}
 	codex := NewCodex("codex", nil, nil)
 	codex.runner = runner

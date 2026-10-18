@@ -206,23 +206,23 @@ func createLaunchFiles(input string) (*os.File, string, error) {
 		return nil, "", err
 	}
 	if _, err := io.WriteString(inputFile, input); err != nil {
-		inputFile.Close()
-		os.Remove(inputFile.Name())
+		_ = inputFile.Close()
+		_ = os.Remove(inputFile.Name())
 		return nil, "", err
 	}
 	if _, err := inputFile.Seek(0, io.SeekStart); err != nil {
-		inputFile.Close()
-		os.Remove(inputFile.Name())
+		_ = inputFile.Close()
+		_ = os.Remove(inputFile.Name())
 		return nil, "", err
 	}
 	outputFile, err := os.CreateTemp("", "bifrost-codex-output-*")
 	if err != nil {
-		inputFile.Close()
-		os.Remove(inputFile.Name())
+		_ = inputFile.Close()
+		_ = os.Remove(inputFile.Name())
 		return nil, "", err
 	}
 	outputPath := outputFile.Name()
-	outputFile.Close()
+	_ = outputFile.Close()
 	return inputFile, outputPath, nil
 }
 
@@ -270,7 +270,7 @@ func readLaunchOutputBytes(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	return io.ReadAll(io.LimitReader(file, maxLaunchOutputBytes+1))
 }
 
