@@ -2,20 +2,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/matan-yadgar/bifrost/internal/bridge"
-	"github.com/matan-yadgar/bifrost/internal/ci"
 	"github.com/matan-yadgar/bifrost/internal/config"
 	githubapi "github.com/matan-yadgar/bifrost/internal/github"
 	"github.com/matan-yadgar/bifrost/internal/harness"
@@ -30,11 +26,6 @@ func main() {
 	}
 	configPath := flag.String("config", defaultConfig, "path to bifrost JSON config")
 	runOnce := flag.Bool("once", false, "poll once and exit")
-	wakeTask := flag.String("wake-task", "", "wake the original task by ID using the configured harness")
-	message := flag.String("message", "", "message for -wake-task")
-	readTask := flag.String("read-task", "", "read recent history by task ID or exact name, without resuming it")
-	releaseTask := flag.String("release-task", "", "release CI holds for this task ID")
-	retryCI := flag.Bool("retry-ci", false, "clear a failed coordinator batch after investigation")
 	flag.Parse()
 
 	runtimeConfig, err := config.Load(*configPath)
@@ -45,30 +36,6 @@ func main() {
 	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
 	if err != nil {
 		log.Fatal(err)
-	}
-	if *wakeTask != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		delivery, err := agentHarness.WakeTask(ctx, *wakeTask, *message)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"task_id": *wakeTask, "delivery": delivery}); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
-	if *readTask != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		history, err := agentHarness.ReadTask(ctx, *readTask)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if err := json.NewEncoder(os.Stdout).Encode(history); err != nil {
-			log.Fatal(err)
-		}
-		return
 	}
 	instanceLock, err := instance.Acquire(runtimeConfig.StateFile)
 	if err != nil {
@@ -90,35 +57,11 @@ func main() {
 	}()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	executable, err := os.Executable()
+	token, err := githubapi.AuthToken(ctx)
 	if err != nil {
 		logger.Fatal(err)
-	}
-	absoluteConfig, err := filepath.Abs(*configPath)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	var token string
-	if *releaseTask == "" && !*retryCI {
-		token, err = githubapi.AuthToken(ctx)
-		if err != nil {
-			logger.Fatal(err)
-		}
 	}
 	githubClient := githubapi.NewClient(token)
-	ciMonitor := ci.New(githubClient, agentHarness, runtimeConfig, environment, executable, absoluteConfig, logger)
-	if *releaseTask != "" {
-		if err := ciMonitor.ReleaseTask(*releaseTask); err != nil {
-			logger.Fatal(err)
-		}
-		return
-	}
-	if *retryCI {
-		if err := ciMonitor.Retry(ctx); err != nil {
-			logger.Fatal(err)
-		}
-		return
-	}
 
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {
@@ -126,17 +69,13 @@ func main() {
 			Name: repository.Name, Authors: repository.Authors, WorkingDirectory: repository.WorkingDirectory,
 		})
 	}
-	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, logger)
+	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, runtimeConfig.MonitorCI, logger)
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
-		var ciError error
-		if runtimeConfig.MonitorCI {
-			ciError = ciMonitor.RunOnce(ctx)
-		}
 		result, err := monitor.RunOnce(ctx)
 		logger.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
-		return result, errors.Join(ciError, err)
+		return result, err
 	}
 	if *runOnce {
 		result, err := poll()

@@ -75,27 +75,28 @@ Bifrost currently targets macOS and Linux and has no UI, webhook listener, datab
 
 Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment monitoring. It uses the existing `poll_interval` and each repository's `authors`; CI monitoring requires a nonempty author list. Existing configurations keep CI monitoring disabled.
 
-Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger a coordinator. A check run ID and completion timestamp distinguish rerun attempts. Previously assessed failures stay quiet; a new head or failed attempt can trigger another assessment.
+Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger delivery. Check identities distinguish rerun attempts. New failures and changed review threads for a PR are combined into one prompt and sent through the same cached fork. No coordinator or Desktop chat tools are needed.
 
-A fresh Codex coordinator handles up to 25 affected PRs per batch. It receives PR URLs, head SHAs, failed-check links and the `Bifrost task:` names. It reads recent task history through the native app-server API using `bifrost -config /path/to/config.json -read-task 'exact task name or UUID'`, then uses `bifrost -config /path/to/config.json -wake-task TASK_UUID -message MESSAGE` to wake the original task. This adapter starts an unloaded task using native `codex exec resume`; for an explicit active-writer conflict it uses native `codex queue`, preserving Desktop ownership. Queueing alone cannot start an unloaded task. There is no extra MCP server, global Codex configuration change, or fork of the originating task. Keep Codex Desktop running so it can consume queued messages for its tasks. Coordinators require separately stored `gh auth login` credentials: polling-only `GH_TOKEN` and `GITHUB_TOKEN` are removed from their environment, and Bifrost checks this prerequisite before launch. The installed Codex CLI must support `queue`, `archive`, and the app-server task APIs.
+The fork verifies the live PR, head and check results, investigates failures, and uses `post-push-validation` and `task-implementation` within its approved scope. Failures that remain current are eligible on each later poll until they recover or the fork records a pause. Dispatch errors are logged and retried on a later poll. The fork must check whether failures have recovered before doing work.
 
-The coordinator must recheck live PR state, head SHA, current check outcomes and task context before queueing a message. It asks the originating task to use `post-push-validation` and `task-implementation` within its existing authorization. It respects explicit user pauses, human blockers and repair-cycle limits. Persisted history can lag a running Desktop task; native queuing serializes delivery instead of taking ownership or interrupting its current turn.
+CI information is stored alongside routes and review fingerprints in `state.json`, under `ci["owner/repo#42"]`:
 
-CI memory lives in `<state_file>.ci.json`, protected by the same Bifrost instance lock. Decisions are `wake`, `hold`, `wait`, or `ignore`. Holds remain until explicitly released, including across commits:
-
-```sh
-bifrost -config /path/to/config.json -release-task TASK_UUID
+```json
+{
+  "head_sha": "current-commit",
+  "paused": true,
+  "reason": "CI requires credentials from a human",
+  "resume_condition": "Credentials have been restored"
+}
 ```
 
-`wait` decisions are reassessed only after the target's persisted history changes. Holds and routing problems are logged with their reasons. Missing or ambiguous task names are reported for human correction rather than guessed; changing the PR's `Bifrost task:` name causes a fresh assessment.
+If further CI messages will not help, the fork can set `paused`, `reason`, and `resume_condition` in its existing PR entry. The prompt supplies the state path and lock instructions. Bifrost rereads the state before dispatch, preserves pause changes when saving delivery results, and logs skipped CI follow-ups. Pauses survive new commits and process restarts. Review comments continue through the normal flow.
 
-After a result is saved, Bifrost archives the coordinator and deletes its batch directory. If no result arrives within `dispatch_timeout`, the batch is held for investigation; Bifrost does not silently start another coordinator. Failed coordinators keep their task ID, batch and diagnostics; investigate them, then explicitly allow another attempt:
+Both the fork and Bifrost must acquire an exclusive OS file lock on `<state_file>.update.lock` before reading and updating state, read the latest contents after acquiring it, and atomically replace the state file before releasing it. On macOS/Linux, Python `fcntl.flock(lock, fcntl.LOCK_EX)` interoperates with Bifrost's lock. Never delete the lock file or recreate a removed PR entry. This short transaction lock is separate from the `.lock` held for the service's lifetime.
 
-```sh
-bifrost -config /path/to/config.json -retry-ci
-```
+To resume, use the same locked update to set `paused` to `false` and clear `reason` and `resume_condition`. No restart or GitHub comment is needed. Still-failing current checks become eligible again after resuming. A successful complete repository scan removes all state for PRs that are closed or merged. Failed scans never infer closure.
 
-A successful complete repository scan removes CI state (including PR-owned holds) for closed or merged PRs and removes those PRs from pending batches. A new head removes decisions for the previous commit. Shared batches retain their still-open, current-head entries; the coordinator re-reads the batch before waking a task. Failed scans never infer closure. State and temporary artifacts are cleaned up; archived chats and ordinary process logs follow their existing retention behavior. CI monitoring has its own state schema and does not alter review-comment routing.
+The CLI exposes only `-config` and `-once` (plus standard help). The main configuration is read at startup; per-PR pause state is read during polling and immediately before CI delivery.
 
 ## Attribution
 

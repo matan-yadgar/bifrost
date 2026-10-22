@@ -2,7 +2,6 @@ package harness
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -33,12 +32,9 @@ type Discovery struct {
 }
 
 type Request struct {
-	SessionID          string
-	WorkingDirectory   string
-	Prompt             string
-	OutputSchemaPath   string
-	OutputPath         string
-	AllowNonRepository bool
+	SessionID        string
+	WorkingDirectory string
+	Prompt           string
 }
 
 type Result struct {
@@ -56,18 +52,7 @@ type Harness interface {
 	Dispatch(context.Context, Request) (Result, error)
 }
 
-// TaskHarness adds task management to review discovery and dispatch. ReadTask
-// returns recent history with an opaque revision; reading must not take ownership.
-// WakeTask acknowledges delivery to the existing task, and Archive waits for
-// command completion. Both preserve task ownership and honor cancellation.
-type TaskHarness interface {
-	Harness
-	ReadTask(context.Context, string) (json.RawMessage, error)
-	WakeTask(context.Context, string, string) (string, error)
-	Archive(context.Context, string) error
-}
-
-func New(kind, command string, arguments, environment []string) (TaskHarness, error) {
+func New(kind, command string, arguments, environment []string) (Harness, error) {
 	switch kind {
 	case "codex":
 		return NewCodex(command, arguments, environment), nil

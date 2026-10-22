@@ -137,7 +137,7 @@ func Load(path string) (Runtime, error) {
 	if err != nil {
 		return Runtime{}, fmt.Errorf("state_file: %w", err)
 	}
-	if pathsOverlap(stateFile, path) || config.MonitorCI && pathsOverlap(stateFile+".ci.json", path) {
+	if pathsOverlap(stateFile, path) {
 		return Runtime{}, fmt.Errorf("config and state_file must use different paths")
 	}
 	logDirectory := config.LogDirectory

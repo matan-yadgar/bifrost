@@ -39,6 +39,7 @@ const promptOmissionSuffix = "\n[Additional changed threads omitted from this me
 type Source interface {
 	OpenPullRequests(context.Context, string) ([]githubapi.PullRequest, error)
 	ReviewThreads(context.Context, githubapi.PullRequest) ([]githubapi.ReviewThread, error)
+	FailedChecks(context.Context, githubapi.PullRequest) ([]githubapi.FailedCheck, error)
 }
 
 type Repository struct {
@@ -52,6 +53,7 @@ type Monitor struct {
 	harness            harness.Harness
 	repositories       []Repository
 	stateFile          string
+	monitorCI          bool
 	dispatchTimeout    time.Duration
 	heartbeatInterval  time.Duration
 	newHeartbeatTicker func(time.Duration) (<-chan time.Time, func())
@@ -81,6 +83,7 @@ type stateFile struct {
 	DiscoveryCursor int                          `json:"discovery_cursor,omitempty"`
 	Threads         map[string]map[string]string `json:"threads"`
 	Routes          map[string]route             `json:"routes,omitempty"`
+	CI              map[string]*ciState          `json:"ci,omitempty"`
 }
 
 type dispatchJob struct {
@@ -89,12 +92,14 @@ type dispatchJob struct {
 	key          string
 	prompt       string
 	fingerprints map[string]string
+	checks       []githubapi.FailedCheck
 	sessionID    string
 	staleIDs     []string
 	routeChoice  string
 }
 
 type dispatchOutcome struct {
+	skipped      bool
 	err          error
 	sessionID    string
 	replaceRoute bool
@@ -136,10 +141,10 @@ func (locks *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 	}
 }
 
-func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, dispatchTimeout time.Duration, logger *log.Logger) *Monitor {
+func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, dispatchTimeout time.Duration, monitorCI bool, logger *log.Logger) *Monitor {
 	return &Monitor{
 		source: source, harness: agentHarness, repositories: repositories,
-		stateFile: statePath, dispatchTimeout: dispatchTimeout, heartbeatInterval: dispatchHeartbeatInterval,
+		stateFile: statePath, monitorCI: monitorCI, dispatchTimeout: dispatchTimeout, heartbeatInterval: dispatchHeartbeatInterval,
 		newHeartbeatTicker: newHeartbeatTicker, logger: logger,
 	}
 }
@@ -150,7 +155,7 @@ func newHeartbeatTicker(interval time.Duration) (<-chan time.Time, func()) {
 }
 
 func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
-	state, err := loadState(monitor.stateFile)
+	state, err := monitor.readState(ctx)
 	if err != nil {
 		return CycleResult{}, err
 	}
@@ -180,24 +185,48 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 		result.PullRequests += len(pullRequests)
 		for _, pullRequest := range pullRequests {
 			threads, err := monitor.source.ReviewThreads(ctx, pullRequest)
+			var changed []githubapi.ReviewThread
+			var fingerprints map[string]string
 			if err != nil {
 				cycleErrors = append(cycleErrors, fmt.Errorf("read %s review threads: %w", pullRequest.URL, err))
 				sourceScanFailed = true
+			} else {
+				result.Threads += len(threads)
+				var changedState bool
+				changed, changedState, fingerprints = changedThreads(state, pullRequest, threads)
+				stateChanged = stateChanged || changedState
+			}
+			var checks []githubapi.FailedCheck
+			if monitor.monitorCI {
+				checks, err = monitor.changedChecks(ctx, state, pullRequest)
+				stateChanged = true
+				if err != nil {
+					cycleErrors = append(cycleErrors, err)
+					sourceScanFailed = true
+				}
+			}
+			if len(changed) == 0 && len(checks) == 0 {
 				continue
 			}
-			result.Threads += len(threads)
-			changed, changedState, fingerprints := changedThreads(state, pullRequest, threads)
-			stateChanged = stateChanged || changedState
-			if len(changed) == 0 {
-				continue
-			}
+
 			key := pullRequestKey(pullRequest.Repository, pullRequest.Number)
 			monitor.logger.Printf("feedback changed: pr=%s changed_threads=%d", key, len(changed))
+			if len(checks) > 0 {
+				monitor.logger.Printf("CI failures detected: pr=%s failed_checks=%d", key, len(checks))
+			}
 			if seenJobKeys[key] {
 				continue
 			}
 			seenJobKeys[key] = true
-			prompt, includedThreads := reviewPrompt(pullRequest, changed)
+			var prompt string
+			var includedThreads map[string]bool
+			if len(changed) > 0 {
+				budget := maxDispatchPrompt
+				if len(checks) > 0 {
+					budget -= maxCIPrompt
+				}
+				prompt, includedThreads = reviewPrompt(pullRequest, changed, budget)
+			}
 			result.DeferredThreads += len(changed) - len(includedThreads)
 			includedFingerprints := make(map[string]string, len(includedThreads))
 			for threadID := range includedThreads {
@@ -205,7 +234,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 			}
 			job := dispatchJob{
 				repository: repository, pullRequest: pullRequest, key: key,
-				prompt: prompt, fingerprints: includedFingerprints,
+				prompt: prompt, fingerprints: includedFingerprints, checks: checks,
 			}
 			if uniqueJobs < queueCursor {
 				if len(wrapJobs) < maxPendingDispatches {
@@ -251,7 +280,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 		}
 	}
 	if stateChanged {
-		if err := saveJSON(monitor.stateFile, state); err != nil {
+		if err := monitor.saveState(ctx, state); err != nil {
 			return result, err
 		}
 		stateChanged = false
@@ -277,7 +306,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 		}
 		if outcome.err != nil {
 			cycleErrors = append(cycleErrors, outcome.err)
-		} else {
+		} else if !outcome.skipped {
 			result.Dispatches++
 			if state.Threads[job.key] == nil {
 				state.Threads[job.key] = make(map[string]string)
@@ -288,7 +317,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 			stateChanged = true
 		}
 		if stateChanged {
-			if err := saveJSON(monitor.stateFile, state); err != nil {
+			if err := monitor.saveState(ctx, state); err != nil {
 				cycleErrors = append(cycleErrors, fmt.Errorf("save state after dispatch %s: %w", job.key, err))
 			} else {
 				stateChanged = false
@@ -296,7 +325,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 		}
 	}
 	if stateChanged {
-		if err := saveJSON(monitor.stateFile, state); err != nil {
+		if err := monitor.saveState(ctx, state); err != nil {
 			cycleErrors = append(cycleErrors, fmt.Errorf("save final dispatch state: %w", err))
 			return result, errors.Join(cycleErrors...)
 		}
@@ -395,7 +424,7 @@ func (monitor *Monitor) dispatchLanes(jobs []dispatchJob, discoveryErrors []erro
 	return lanes
 }
 
-func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) dispatchOutcome {
+func (monitor *Monitor) deliver(ctx context.Context, item queuedDispatch) dispatchOutcome {
 	job := item.job
 	if err := ctx.Err(); err != nil {
 		return dispatchOutcome{err: fmt.Errorf("dispatch %s: %w", job.key, err)}
@@ -403,14 +432,9 @@ func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) dispa
 	if job.sessionID == "" {
 		return monitor.spawn(ctx, job)
 	}
-	unlock, err := monitor.sessionLocks.lock(ctx, strings.ToLower(job.sessionID))
-	if err != nil {
-		return dispatchOutcome{err: fmt.Errorf("wait for session %s: %w", job.sessionID, err)}
-	}
 	result, dispatchError := monitor.harness.Dispatch(ctx, harness.Request{
 		SessionID: job.sessionID, WorkingDirectory: job.repository.WorkingDirectory, Prompt: job.prompt,
 	})
-	unlock()
 	if !errors.Is(dispatchError, harness.ErrSessionNotFound) {
 		return monitor.completedDispatch(job, job.sessionID, result, dispatchError, false)
 	}
@@ -422,11 +446,6 @@ func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) dispa
 }
 
 func (monitor *Monitor) spawn(ctx context.Context, job dispatchJob) dispatchOutcome {
-	unlock, err := monitor.spawnLocks.lock(ctx, filepath.Clean(job.repository.WorkingDirectory))
-	if err != nil {
-		return dispatchOutcome{err: fmt.Errorf("wait to start %s: %w", job.key, err)}
-	}
-	defer unlock()
 	result, dispatchError := monitor.harness.Dispatch(ctx, harness.Request{
 		WorkingDirectory: job.repository.WorkingDirectory, Prompt: job.prompt,
 	})
@@ -605,6 +624,12 @@ func pruneRepositoryState(state *stateFile, repository string, pullRequests []gi
 		open[pullRequestKey(pullRequest.Repository, pullRequest.Number)] = true
 	}
 	changed := false
+	for key := range state.CI {
+		if strings.HasPrefix(key, prefix) && !open[key] {
+			delete(state.CI, key)
+			changed = true
+		}
+	}
 	for key := range state.Threads {
 		if strings.HasPrefix(key, prefix) && !open[key] {
 			delete(state.Threads, key)
@@ -661,7 +686,7 @@ func fingerprint(thread githubapi.ReviewThread) string {
 	return commentFingerprintV1 + hex.EncodeToString(sum[:])
 }
 
-func reviewPrompt(pullRequest githubapi.PullRequest, threads []githubapi.ReviewThread) (string, map[string]bool) {
+func reviewPrompt(pullRequest githubapi.PullRequest, threads []githubapi.ReviewThread, budget int) (string, map[string]bool) {
 	var prompt strings.Builder
 	fmt.Fprintf(&prompt, "New or updated unresolved inline review feedback was detected.\n\nRepository: %s\nPR: #%d — %s\nURL: %s\n", pullRequest.Repository, pullRequest.Number, pullRequest.Title, pullRequest.URL)
 	if pullRequest.HeadRef != "" {
@@ -688,7 +713,7 @@ func reviewPrompt(pullRequest githubapi.PullRequest, threads []githubapi.ReviewT
 			fmt.Fprintf(&summary, "Latest: %s (%s): %s\n  %s\n", latest.Author, latest.URL, body, latest.UpdatedAt.UTC().Format(time.RFC3339))
 		}
 		summary.WriteString("\n")
-		if prompt.Len()+summary.Len()+len(promptOmissionSuffix) > maxDispatchPrompt {
+		if prompt.Len()+summary.Len()+len(promptOmissionSuffix) > budget {
 			prompt.WriteString(promptOmissionSuffix)
 			break
 		}
@@ -728,6 +753,7 @@ func loadState(path string) (*stateFile, error) {
 		Version: stateSchemaVersion,
 		Threads: make(map[string]map[string]string),
 		Routes:  make(map[string]route),
+		CI:      make(map[string]*ciState),
 	}
 	if err := loadJSON(path, state); err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
@@ -746,6 +772,14 @@ func loadState(path string) (*stateFile, error) {
 	}
 	if state.Routes == nil {
 		state.Routes = make(map[string]route)
+	}
+	if state.CI == nil {
+		state.CI = make(map[string]*ciState)
+	}
+	for key, entry := range state.CI {
+		if entry == nil {
+			return nil, fmt.Errorf("invalid CI entry %s", key)
+		}
 	}
 	return state, nil
 }
