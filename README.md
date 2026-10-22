@@ -75,7 +75,7 @@ Bifrost currently targets macOS and Linux and has no UI, webhook listener, datab
 
 Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment monitoring. It uses the existing `poll_interval` and each repository's `authors`; CI monitoring requires a nonempty author list. Existing configurations keep CI monitoring disabled.
 
-Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger delivery. Check identities distinguish rerun attempts. New failures and changed review threads for a PR are combined into one prompt and sent through the same cached fork. No coordinator or Desktop chat tools are needed.
+Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger delivery. New failures and changed review threads for a PR are combined into one prompt and sent through the same cached fork. No coordinator or Desktop chat tools are needed.
 
 The fork verifies the live PR, head and check results, investigates failures, and uses `post-push-validation` and `task-implementation` within its approved scope. Failures that remain current are eligible on each later poll until they recover or the fork records a pause. Dispatch errors are logged and retried on a later poll. The fork must check whether failures have recovered before doing work.
 

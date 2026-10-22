@@ -14,7 +14,7 @@ import (
 
 func ciFixture(t *testing.T) (*Monitor, *fakeSource, *fakeHarness) {
 	t.Helper()
-	source := &fakeSource{pullRequest: githubapi.PullRequest{Repository: "owner/repo", Number: 42, URL: "https://github.com/owner/repo/pull/42", HeadSHA: "head-1"}, checks: []githubapi.FailedCheck{{ID: "check-1", Name: "unit", URL: "https://github.com/owner/repo/actions/runs/1", Conclusion: "failure"}}}
+	source := &fakeSource{pullRequest: githubapi.PullRequest{Repository: "owner/repo", Number: 42, URL: "https://github.com/owner/repo/pull/42", HeadSHA: "head-1"}, checks: []githubapi.FailedCheck{{Name: "unit", URL: "https://github.com/owner/repo/actions/runs/1", Conclusion: "failure"}}}
 	agent := &fakeHarness{discoveredID: "019c0000-0000-7000-8000-000000000003"}
 	monitor := New(source, agent, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, filepath.Join(t.TempDir(), "state.json"), time.Minute, true, discardLogger())
 	return monitor, source, agent
@@ -35,8 +35,6 @@ func TestCIAndCommentsUseOneCachedForkAndPersistentFailuresStayEligible(t *testi
 	if len(agent.requests) != 1 || !strings.Contains(agent.requests[0].Prompt, "review feedback") || !strings.Contains(agent.requests[0].Prompt, "CI failures") {
 		t.Fatalf("requests=%+v", agent.requests)
 	}
-	run(1)
-	source.checks[0].ID = "rerun-2"
 	run(1)
 	source.pullRequest.HeadSHA = "head-2"
 	run(1)
@@ -94,7 +92,6 @@ func TestPauseWrittenDuringDeliverySurvivesSaveAndNewHeads(t *testing.T) {
 		t.Fatal(err)
 	}
 	source.pullRequest.HeadSHA = "new-head"
-	source.checks[0].ID = "new-check"
 	if r, err := monitor.RunOnce(context.Background()); err != nil || r.Dispatches != 0 {
 		t.Fatalf("paused=%+v err=%v", r, err)
 	}

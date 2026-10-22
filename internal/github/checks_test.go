@@ -16,9 +16,9 @@ func TestFailedChecksUsesCurrentHeadLatestAttemptsAndContexts(t *testing.T) {
 			if request.URL.Query().Get("filter") != "latest" {
 				t.Error("missing latest-attempt filter")
 			}
-			_, _ = fmt.Fprint(writer, `{"check_runs":[{"id":1,"name":"unit","status":"completed","conclusion":"failure","completed_at":"2026-10-22T12:00:00Z","html_url":"https://example/unit"},{"id":2,"status":"in_progress","conclusion":"failure"},{"id":3,"status":"completed","conclusion":"cancelled"},{"id":4,"status":"completed","conclusion":"success"},{"id":5,"name":"build","status":"completed","conclusion":"timed_out"}]}`)
+			_, _ = fmt.Fprint(writer, `{"check_runs":[{"name":"unit","status":"completed","conclusion":"failure","html_url":"https://example/unit"},{"status":"in_progress","conclusion":"failure"},{"status":"completed","conclusion":"cancelled"},{"status":"completed","conclusion":"success"},{"name":"build","status":"completed","conclusion":"timed_out"}]}`)
 		case "/repos/owner/repo/commits/current-sha/statuses":
-			_, _ = fmt.Fprint(writer, `[{"id":9,"context":"external","state":"pending"},{"id":8,"context":"external","state":"failure"},{"id":7,"context":"deploy","state":"error","target_url":"https://example/deploy"}]`)
+			_, _ = fmt.Fprint(writer, `[{"context":"external","state":"pending"},{"context":"external","state":"failure"},{"context":"deploy","state":"error","target_url":"https://example/deploy"}]`)
 		default:
 			t.Errorf("unexpected endpoint %s", request.URL)
 			http.Error(writer, "unexpected endpoint", 400)
@@ -33,9 +33,6 @@ func TestFailedChecksUsesCurrentHeadLatestAttemptsAndContexts(t *testing.T) {
 	}
 	if len(checks) != 3 || checks[0].Name != "unit" || checks[1].Name != "build" || checks[2].Name != "deploy" {
 		t.Fatalf("checks=%#v", checks)
-	}
-	if checks[0].ID != "check:1:2026-10-22T12:00:00Z" {
-		t.Fatal("attempt timestamp missing from identity")
 	}
 }
 
@@ -52,7 +49,7 @@ func TestFailedChecksDoesNotReturnPartialScan(t *testing.T) {
 				if index > 0 {
 					_, _ = fmt.Fprint(writer, ",")
 				}
-				_, _ = fmt.Fprintf(writer, `{"id":%d,"status":"completed","conclusion":"failure"}`, index)
+				_, _ = fmt.Fprint(writer, `{"status":"completed","conclusion":"failure"}`)
 			}
 			_, _ = fmt.Fprint(writer, ` ]}`)
 			return
