@@ -24,17 +24,20 @@ type sessionDiscoverer interface {
 	Discover(context.Context, []Target) ([]Discovery, error)
 }
 
-type commandLauncher interface {
+type commandRunner interface {
+	Run(context.Context, string, []string, string, func(string)) error
 	Launch(context.Context, string, []string, string, func(string) bool) error
 }
 
 type Codex struct {
 	command    string
 	args       []string
-	runner     commandLauncher
+	runner     commandRunner
 	discoverer sessionDiscoverer
 	appServer  *codexAppServer
 }
+
+var _ TaskHarness = (*Codex)(nil)
 
 func NewCodex(command string, args, environment []string) *Codex {
 	processes := osProcessStarter{}
@@ -61,6 +64,15 @@ func (codex *Codex) Dispatch(ctx context.Context, request Request) (Result, erro
 	args = append(args, codex.args...)
 	if request.SessionID != "" {
 		args = append(args, "resume")
+	}
+	if request.AllowNonRepository {
+		args = append(args, "--skip-git-repo-check")
+	}
+	if request.OutputSchemaPath != "" {
+		args = append(args, "--output-schema", request.OutputSchemaPath)
+	}
+	if request.OutputPath != "" {
+		args = append(args, "-o", request.OutputPath)
 	}
 	args = append(args, "--json")
 	if request.SessionID == "" {

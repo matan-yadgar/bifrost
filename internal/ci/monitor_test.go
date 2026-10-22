@@ -282,3 +282,73 @@ func TestMissingResultWaitsUntilDeadlineThenRequiresInvestigation(t *testing.T) 
 		t.Fatal("expired coordinator not retained for investigation")
 	}
 }
+
+func TestPendingBatchInvalidatesCorrectedOrRemovedRouting(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{"Bifrost task: Corrected task", "No routing marker"} {
+		t.Run(body, func(t *testing.T) {
+			monitor, source, runtime := fixture(t)
+			poll(t, monitor)
+			memory, err := monitor.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldBatch := memory.Pending.Directory
+			oldEntry := memory.Pending.Failures[0]
+			report := map[string]any{"decisions": []decision{{FailureID: oldEntry.ID, TaskID: testTask, Outcome: "hold", Reason: "old task needs approval"}}}
+			if err := writeJSON(filepath.Join(oldBatch, "result.json"), report); err != nil {
+				t.Fatal(err)
+			}
+			source.prs[0].Body = body
+			poll(t, monitor)
+			memory, err = monitor.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved := memory.PRs[oldEntry.PRKey]
+			if memory.Pending != nil || len(saved.Decisions) != 0 || saved.Hold != nil {
+				t.Fatal("obsolete route result was applied")
+			}
+			if _, err := os.Stat(oldBatch); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("obsolete batch retained: %v", err)
+			}
+			poll(t, monitor)
+			memory, err = monitor.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.launches != 2 || memory.Pending.Failures[0].TaskName != source.prs[0].TaskName() {
+				t.Fatal("corrected route was suppressed")
+			}
+		})
+	}
+}
+
+func TestRouteChangeRemovesOnlyObsoleteEntryFromSharedBatch(t *testing.T) {
+	t.Parallel()
+	monitor, source, _ := fixture(t)
+	second := source.prs[0]
+	second.Number = 2
+	source.prs = append(source.prs, second)
+	poll(t, monitor)
+	source.prs[0].Body = "Bifrost task: Replacement"
+	poll(t, monitor)
+	memory, err := monitor.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memory.Pending == nil || len(memory.Pending.Failures) != 1 || memory.Pending.Failures[0].PRKey != "owner/repo#2" {
+		t.Fatal("unaffected pending route was removed")
+	}
+	data, err := os.ReadFile(filepath.Join(memory.Pending.Directory, "batch.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []failure
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].PRKey != "owner/repo#2" {
+		t.Fatal("obsolete route remained authorized in batch file")
+	}
+}

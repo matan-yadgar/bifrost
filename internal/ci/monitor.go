@@ -13,6 +13,7 @@ import (
 
 	"github.com/matan-yadgar/bifrost/internal/config"
 	githubapi "github.com/matan-yadgar/bifrost/internal/github"
+	"github.com/matan-yadgar/bifrost/internal/harness"
 )
 
 type Source interface {
@@ -74,8 +75,8 @@ type state struct {
 	Pending *batch                       `json:"pending,omitempty"`
 }
 
-func New(source Source, settings config.Runtime, environment []string, executable, configPath string, logger *log.Logger) *Monitor {
-	return &Monitor{source: source, runtime: newCodex(settings, environment, executable, configPath), repositories: settings.Repositories, statePath: settings.StateFile + ".ci.json", logger: logger, timeout: settings.DispatchTimeout}
+func New(source Source, agent harness.TaskHarness, settings config.Runtime, environment []string, executable, configPath string, logger *log.Logger) *Monitor {
+	return &Monitor{source: source, runtime: newRuntime(agent, settings, environment, executable, configPath), repositories: settings.Repositories, statePath: settings.StateFile + ".ci.json", logger: logger, timeout: settings.DispatchTimeout}
 }
 
 func (monitor *Monitor) RunOnce(ctx context.Context) error {
@@ -210,7 +211,7 @@ func (monitor *Monitor) finishBatch(ctx context.Context, memory *state) error {
 	pending := memory.Pending
 	current := pending.Failures[:0]
 	for _, entry := range pending.Failures {
-		if saved := memory.PRs[entry.PRKey]; saved != nil && saved.HeadSHA == entry.HeadSHA {
+		if saved := memory.PRs[entry.PRKey]; saved != nil && saved.HeadSHA == entry.HeadSHA && saved.TaskName == entry.TaskName {
 			current = append(current, entry)
 		}
 	}
@@ -315,8 +316,8 @@ func (monitor *Monitor) taskRevision(ctx context.Context, id string) (string, er
 }
 
 func (monitor *Monitor) ReleaseTask(id string) error {
-	if !validTaskID(id) {
-		return fmt.Errorf("release-task requires a task UUID")
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("release-task requires a task identifier")
 	}
 	memory, err := monitor.load()
 	if err != nil {
@@ -361,9 +362,9 @@ func validDecision(value decision) bool {
 	}
 	switch value.Outcome {
 	case "wake", "hold":
-		return validTaskID(value.TaskID)
+		return strings.TrimSpace(value.TaskID) != ""
 	case "wait":
-		return validTaskID(value.TaskID) && value.Revision != ""
+		return strings.TrimSpace(value.TaskID) != "" && value.Revision != ""
 	case "ignore":
 		return true
 	}

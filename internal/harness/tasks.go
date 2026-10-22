@@ -11,7 +11,11 @@ import (
 
 // ReadTask reads persisted history without taking ownership of a Desktop thread.
 func (codex *Codex) ReadTask(ctx context.Context, identifier string) (json.RawMessage, error) {
-	return codex.appServer.ReadTask(ctx, identifier)
+	raw, err := codex.appServer.ReadTask(ctx, identifier)
+	if err != nil {
+		return nil, err
+	}
+	return recentTaskHistory(raw)
 }
 
 func (server *codexAppServer) ReadTask(ctx context.Context, identifier string) (json.RawMessage, error) {
@@ -103,4 +107,53 @@ func (codex *Codex) WakeTask(ctx context.Context, id, message string) (string, e
 		return "", fmt.Errorf("Codex queue returned no delivery receipt")
 	}
 	return "queued", nil
+}
+
+func (codex *Codex) Archive(ctx context.Context, id string) error {
+	if !validSessionID(id) {
+		return fmt.Errorf("invalid Codex task ID")
+	}
+	if err := codex.runner.Run(ctx, codex.command, []string{"archive", id}, "", func(string) {}); err != nil {
+		return fmt.Errorf("archive task %s: %w", id, err)
+	}
+	return nil
+}
+
+func recentTaskHistory(raw json.RawMessage) (json.RawMessage, error) {
+	var result struct {
+		Revision string `json:"revision"`
+		Thread   struct {
+			ID     string          `json:"id"`
+			Status json.RawMessage `json:"status"`
+			Turns  []struct {
+				ID     string            `json:"id"`
+				Status string            `json:"status"`
+				Items  []json.RawMessage `json:"items"`
+			} `json:"turns"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	turns := result.Thread.Turns
+	if len(turns) > 8 {
+		turns = turns[len(turns)-8:]
+	}
+	for index := range turns {
+		var messages []json.RawMessage
+		for _, item := range turns[index].Items {
+			var header struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(item, &header); err != nil {
+				return nil, err
+			}
+			if header.Type == "userMessage" || header.Type == "agentMessage" {
+				messages = append(messages, item)
+			}
+		}
+		turns[index].Items = messages
+	}
+	result.Thread.Turns = turns
+	return json.Marshal(result)
 }

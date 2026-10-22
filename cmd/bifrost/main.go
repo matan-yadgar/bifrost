@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/matan-yadgar/bifrost/internal/ci"
 	"io"
 	"log"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/matan-yadgar/bifrost/internal/bridge"
+	"github.com/matan-yadgar/bifrost/internal/ci"
 	"github.com/matan-yadgar/bifrost/internal/config"
 	githubapi "github.com/matan-yadgar/bifrost/internal/github"
 	"github.com/matan-yadgar/bifrost/internal/harness"
@@ -30,10 +30,10 @@ func main() {
 	}
 	configPath := flag.String("config", defaultConfig, "path to bifrost JSON config")
 	runOnce := flag.Bool("once", false, "poll once and exit")
-	wakeTask := flag.String("wake-task", "", "wake the original task by UUID using native Codex resume/queue")
+	wakeTask := flag.String("wake-task", "", "wake the original task by ID using the configured harness")
 	message := flag.String("message", "", "message for -wake-task")
-	readTask := flag.String("read-task", "", "read recent history by task UUID or exact name, without resuming it")
-	releaseTask := flag.String("release-task", "", "release CI holds for this task UUID")
+	readTask := flag.String("read-task", "", "read recent history by task ID or exact name, without resuming it")
+	releaseTask := flag.String("release-task", "", "release CI holds for this task ID")
 	retryCI := flag.Bool("retry-ci", false, "clear a failed coordinator batch after investigation")
 	flag.Parse()
 
@@ -42,11 +42,14 @@ func main() {
 		log.Fatal(err)
 	}
 	environment := githubapi.WithoutAuthTokens(os.Environ())
+	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if *wakeTask != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		agent := harness.NewCodex(runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
-		delivery, err := agent.WakeTask(ctx, *wakeTask, *message)
+		delivery, err := agentHarness.WakeTask(ctx, *wakeTask, *message)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -58,12 +61,11 @@ func main() {
 	if *readTask != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		agent := harness.NewCodex(runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
-		history, err := agent.ReadTask(ctx, *readTask)
+		history, err := agentHarness.ReadTask(ctx, *readTask)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := writeTaskHistory(os.Stdout, history); err != nil {
+		if err := json.NewEncoder(os.Stdout).Encode(history); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -104,7 +106,7 @@ func main() {
 		}
 	}
 	githubClient := githubapi.NewClient(token)
-	ciMonitor := ci.New(githubClient, runtimeConfig, environment, executable, absoluteConfig, logger)
+	ciMonitor := ci.New(githubClient, agentHarness, runtimeConfig, environment, executable, absoluteConfig, logger)
 	if *releaseTask != "" {
 		if err := ciMonitor.ReleaseTask(*releaseTask); err != nil {
 			logger.Fatal(err)
@@ -118,13 +120,6 @@ func main() {
 		return
 	}
 
-	var agentHarness harness.Harness
-	switch runtimeConfig.Harness.Type {
-	case "codex":
-		agentHarness = harness.NewCodex(runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, githubapi.WithoutAuthTokens(os.Environ()))
-	default:
-		logger.Fatalf("unsupported harness %q", runtimeConfig.Harness.Type)
-	}
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {
 		repositories = append(repositories, bridge.Repository{
@@ -186,43 +181,4 @@ func incompleteDeliveryError(result bridge.CycleResult) error {
 		return nil
 	}
 	return fmt.Errorf("incomplete delivery: %d pull requests and %d review threads were deferred", result.Deferred, result.DeferredThreads)
-}
-
-func writeTaskHistory(output io.Writer, raw json.RawMessage) error {
-	var result struct {
-		Revision string `json:"revision"`
-		Thread   struct {
-			ID     string          `json:"id"`
-			Status json.RawMessage `json:"status"`
-			Turns  []struct {
-				ID     string            `json:"id"`
-				Status string            `json:"status"`
-				Items  []json.RawMessage `json:"items"`
-			} `json:"turns"`
-		} `json:"thread"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return err
-	}
-	turns := result.Thread.Turns
-	if len(turns) > 8 {
-		turns = turns[len(turns)-8:]
-	}
-	for index := range turns {
-		var messages []json.RawMessage
-		for _, item := range turns[index].Items {
-			var header struct {
-				Type string `json:"type"`
-			}
-			if err := json.Unmarshal(item, &header); err != nil {
-				return err
-			}
-			if header.Type == "userMessage" || header.Type == "agentMessage" {
-				messages = append(messages, item)
-			}
-		}
-		turns[index].Items = messages
-	}
-	result.Thread.Turns = turns
-	return json.NewEncoder(output).Encode(result)
 }

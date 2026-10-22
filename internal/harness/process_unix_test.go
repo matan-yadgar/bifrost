@@ -119,3 +119,56 @@ func TestExecRunnerLaunchCancelsUnacknowledgedProcess(t *testing.T) {
 		t.Fatal("canceled launch did not return")
 	}
 }
+
+func TestArchiveCancelsConfiguredWrapperDescendants(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	pidFile := filepath.Join(directory, "child.pid")
+	wrapper := filepath.Join(directory, "codex-wrapper")
+	script := "#!/bin/sh\n[ \"$1\" = archive ] || exit 7\nsleep 30 &\necho $! > \"$BIFROST_ARCHIVE_CHILD_PID\"\nwait\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	agent := NewCodex(wrapper, nil, append(os.Environ(), "BIFROST_ARCHIVE_CHILD_PID="+pidFile))
+	completed := make(chan error, 1)
+	go func() { completed <- agent.Archive(ctx, appServerCreatorSessionID) }()
+	deadline := time.Now().Add(2 * time.Second)
+	var childPID int
+	for childPID == 0 {
+		if data, err := os.ReadFile(pidFile); err == nil {
+			childPID, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("archive wrapper did not report its child")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if child, err := os.FindProcess(childPID); err == nil {
+		defer func() { _ = child.Kill() }()
+	}
+	cancel()
+	select {
+	case err := <-completed:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("archive error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("archive cancellation did not finish managed cleanup")
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		output, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(childPID)).Output()
+		state := strings.TrimSpace(string(output))
+		if err != nil || strings.HasPrefix(state, "Z") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("archive wrapper child %d survived cancellation", childPID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

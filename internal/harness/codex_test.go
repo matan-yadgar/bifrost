@@ -876,3 +876,43 @@ func TestExecRunnerEnvironmentHelper(t *testing.T) {
 	fmt.Printf("GITHUB_TOKEN_PRESENT=%t\n", githubTokenPresent)
 	os.Exit(0)
 }
+
+func TestFactorySelectsConfiguredHarnessAndRejectsUnsupportedTypes(t *testing.T) {
+	t.Parallel()
+	agent, err := New("codex", "custom-codex", []string{"--approve-for-me"}, nil)
+	if err != nil || agent.Name() != "codex" {
+		t.Fatalf("agent=%v err=%v", agent, err)
+	}
+	if _, err := New("unsupported", "codex", nil, nil); err == nil {
+		t.Fatal("unsupported provider silently selected Codex")
+	}
+}
+
+func TestCodexDispatchTranslatesStructuredResultOptions(t *testing.T) {
+	t.Parallel()
+	runner := &fakeRunner{lines: []string{`{"type":"thread.started","thread_id":"` + appServerCreatorSessionID + `"}`}}
+	codex := NewCodex("custom-codex", []string{"--approve-for-me"}, nil)
+	codex.runner = runner
+	_, err := codex.Dispatch(context.Background(), Request{WorkingDirectory: "/state", Prompt: "assess", OutputSchemaPath: "/state/schema.json", OutputPath: "/state/result.json", AllowNonRepository: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"exec", "--approve-for-me", "--skip-git-repo-check", "--output-schema", "/state/schema.json", "-o", "/state/result.json", "--json", "-C", "/state", "-"}
+	if !reflect.DeepEqual(runner.args, want) {
+		t.Fatalf("args=%#v", runner.args)
+	}
+}
+
+func TestCodexArchiveUsesManagedRunnerWithoutExecFlags(t *testing.T) {
+	t.Parallel()
+	cause := errors.New("archive cancelled")
+	runner := &fakeRunner{err: cause}
+	codex := NewCodex("custom-codex", []string{"--skip-git-repo-check"}, nil)
+	codex.runner = runner
+	if err := codex.Archive(context.Background(), appServerCreatorSessionID); !errors.Is(err, cause) {
+		t.Fatalf("archive error=%v", err)
+	}
+	if runner.command != "custom-codex" || !reflect.DeepEqual(runner.args, []string{"archive", appServerCreatorSessionID}) {
+		t.Fatalf("command=%s args=%#v", runner.command, runner.args)
+	}
+}
