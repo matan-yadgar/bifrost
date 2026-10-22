@@ -77,13 +77,14 @@ Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment m
 
 Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger delivery. New failures and changed review threads for a PR are combined into one prompt and sent through the same cached fork. No coordinator or Desktop chat tools are needed.
 
-The fork verifies the live PR, head and check results, investigates failures, and uses `post-push-validation` and `task-implementation` within its approved scope. Failures that remain current are eligible on each later poll until they recover or the fork records a pause. Dispatch errors are logged and retried on a later poll. The fork must check whether failures have recovered before doing work.
+The fork verifies the live PR, head and check results, investigates failures, and uses `post-push-validation` and `task-implementation` within its approved scope. Once the fork acknowledges startup, Bifrost records the reported CI attempts for that PR head and does not send those attempts again. New commits or newly failed reruns are eligible. Dispatch errors are logged and retried on a later poll. Bifrost does not track whether an acknowledged fork later finishes or crashes. The fork must check whether failures have recovered before doing work.
 
 CI information is stored alongside routes and review fingerprints in `state.json`, under `ci["owner/repo#42"]`:
 
 ```json
 {
   "head_sha": "current-commit",
+  "reported": {"check:123:completion-timestamp": true},
   "paused": true,
   "reason": "CI requires credentials from a human",
   "resume_condition": "Credentials have been restored"
@@ -94,7 +95,7 @@ If further CI messages will not help, the fork can set `paused`, `reason`, and `
 
 Both the fork and Bifrost must acquire an exclusive OS file lock on `<state_file>.update.lock` before reading and updating state, read the latest contents after acquiring it, and atomically replace the state file before releasing it. On macOS/Linux, Python `fcntl.flock(lock, fcntl.LOCK_EX)` interoperates with Bifrost's lock. Never delete the lock file or recreate a removed PR entry. This short transaction lock is separate from the `.lock` held for the service's lifetime.
 
-To resume, use the same locked update to set `paused` to `false` and clear `reason` and `resume_condition`. No restart or GitHub comment is needed. Still-failing current checks become eligible again after resuming. A successful complete repository scan removes all state for PRs that are closed or merged. Failed scans never infer closure.
+To resume, use the same locked update to set `paused` to `false` and clear `reason` and `resume_condition`. No restart or GitHub comment is needed. Unreported current failures become eligible after resuming; already reported attempts remain suppressed. A successful complete repository scan removes all state for PRs that are closed or merged. Failed scans never infer closure.
 
 The CLI exposes only `-config` and `-once` (plus standard help). The main configuration is read at startup; per-PR pause state is read during polling and immediately before CI delivery.
 

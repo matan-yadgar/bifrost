@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,13 +15,13 @@ import (
 
 func ciFixture(t *testing.T) (*Monitor, *fakeSource, *fakeHarness) {
 	t.Helper()
-	source := &fakeSource{pullRequest: githubapi.PullRequest{Repository: "owner/repo", Number: 42, URL: "https://github.com/owner/repo/pull/42", HeadSHA: "head-1"}, checks: []githubapi.FailedCheck{{Name: "unit", URL: "https://github.com/owner/repo/actions/runs/1", Conclusion: "failure"}}}
+	source := &fakeSource{pullRequest: githubapi.PullRequest{Repository: "owner/repo", Number: 42, URL: "https://github.com/owner/repo/pull/42", HeadSHA: "head-1"}, checks: []githubapi.FailedCheck{{ID: "check:1:first", Name: "unit", URL: "https://github.com/owner/repo/actions/runs/1", Conclusion: "failure"}}}
 	agent := &fakeHarness{discoveredID: "019c0000-0000-7000-8000-000000000003"}
 	monitor := New(source, agent, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, filepath.Join(t.TempDir(), "state.json"), time.Minute, true, discardLogger())
 	return monitor, source, agent
 }
 
-func TestCIAndCommentsUseOneCachedForkAndPersistentFailuresStayEligible(t *testing.T) {
+func TestCIReportsOncePerHeadAndAttemptAcrossRestarts(t *testing.T) {
 	t.Parallel()
 	monitor, source, agent := ciFixture(t)
 	source.threads = []githubapi.ReviewThread{reviewThread("review", time.Now())}
@@ -35,7 +36,12 @@ func TestCIAndCommentsUseOneCachedForkAndPersistentFailuresStayEligible(t *testi
 	if len(agent.requests) != 1 || !strings.Contains(agent.requests[0].Prompt, "review feedback") || !strings.Contains(agent.requests[0].Prompt, "CI failures") {
 		t.Fatalf("requests=%+v", agent.requests)
 	}
+	run(0)
+	monitor = New(source, agent, monitor.repositories, monitor.stateFile, time.Minute, true, discardLogger())
+	run(0)
+	source.checks[0].ID = "check:1:rerun"
 	run(1)
+	run(0)
 	source.pullRequest.HeadSHA = "head-2"
 	run(1)
 	if agent.discoverCalls != 1 {
@@ -176,5 +182,70 @@ func TestCIScanFailureDoesNotBlockReviewDelivery(t *testing.T) {
 	source.threads = []githubapi.ReviewThread{reviewThread("review", time.Now())}
 	if r, err := monitor.RunOnce(context.Background()); err == nil || r.Dispatches != 1 {
 		t.Fatalf("result=%+v err=%v", r, err)
+	}
+}
+
+func TestReportedCIFailureDoesNotSuppressNewCheckOrReviewFeedback(t *testing.T) {
+	t.Parallel()
+	monitor, source, agent := ciFixture(t)
+	if _, err := monitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	source.threads = []githubapi.ReviewThread{reviewThread("new-review", time.Now())}
+	source.checks = append(source.checks, githubapi.FailedCheck{ID: "status:2", Name: "deploy", Conclusion: "error"})
+	if r, err := monitor.RunOnce(context.Background()); err != nil || r.Dispatches != 1 {
+		t.Fatalf("result=%+v err=%v", r, err)
+	}
+	prompt := agent.requests[len(agent.requests)-1].Prompt
+	if !strings.Contains(prompt, "review feedback") || !strings.Contains(prompt, "deploy (error)") || strings.Contains(prompt, "unit (failure)") {
+		t.Fatalf("unexpected combined prompt: %s", prompt)
+	}
+	if r, err := monitor.RunOnce(context.Background()); err != nil || r.Dispatches != 0 {
+		t.Fatalf("duplicate=%+v err=%v", r, err)
+	}
+}
+
+func TestOmittedCIFailuresRemainPending(t *testing.T) {
+	t.Parallel()
+	monitor, source, agent := ciFixture(t)
+	for index := 2; index <= 100; index++ {
+		source.checks = append(source.checks, githubapi.FailedCheck{ID: fmt.Sprintf("status:%d", index), Name: fmt.Sprintf("check-%03d-", index) + strings.Repeat("x", 500), URL: strings.Repeat("u", 2048), Conclusion: "failure"})
+	}
+	if _, err := monitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReported := state.CI["owner/repo#42"].Reported
+	first := len(firstReported)
+	for _, check := range source.checks {
+		included := strings.Contains(agent.requests[0].Prompt, "- "+check.Name+" (")
+		if firstReported[check.ID] != included {
+			t.Fatalf("reported status differs from delivered prompt for %s", check.ID)
+		}
+	}
+	if first == 0 || first >= len(source.checks) || !strings.Contains(agent.requests[0].Prompt, ciOmission) {
+		t.Fatal("fixture did not overflow the CI prompt")
+	}
+	if _, err := monitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err = loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range source.checks {
+		included := strings.Contains(agent.requests[1].Prompt, "- "+check.Name+" (")
+		if firstReported[check.ID] && included {
+			t.Fatalf("already reported check repeated: %s", check.ID)
+		}
+		if state.CI["owner/repo#42"].Reported[check.ID] != (firstReported[check.ID] || included) {
+			t.Fatalf("omitted check incorrectly recorded: %s", check.ID)
+		}
+	}
+	if len(state.CI["owner/repo#42"].Reported) <= first {
+		t.Fatal("omitted checks incorrectly marked reported")
 	}
 }

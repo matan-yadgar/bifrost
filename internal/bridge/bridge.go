@@ -99,11 +99,12 @@ type dispatchJob struct {
 }
 
 type dispatchOutcome struct {
-	skipped      bool
-	err          error
-	sessionID    string
-	replaceRoute bool
-	staleID      string
+	reportedChecks []string
+	skipped        bool
+	err            error
+	sessionID      string
+	replaceRoute   bool
+	staleID        string
 }
 
 type dispatchCompletion struct {
@@ -314,6 +315,16 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 			for threadID, fingerprint := range job.fingerprints {
 				state.Threads[job.key][threadID] = fingerprint
 			}
+			if len(outcome.reportedChecks) > 0 {
+				saved := state.CI[job.key]
+				if saved.Reported == nil {
+					saved.Reported = make(map[string]bool)
+				}
+				for _, id := range outcome.reportedChecks {
+					saved.Reported[id] = true
+				}
+			}
+
 			stateChanged = true
 		}
 		if stateChanged {
