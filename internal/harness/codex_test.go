@@ -876,3 +876,14 @@ func TestExecRunnerEnvironmentHelper(t *testing.T) {
 	fmt.Printf("GITHUB_TOKEN_PRESENT=%t\n", githubTokenPresent)
 	os.Exit(0)
 }
+
+func TestFactorySelectsConfiguredHarnessAndRejectsUnsupportedTypes(t *testing.T) {
+	t.Parallel()
+	agent, err := New("codex", "custom-codex", []string{"--approve-for-me"}, nil)
+	if err != nil || agent.Name() != "codex" {
+		t.Fatalf("agent=%v err=%v", agent, err)
+	}
+	if _, err := New("unsupported", "codex", nil, nil); err == nil {
+		t.Fatal("unsupported provider silently selected Codex")
+	}
+}

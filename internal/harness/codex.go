@@ -24,24 +24,27 @@ type sessionDiscoverer interface {
 	Discover(context.Context, []Target) ([]Discovery, error)
 }
 
-type commandLauncher interface {
+type commandRunner interface {
 	Launch(context.Context, string, []string, string, func(string) bool) error
 }
 
 type Codex struct {
 	command    string
 	args       []string
-	runner     commandLauncher
+	runner     commandRunner
 	discoverer sessionDiscoverer
 }
 
+var _ Harness = (*Codex)(nil)
+
 func NewCodex(command string, args, environment []string) *Codex {
 	processes := osProcessStarter{}
+	appServer := &codexAppServer{command: command, environment: slices.Clone(environment), processes: processes}
 	return &Codex{
 		command:    command,
 		args:       append([]string(nil), args...),
 		runner:     &execRunner{environment: slices.Clone(environment), processes: processes},
-		discoverer: &codexAppServer{command: command, environment: slices.Clone(environment), processes: processes},
+		discoverer: appServer,
 	}
 }
 

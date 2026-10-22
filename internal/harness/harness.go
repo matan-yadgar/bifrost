@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 var ErrSessionNotFound = errors.New("harness session not found")
@@ -49,4 +50,13 @@ type Harness interface {
 	Name() string
 	Discover(context.Context, []Target) ([]Discovery, error)
 	Dispatch(context.Context, Request) (Result, error)
+}
+
+func New(kind, command string, arguments, environment []string) (Harness, error) {
+	switch kind {
+	case "codex":
+		return NewCodex(command, arguments, environment), nil
+	default:
+		return nil, fmt.Errorf("unsupported harness %q", kind)
+	}
 }

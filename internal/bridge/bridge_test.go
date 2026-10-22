@@ -20,6 +20,8 @@ import (
 )
 
 type fakeSource struct {
+	checks               []githubapi.FailedCheck
+	checksError          error
 	pullRequest          githubapi.PullRequest
 	pullRequests         []githubapi.PullRequest
 	pullRequestsByRepo   map[string][]githubapi.PullRequest
@@ -44,6 +46,10 @@ func (source *fakeSource) OpenPullRequests(_ context.Context, repository string)
 		return source.pullRequests, nil
 	}
 	return []githubapi.PullRequest{source.pullRequest}, nil
+}
+
+func (source *fakeSource) FailedChecks(context.Context, githubapi.PullRequest) ([]githubapi.FailedCheck, error) {
+	return source.checks, source.checksError
 }
 
 func (source *fakeSource) ReviewThreads(_ context.Context, pullRequest githubapi.PullRequest) ([]githubapi.ReviewThread, error) {
@@ -83,7 +89,7 @@ func newTestMonitor(source Source, agentHarness harness.Harness, repositories []
 			panic(err)
 		}
 	}
-	return New(source, agentHarness, repositories, statePath, time.Minute, discardLogger())
+	return New(source, agentHarness, repositories, statePath, time.Minute, false, discardLogger())
 }
 
 func discardLogger() *log.Logger {
@@ -196,7 +202,7 @@ func TestMonitorLogsOperationalLifecycleWithoutSensitivePayloads(t *testing.T) {
 		agentHarness,
 		[]Repository{{Name: "Owner/Repo", WorkingDirectory: directory}},
 		statePath,
-		time.Minute,
+		time.Minute, false,
 		log.New(&output, "", 0),
 	)
 
@@ -885,7 +891,7 @@ func TestMonitorPrunesClosedPullRequestStateAfterSuccessfulListing(t *testing.T)
 		t.Fatal(err)
 	}
 	source := &fakeSource{pullRequest: openPullRequest, threads: []githubapi.ReviewThread{openThread}}
-	monitor := New(source, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute, discardLogger())
+	monitor := New(source, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute, false, discardLogger())
 
 	result, err := monitor.RunOnce(context.Background())
 	if err != nil || result.Dispatches != 0 {
@@ -918,7 +924,7 @@ func TestMonitorPreservesOpenPullRequestStateWhenAuthorIsFilteredOut(t *testing.
 	}
 	agentHarness := &fakeHarness{}
 	monitor := New(&fakeSource{pullRequest: pullRequest, threads: []githubapi.ReviewThread{reviewThread("new-thread", time.Now())}}, agentHarness,
-		[]Repository{{Name: "Owner/Repo", Authors: []string{"wanted-author"}, WorkingDirectory: directory}}, statePath, time.Minute, discardLogger())
+		[]Repository{{Name: "Owner/Repo", Authors: []string{"wanted-author"}, WorkingDirectory: directory}}, statePath, time.Minute, false, discardLogger())
 
 	result, err := monitor.RunOnce(context.Background())
 	if err != nil || result.PullRequests != 0 || result.Threads != 0 || len(agentHarness.requests) != 0 {
@@ -953,7 +959,7 @@ func TestMonitorDoesNotPruneRoutesWhenPullRequestListingFails(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	monitor := New(&fakeSource{openError: errors.New("temporary failure")}, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute, discardLogger())
+	monitor := New(&fakeSource{openError: errors.New("temporary failure")}, &fakeHarness{}, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, time.Minute, false, discardLogger())
 
 	if _, err := monitor.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected listing error")
@@ -991,7 +997,7 @@ func TestMonitorPrunesSuccessfulRepositoryAndPreservesFailedRepository(t *testin
 	monitor := New(source, &fakeHarness{}, []Repository{
 		{Name: "Good/Repo", WorkingDirectory: directory},
 		{Name: "Bad/Repo", WorkingDirectory: directory},
-	}, statePath, time.Minute, discardLogger())
+	}, statePath, time.Minute, false, discardLogger())
 
 	if _, err := monitor.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected partial listing error")
@@ -1529,7 +1535,7 @@ func TestDispatchTimeoutPreservesSessionAndLeavesFeedbackPending(t *testing.T) {
 	const dispatchTimeout = 250 * time.Millisecond
 	agentHarness := &timeoutHarness{sessionID: "started-session", deadline: make(chan timeoutObservation, 1)}
 	statePath := filepath.Join(directory, "state.json")
-	monitor := New(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, dispatchTimeout, discardLogger())
+	monitor := New(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, dispatchTimeout, false, discardLogger())
 	type cycleOutcome struct {
 		result CycleResult
 		err    error
@@ -1867,7 +1873,7 @@ func TestReviewPromptBoundsUntrustedCommentText(t *testing.T) {
 		threads[index] = reviewThread(fmt.Sprintf("large-thread-%d", index), now)
 		threads[index].Comments[0].Body = "comment-prefix " + strings.Repeat("界", 2*1024)
 	}
-	prompt, included := reviewPrompt(githubapi.PullRequest{Repository: "owner/repo", Number: 1}, threads)
+	prompt, included := reviewPrompt(githubapi.PullRequest{Repository: "owner/repo", Number: 1}, threads, maxDispatchPrompt)
 	if len(prompt) > 256*1024 || !utf8.ValidString(prompt) || !strings.Contains(prompt, "Additional changed threads omitted") {
 		t.Fatalf("bounded prompt length/valid/suffix = %d / %t / %t", len(prompt), utf8.ValidString(prompt), strings.Contains(prompt, "Additional changed threads omitted"))
 	}

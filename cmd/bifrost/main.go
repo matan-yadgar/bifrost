@@ -32,6 +32,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	environment := githubapi.WithoutAuthTokens(os.Environ())
+	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
+	if err != nil {
+		log.Fatal(err)
+	}
 	instanceLock, err := instance.Acquire(runtimeConfig.StateFile)
 	if err != nil {
 		log.Fatal(err)
@@ -56,21 +61,15 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
+	githubClient := githubapi.NewClient(token)
 
-	var agentHarness harness.Harness
-	switch runtimeConfig.Harness.Type {
-	case "codex":
-		agentHarness = harness.NewCodex(runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, githubapi.WithoutAuthTokens(os.Environ()))
-	default:
-		logger.Fatalf("unsupported harness %q", runtimeConfig.Harness.Type)
-	}
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {
 		repositories = append(repositories, bridge.Repository{
 			Name: repository.Name, Authors: repository.Authors, WorkingDirectory: repository.WorkingDirectory,
 		})
 	}
-	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, logger)
+	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, runtimeConfig.MonitorCI, logger)
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()

@@ -71,6 +71,33 @@ The harness interface separates discovery from dispatch. Codex currently impleme
 
 Bifrost currently targets macOS and Linux and has no UI, webhook listener, database, dynamic plugin loading, reviewer allowlist, per-PR worktree provisioning, or automatic GitHub-thread resolution. GitHub polling remains sequential; queued agent dispatches use at most two workers and the next poll waits for the queue to drain. At most 100 PR dispatches are retained per poll; excess work remains uncommitted and a persisted cursor rotates capacity fairly across later polls. Prompts are capped at 256 KiB and direct the agent to inspect omitted text on the live PR. One-shot mode exits unsuccessfully while PRs or threads remain deferred. Each GitHub response is capped at 8 MiB, with at most 32 MiB of retained review-thread text per PR. Distinct routed tasks can run concurrently, so give them isolated worktrees; Bifrost-spawned tasks otherwise share the configured checkout.
 
+## CI follow-up
+
+Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment monitoring. It uses the existing `poll_interval` and each repository's `authors`; CI monitoring requires a nonempty author list. Existing configurations keep CI monitoring disabled.
+
+Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger delivery. New failures and changed review threads for a PR are combined into one prompt and sent through the same cached fork. No coordinator or Desktop chat tools are needed.
+
+The fork verifies the live PR, head and check results, investigates failures, and uses `post-push-validation` and `task-implementation` within its approved scope. Failures that remain current are eligible on each later poll until they recover or the fork records a pause. Dispatch errors are logged and retried on a later poll. The fork must check whether failures have recovered before doing work.
+
+CI information is stored alongside routes and review fingerprints in `state.json`, under `ci["owner/repo#42"]`:
+
+```json
+{
+  "head_sha": "current-commit",
+  "paused": true,
+  "reason": "CI requires credentials from a human",
+  "resume_condition": "Credentials have been restored"
+}
+```
+
+If further CI messages will not help, the fork can set `paused`, `reason`, and `resume_condition` in its existing PR entry. The prompt supplies the state path and lock instructions. Bifrost rereads the state before dispatch, preserves pause changes when saving delivery results, and logs skipped CI follow-ups. Pauses survive new commits and process restarts. Review comments continue through the normal flow.
+
+Both the fork and Bifrost must acquire an exclusive OS file lock on `<state_file>.update.lock` before reading and updating state, read the latest contents after acquiring it, and atomically replace the state file before releasing it. On macOS/Linux, Python `fcntl.flock(lock, fcntl.LOCK_EX)` interoperates with Bifrost's lock. Never delete the lock file or recreate a removed PR entry. This short transaction lock is separate from the `.lock` held for the service's lifetime.
+
+To resume, use the same locked update to set `paused` to `false` and clear `reason` and `resume_condition`. No restart or GitHub comment is needed. Still-failing current checks become eligible again after resuming. A successful complete repository scan removes all state for PRs that are closed or merged. Failed scans never infer closure.
+
+The CLI exposes only `-config` and `-once` (plus standard help). The main configuration is read at startup; per-PR pause state is read during polling and immediately before CI delivery.
+
 ## Attribution
 
 The GitHub review-thread query and pagination are adapted from [prdash](https://github.com/danielwolfman/prdash). See `THIRD_PARTY_NOTICES.md`.
