@@ -176,3 +176,27 @@ func TestLoadRejectsPathCollisions(t *testing.T) {
 		t.Fatal("expected path collision error")
 	}
 }
+
+func TestCIMonitoringRequiresExplicitAuthors(t *testing.T) {
+	t.Parallel()
+	for _, authors := range []string{`[]`, `["me"]`} {
+		t.Run(authors, func(t *testing.T) {
+			directory := t.TempDir()
+			path := filepath.Join(directory, "config.json")
+			data := `{"monitor_ci":true,"repositories":[{"name":"owner/repo","authors":` + authors + `,"working_directory":"."}]}`
+			if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			settings, err := Load(path)
+			if authors == `[]` {
+				if err == nil {
+					t.Fatal("CI enabled for every author implicitly")
+				}
+				return
+			}
+			if err != nil || !settings.MonitorCI {
+				t.Fatalf("CI config=%#v err=%v", settings, err)
+			}
+		})
+	}
+}

@@ -1,5 +1,6 @@
 {
   "poll_interval": "5m",
+  "monitor_ci": false,
   "dispatch_timeout": "30m",
   "state_file": "state.json",
   "log_directory": "logs",

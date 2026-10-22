@@ -15,6 +15,7 @@ const (
 )
 
 type Config struct {
+	MonitorCI       bool         `json:"monitor_ci,omitempty"`
 	PollInterval    string       `json:"poll_interval"`
 	DispatchTimeout string       `json:"dispatch_timeout"`
 	StateFile       string       `json:"state_file"`
@@ -36,6 +37,7 @@ type Harness struct {
 }
 
 type Runtime struct {
+	MonitorCI       bool
 	PollInterval    time.Duration
 	DispatchTimeout time.Duration
 	StateFile       string
@@ -99,6 +101,9 @@ func Load(path string) (Runtime, error) {
 		}
 		seenRepositories[repositoryKey] = true
 		repository.Authors = normalizeAuthors(repository.Authors)
+		if config.MonitorCI && len(repository.Authors) == 0 {
+			return Runtime{}, fmt.Errorf("repositories[%d].authors is required when monitor_ci is enabled", index)
+		}
 		repository.WorkingDirectory, err = resolvePath(baseDirectory, repository.WorkingDirectory)
 		if err != nil {
 			return Runtime{}, fmt.Errorf("repositories[%d].working_directory: %w", index, err)
@@ -132,7 +137,7 @@ func Load(path string) (Runtime, error) {
 	if err != nil {
 		return Runtime{}, fmt.Errorf("state_file: %w", err)
 	}
-	if pathsOverlap(stateFile, path) {
+	if pathsOverlap(stateFile, path) || config.MonitorCI && pathsOverlap(stateFile+".ci.json", path) {
 		return Runtime{}, fmt.Errorf("config and state_file must use different paths")
 	}
 	logDirectory := config.LogDirectory
@@ -144,6 +149,7 @@ func Load(path string) (Runtime, error) {
 		return Runtime{}, fmt.Errorf("log_directory: %w", err)
 	}
 	return Runtime{
+		MonitorCI:       config.MonitorCI,
 		PollInterval:    pollInterval,
 		DispatchTimeout: dispatchTimeout,
 		StateFile:       stateFile,

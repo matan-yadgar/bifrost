@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"github.com/matan-yadgar/bifrost/internal/ci"
 	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -26,11 +30,43 @@ func main() {
 	}
 	configPath := flag.String("config", defaultConfig, "path to bifrost JSON config")
 	runOnce := flag.Bool("once", false, "poll once and exit")
+	wakeTask := flag.String("wake-task", "", "wake the original task by UUID using native Codex resume/queue")
+	message := flag.String("message", "", "message for -wake-task")
+	readTask := flag.String("read-task", "", "read recent history by task UUID or exact name, without resuming it")
+	releaseTask := flag.String("release-task", "", "release CI holds for this task UUID")
+	retryCI := flag.Bool("retry-ci", false, "clear a failed coordinator batch after investigation")
 	flag.Parse()
 
 	runtimeConfig, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatal(err)
+	}
+	environment := githubapi.WithoutAuthTokens(os.Environ())
+	if *wakeTask != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		agent := harness.NewCodex(runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
+		delivery, err := agent.WakeTask(ctx, *wakeTask, *message)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"task_id": *wakeTask, "delivery": delivery}); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if *readTask != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		agent := harness.NewCodex(runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
+		history, err := agent.ReadTask(ctx, *readTask)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := writeTaskHistory(os.Stdout, history); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 	instanceLock, err := instance.Acquire(runtimeConfig.StateFile)
 	if err != nil {
@@ -52,9 +88,34 @@ func main() {
 	}()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	token, err := githubapi.AuthToken(ctx)
+	executable, err := os.Executable()
 	if err != nil {
 		logger.Fatal(err)
+	}
+	absoluteConfig, err := filepath.Abs(*configPath)
+	if err != nil {
+		logger.Fatal(err)
+	}
+	var token string
+	if *releaseTask == "" && !*retryCI {
+		token, err = githubapi.AuthToken(ctx)
+		if err != nil {
+			logger.Fatal(err)
+		}
+	}
+	githubClient := githubapi.NewClient(token)
+	ciMonitor := ci.New(githubClient, runtimeConfig, environment, executable, absoluteConfig, logger)
+	if *releaseTask != "" {
+		if err := ciMonitor.ReleaseTask(*releaseTask); err != nil {
+			logger.Fatal(err)
+		}
+		return
+	}
+	if *retryCI {
+		if err := ciMonitor.Retry(ctx); err != nil {
+			logger.Fatal(err)
+		}
+		return
 	}
 
 	var agentHarness harness.Harness
@@ -70,13 +131,17 @@ func main() {
 			Name: repository.Name, Authors: repository.Authors, WorkingDirectory: repository.WorkingDirectory,
 		})
 	}
-	monitor := bridge.New(githubapi.NewClient(token), agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, logger)
+	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, logger)
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
+		var ciError error
+		if runtimeConfig.MonitorCI {
+			ciError = ciMonitor.RunOnce(ctx)
+		}
 		result, err := monitor.RunOnce(ctx)
 		logger.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
-		return result, err
+		return result, errors.Join(ciError, err)
 	}
 	if *runOnce {
 		result, err := poll()
@@ -121,4 +186,43 @@ func incompleteDeliveryError(result bridge.CycleResult) error {
 		return nil
 	}
 	return fmt.Errorf("incomplete delivery: %d pull requests and %d review threads were deferred", result.Deferred, result.DeferredThreads)
+}
+
+func writeTaskHistory(output io.Writer, raw json.RawMessage) error {
+	var result struct {
+		Revision string `json:"revision"`
+		Thread   struct {
+			ID     string          `json:"id"`
+			Status json.RawMessage `json:"status"`
+			Turns  []struct {
+				ID     string            `json:"id"`
+				Status string            `json:"status"`
+				Items  []json.RawMessage `json:"items"`
+			} `json:"turns"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return err
+	}
+	turns := result.Thread.Turns
+	if len(turns) > 8 {
+		turns = turns[len(turns)-8:]
+	}
+	for index := range turns {
+		var messages []json.RawMessage
+		for _, item := range turns[index].Items {
+			var header struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(item, &header); err != nil {
+				return err
+			}
+			if header.Type == "userMessage" || header.Type == "agentMessage" {
+				messages = append(messages, item)
+			}
+		}
+		turns[index].Items = messages
+	}
+	result.Thread.Turns = turns
+	return json.NewEncoder(output).Encode(result)
 }

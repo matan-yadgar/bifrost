@@ -71,6 +71,32 @@ The harness interface separates discovery from dispatch. Codex currently impleme
 
 Bifrost currently targets macOS and Linux and has no UI, webhook listener, database, dynamic plugin loading, reviewer allowlist, per-PR worktree provisioning, or automatic GitHub-thread resolution. GitHub polling remains sequential; queued agent dispatches use at most two workers and the next poll waits for the queue to drain. At most 100 PR dispatches are retained per poll; excess work remains uncommitted and a persisted cursor rotates capacity fairly across later polls. Prompts are capped at 256 KiB and direct the agent to inspect omitted text on the live PR. One-shot mode exits unsuccessfully while PRs or threads remain deferred. Each GitHub response is capped at 8 MiB, with at most 32 MiB of retained review-thread text per PR. Distinct routed tasks can run concurrently, so give them isolated worktrees; Bifrost-spawned tasks otherwise share the configured checkout.
 
+## CI follow-up
+
+Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment monitoring. It uses the existing `poll_interval` and each repository's `authors`; CI monitoring requires a nonempty author list. Existing configurations keep CI monitoring disabled.
+
+Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger a coordinator. A check run ID and completion timestamp distinguish rerun attempts. Previously assessed failures stay quiet; a new head or failed attempt can trigger another assessment.
+
+A fresh Codex coordinator handles up to 25 affected PRs per batch. It receives PR URLs, head SHAs, failed-check links and the `Bifrost task:` names. It reads recent task history through the native app-server API using `bifrost -config /path/to/config.json -read-task 'exact task name or UUID'`, then uses `bifrost -config /path/to/config.json -wake-task TASK_UUID -message MESSAGE` to wake the original task. This adapter starts an unloaded task using native `codex exec resume`; for an explicit active-writer conflict it uses native `codex queue`, preserving Desktop ownership. Queueing alone cannot start an unloaded task. There is no extra MCP server, global Codex configuration change, or fork of the originating task. Keep Codex Desktop running so it can consume queued messages for its tasks. Coordinators require separately stored `gh auth login` credentials: polling-only `GH_TOKEN` and `GITHUB_TOKEN` are removed from their environment, and Bifrost checks this prerequisite before launch. The installed Codex CLI must support `queue`, `archive`, and the app-server task APIs.
+
+The coordinator must recheck live PR state, head SHA, current check outcomes and task context before queueing a message. It asks the originating task to use `post-push-validation` and `task-implementation` within its existing authorization. It respects explicit user pauses, human blockers and repair-cycle limits. Persisted history can lag a running Desktop task; native queuing serializes delivery instead of taking ownership or interrupting its current turn.
+
+CI memory lives in `<state_file>.ci.json`, protected by the same Bifrost instance lock. Decisions are `wake`, `hold`, `wait`, or `ignore`. Holds remain until explicitly released, including across commits:
+
+```sh
+bifrost -config /path/to/config.json -release-task TASK_UUID
+```
+
+`wait` decisions are reassessed only after the target's persisted history changes. Holds and routing problems are logged with their reasons. Missing or ambiguous task names are reported for human correction rather than guessed; changing the PR's `Bifrost task:` name causes a fresh assessment.
+
+After a result is saved, Bifrost archives the coordinator and deletes its batch directory. If no result arrives within `dispatch_timeout`, the batch is held for investigation; Bifrost does not silently start another coordinator. Failed coordinators keep their task ID, batch and diagnostics; investigate them, then explicitly allow another attempt:
+
+```sh
+bifrost -config /path/to/config.json -retry-ci
+```
+
+A successful complete repository scan removes CI state (including PR-owned holds) for closed or merged PRs and removes those PRs from pending batches. A new head removes decisions for the previous commit. Shared batches retain their still-open, current-head entries; the coordinator re-reads the batch before waking a task. Failed scans never infer closure. State and temporary artifacts are cleaned up; archived chats and ordinary process logs follow their existing retention behavior. CI monitoring has its own state schema and does not alter review-comment routing.
+
 ## Attribution
 
 The GitHub review-thread query and pagination are adapted from [prdash](https://github.com/danielwolfman/prdash). See `THIRD_PARTY_NOTICES.md`.

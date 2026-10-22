@@ -33,15 +33,18 @@ type Codex struct {
 	args       []string
 	runner     commandLauncher
 	discoverer sessionDiscoverer
+	appServer  *codexAppServer
 }
 
 func NewCodex(command string, args, environment []string) *Codex {
 	processes := osProcessStarter{}
+	appServer := &codexAppServer{command: command, environment: slices.Clone(environment), processes: processes}
 	return &Codex{
 		command:    command,
 		args:       append([]string(nil), args...),
 		runner:     &execRunner{environment: slices.Clone(environment), processes: processes},
-		discoverer: &codexAppServer{command: command, environment: slices.Clone(environment), processes: processes},
+		discoverer: appServer,
+		appServer:  appServer,
 	}
 }
 

@@ -29,7 +29,6 @@ const (
 	maxStaleSessionIDs        = 16
 	dispatchHeartbeatInterval = 30 * time.Second
 	commentFingerprintV1      = "comments-v1:"
-	taskNameDescriptionPrefix = "Bifrost task:"
 	routeCached               = "cached"
 	routeDiscovered           = "discovered"
 	routeNew                  = "new"
@@ -583,15 +582,7 @@ func targetFor(job dispatchJob) harness.Target {
 }
 
 func taskNameFromDescription(description string) string {
-	for line := range strings.SplitSeq(description, "\n") {
-		line = strings.TrimSpace(line)
-		if taskName, found := strings.CutPrefix(line, taskNameDescriptionPrefix); found {
-			if taskName = strings.TrimSpace(taskName); taskName != "" {
-				return taskName
-			}
-		}
-	}
-	return ""
+	return (githubapi.PullRequest{Body: description}).TaskName()
 }
 
 func appendStaleSessionID(sessionIDs []string, sessionID string) []string {

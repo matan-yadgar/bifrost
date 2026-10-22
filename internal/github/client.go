@@ -93,7 +93,19 @@ type PullRequest struct {
 	Body       string
 	URL        string
 	HeadRef    string
+	HeadSHA    string
 	Author     string
+}
+
+func (pullRequest PullRequest) TaskName() string {
+	for line := range strings.SplitSeq(pullRequest.Body, "\n") {
+		if name, found := strings.CutPrefix(strings.TrimSpace(line), "Bifrost task:"); found {
+			if name = strings.TrimSpace(name); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 type ReviewThread struct {
@@ -188,6 +200,7 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string) (
 			} `json:"user"`
 			Head struct {
 				Ref string `json:"ref"`
+				SHA string `json:"sha"`
 			} `json:"head"`
 		}
 		if err := client.get(ctx, endpoint, &response); err != nil {
@@ -201,6 +214,7 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string) (
 				Body:       pullRequest.Body,
 				URL:        pullRequest.HTMLURL,
 				HeadRef:    pullRequest.Head.Ref,
+				HeadSHA:    pullRequest.Head.SHA,
 				Author:     pullRequest.User.Login,
 			})
 		}
