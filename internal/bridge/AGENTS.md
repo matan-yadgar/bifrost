@@ -4,4 +4,4 @@ The bridge owns PR scans, review fingerprints, CI failure delivery, and the shar
 
 CI state lives in the same versioned state file. Forks may update only their existing PR entry's paused, reason, and resume_condition fields. All runtime state transactions use the neighboring .update.lock, separate from the service instance lock. Reread pauses after waiting for a dispatch lane and preserve the latest pause fields before saving. Do not hold the state lock while a harness runs.
 
-Review versions are marked delivered after acknowledged dispatch. Current CI failures stay eligible on later polls until recovery or an explicit pause; a new head never clears a pause. Prune closed/merged PR state only after a complete successful repository scan.
+Review versions are marked delivered after acknowledged dispatch. CI attempt identities are marked reported only after acknowledged dispatch, and only for checks actually included in the prompt. Suppress reported attempts on the same head; new heads clear reported identities but never explicit pauses. Prune closed/merged PR state only after a complete successful repository scan.
