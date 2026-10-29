@@ -378,7 +378,11 @@ func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob
 						outcome := monitor.dispatchWithHeartbeat(dispatchContext, item, started)
 						cancel()
 						if outcome.err != nil {
-							monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), elapsed(started))
+							if diagnostic := harness.Diagnostic(outcome.err); diagnostic != "" {
+								monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s stderr=%q duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), diagnostic, elapsed(started))
+							} else {
+								monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), elapsed(started))
+							}
 						} else {
 							monitor.logger.Printf("dispatch succeeded: pr=%s route=%s duration=%s", item.job.key, item.job.routeChoice, elapsed(started))
 						}

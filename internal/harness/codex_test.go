@@ -792,6 +792,14 @@ func TestCommandErrorClassifiesActiveWriterWithoutExposingStderr(t *testing.T) {
 	}
 }
 
+func TestDiagnosticReturnsCodexStderr(t *testing.T) {
+	t.Parallel()
+	err := fmt.Errorf("run Codex: %w", &commandError{cause: errors.New("exit status 1"), stderr: "launch diagnostic"})
+	if diagnostic := Diagnostic(err); diagnostic != "launch diagnostic" {
+		t.Fatalf("diagnostic = %q", diagnostic)
+	}
+}
+
 func TestCommandErrorHidesUnclassifiedStderr(t *testing.T) {
 	t.Parallel()
 	err := &commandError{cause: errors.New("exit status 2"), stderr: "private diagnostic"}

@@ -28,7 +28,7 @@ func TestPythonPauseLockBlocksGoTransactionsAndPreservesConcurrentUpdates(t *tes
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, python, "-c", `
-import fcntl,json,os,pathlib,sys,tempfile
+import datetime,fcntl,json,os,pathlib,sys,tempfile
 path=pathlib.Path(sys.argv[1])
 with open(str(path)+'.update.lock','a+b') as lock:
  fcntl.flock(lock,fcntl.LOCK_EX)
@@ -36,7 +36,7 @@ with open(str(path)+'.update.lock','a+b') as lock:
  sys.stdin.readline()
  state=json.loads(path.read_text())
  entry=state['ci']['owner/repo#42']
- entry.update(paused=True,reason='human credentials needed',resume_condition='credentials restored')
+ entry.update(paused=True,paused_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),reason='human credentials needed',resume_condition='credentials restored')
  fd,name=tempfile.mkstemp(dir=path.parent)
  with os.fdopen(fd,'w') as output:
   json.dump(state,output)

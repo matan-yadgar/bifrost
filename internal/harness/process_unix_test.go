@@ -119,3 +119,14 @@ func TestExecRunnerLaunchCancelsUnacknowledgedProcess(t *testing.T) {
 		t.Fatal("canceled launch did not return")
 	}
 }
+
+func TestExecRunnerLaunchReturnsOnlyStderrOnFailure(t *testing.T) {
+	t.Parallel()
+	runner := &execRunner{processes: osProcessStarter{}}
+	err := runner.Launch(context.Background(), "sh", []string{"-c", "printf stdout; printf 'launch failure\\n' >&2; exit 7"}, "", func(string) bool {
+		return false
+	})
+	if diagnostic := Diagnostic(err); diagnostic != "launch failure" {
+		t.Fatalf("diagnostic = %q", diagnostic)
+	}
+}

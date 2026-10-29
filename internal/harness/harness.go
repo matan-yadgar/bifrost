@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var ErrSessionNotFound = errors.New("harness session not found")
@@ -13,6 +14,15 @@ var ErrSessionActiveWriter = errors.New("harness session has an active writer")
 var ErrAmbiguousSession = errors.New("multiple harness sessions match the pull request")
 
 var ErrDiscoveryDeferred = errors.New("harness discovery deferred after a batch failure")
+
+// Diagnostic returns the harness-provided failure detail, if any.
+func Diagnostic(err error) string {
+	var commandError *commandError
+	if errors.As(err, &commandError) {
+		return strings.TrimSpace(commandError.stderr)
+	}
+	return ""
+}
 
 type Target struct {
 	Repository       string

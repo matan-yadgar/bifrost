@@ -151,7 +151,7 @@ func (runner *execRunner) Launch(ctx context.Context, command string, args []str
 	if err := launchContext.Err(); err != nil {
 		return err
 	}
-	inputFile, outputPath, err := createLaunchFiles(input)
+	inputFile, outputPath, stderrPath, err := createLaunchFiles(input)
 	if err != nil {
 		return err
 	}
@@ -159,15 +159,22 @@ func (runner *execRunner) Launch(ctx context.Context, command string, args []str
 	outputFile, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		_ = os.Remove(outputPath)
+		_ = os.Remove(stderrPath)
 		return err
 	}
 	defer closeAndRemove(outputFile)
+	stderrFile, err := os.OpenFile(stderrPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		_ = os.Remove(stderrPath)
+		return err
+	}
+	defer closeAndRemove(stderrFile)
 	process := exec.Command(command, args...)
 	configureProcess(process)
 	process.Env = slices.Clone(runner.environment)
 	process.Stdin = inputFile
 	process.Stdout = outputFile
-	process.Stderr = outputFile
+	process.Stderr = stderrFile
 	if err := process.Start(); err != nil {
 		return err
 	}
@@ -178,20 +185,20 @@ func (runner *execRunner) Launch(ctx context.Context, command string, args []str
 	for {
 		acknowledged, outputErr := launchAcknowledged(outputPath, started)
 		if outputErr != nil {
-			return waitForLaunchExit(process, done, outputErr, outputPath)
+			return waitForLaunchExit(process, done, outputErr, stderrPath)
 		}
 		if acknowledged {
 			if err := launchContext.Err(); err != nil {
-				return waitForLaunchExit(process, done, err, outputPath)
+				return waitForLaunchExit(process, done, err, stderrPath)
 			}
-			go reapLaunchedCommand(done, inputFile.Name(), outputFile.Name())
+			go reapLaunchedCommand(done, inputFile.Name(), outputFile.Name(), stderrFile.Name())
 			return nil
 		}
 		select {
 		case waitErr := <-done:
-			return commandRunError(processExit{WaitError: waitErr, Stderr: readLaunchOutput(outputPath)}, nil)
+			return commandRunError(processExit{WaitError: waitErr, Stderr: readLaunchOutput(stderrPath)}, nil)
 		case <-launchContext.Done():
-			return waitForLaunchExit(process, done, launchContext.Err(), outputPath)
+			return waitForLaunchExit(process, done, launchContext.Err(), stderrPath)
 		case <-ticker.C:
 		}
 	}
@@ -203,30 +210,39 @@ func closeAndRemove(file *os.File) {
 	_ = os.Remove(path)
 }
 
-func createLaunchFiles(input string) (*os.File, string, error) {
+func createLaunchFiles(input string) (*os.File, string, string, error) {
 	inputFile, err := os.CreateTemp("", "bifrost-codex-input-*")
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if _, err := io.WriteString(inputFile, input); err != nil {
 		_ = inputFile.Close()
 		_ = os.Remove(inputFile.Name())
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if _, err := inputFile.Seek(0, io.SeekStart); err != nil {
 		_ = inputFile.Close()
 		_ = os.Remove(inputFile.Name())
-		return nil, "", err
+		return nil, "", "", err
 	}
 	outputFile, err := os.CreateTemp("", "bifrost-codex-output-*")
 	if err != nil {
 		_ = inputFile.Close()
 		_ = os.Remove(inputFile.Name())
-		return nil, "", err
+		return nil, "", "", err
 	}
 	outputPath := outputFile.Name()
 	_ = outputFile.Close()
-	return inputFile, outputPath, nil
+	stderrFile, err := os.CreateTemp("", "bifrost-codex-stderr-*")
+	if err != nil {
+		_ = os.Remove(outputPath)
+		_ = inputFile.Close()
+		_ = os.Remove(inputFile.Name())
+		return nil, "", "", err
+	}
+	stderrPath := stderrFile.Name()
+	_ = stderrFile.Close()
+	return inputFile, outputPath, stderrPath, nil
 }
 
 func launchAcknowledged(outputPath string, started func(string) bool) (bool, error) {

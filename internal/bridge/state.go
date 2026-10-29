@@ -49,7 +49,9 @@ func (monitor *Monitor) saveState(ctx context.Context, state *stateFile) (err er
 	}
 	for key, entry := range state.CI {
 		if current := latest.CI[key]; current != nil {
-			entry.Paused, entry.Reason, entry.ResumeCondition = current.Paused, current.Reason, current.ResumeCondition
+			if entry.Paused || !current.Paused || !ciPauseExpired(current, time.Now()) {
+				entry.Paused, entry.PausedAt, entry.Reason, entry.ResumeCondition = current.Paused, current.PausedAt, current.Reason, current.ResumeCondition
+			}
 		}
 	}
 	return saveJSON(monitor.stateFile, state)
