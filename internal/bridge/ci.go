@@ -68,22 +68,15 @@ func (monitor *Monitor) dispatch(ctx context.Context, item queuedDispatch) dispa
 	defer unlock()
 	var reported []string
 	if len(item.job.checks) > 0 {
-		current, err := monitor.readState(ctx)
+		paused, expired, err := monitor.currentCIPause(ctx, item.job.key, item.job.pullRequest.HeadSHA)
 		if err != nil {
 			return dispatchOutcome{err: err}
 		}
-		saved := current.CI[item.job.key]
-		if saved == nil || saved.HeadSHA != item.job.pullRequest.HeadSHA {
-			return dispatchOutcome{err: fmt.Errorf("CI state changed before dispatch %s", item.job.key)}
-		}
-		if expireCIPause(saved, time.Now()) {
+		if expired {
 			monitor.logger.Printf("CI follow-up pause expired: pr=%s", item.job.key)
-			if err := monitor.saveState(ctx, current); err != nil {
-				return dispatchOutcome{err: err}
-			}
 		}
-		if saved.Paused {
-			monitor.logger.Printf("CI delivery skipped: pr=%s paused=true reason=%q", item.job.key, saved.Reason)
+		if paused {
+			monitor.logger.Printf("CI delivery skipped: pr=%s paused=true", item.job.key)
 		} else {
 			prompt, included := ciPrompt(item.job.pullRequest, item.job.checks, monitor.stateFile, item.job.key)
 			item.job.prompt += prompt

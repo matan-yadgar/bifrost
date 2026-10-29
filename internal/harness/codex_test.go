@@ -758,6 +758,9 @@ func TestCodexClassifiesMissingMappedSession(t *testing.T) {
 	if !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("error = %v", err)
 	}
+	if diagnostic := Diagnostic(err); diagnostic != "thread/resume failed: no rollout found for thread id "+sessionID {
+		t.Fatalf("diagnostic = %q", diagnostic)
+	}
 }
 
 func TestCommandErrorClassifiesAuthenticationWithoutExposingStderr(t *testing.T) {

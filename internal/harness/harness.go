@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 var ErrSessionNotFound = errors.New("harness session not found")
@@ -17,9 +16,9 @@ var ErrDiscoveryDeferred = errors.New("harness discovery deferred after a batch 
 
 // Diagnostic returns the harness-provided failure detail, if any.
 func Diagnostic(err error) string {
-	var commandError *commandError
-	if errors.As(err, &commandError) {
-		return strings.TrimSpace(commandError.stderr)
+	var diagnosticError interface{ Diagnostic() string }
+	if errors.As(err, &diagnosticError) {
+		return diagnosticError.Diagnostic()
 	}
 	return ""
 }

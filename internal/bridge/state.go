@@ -56,3 +56,26 @@ func (monitor *Monitor) saveState(ctx context.Context, state *stateFile) (err er
 	}
 	return saveJSON(monitor.stateFile, state)
 }
+
+func (monitor *Monitor) currentCIPause(ctx context.Context, key, headSHA string) (paused, expired bool, err error) {
+	lock, err := monitor.stateLock(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		return false, false, err
+	}
+	saved := state.CI[key]
+	if saved == nil || saved.HeadSHA != headSHA {
+		return false, false, fmt.Errorf("CI state changed before dispatch %s", key)
+	}
+	expired = expireCIPause(saved, time.Now())
+	if expired {
+		if err := saveJSON(monitor.stateFile, state); err != nil {
+			return false, false, err
+		}
+	}
+	return saved.Paused, expired, nil
+}

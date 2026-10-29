@@ -170,6 +170,38 @@ func TestExpiredCIPauseResumesDelivery(t *testing.T) {
 	}
 }
 
+func TestExpireCIPauseTransactionPreservesDeliveryState(t *testing.T) {
+	t.Parallel()
+	monitor, source, _ := ciFixture(t)
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.CI["owner/repo#42"] = &ciState{
+		HeadSHA: source.pullRequest.HeadSHA, Paused: true,
+		PausedAt: time.Now().Add(-ciPauseDuration - time.Second).UTC(),
+		Reported: map[string]bool{"check:1:first": true},
+	}
+	state.Threads["owner/repo#42"] = map[string]string{"review-1": "delivered"}
+	state.Routes["owner/repo#42"] = route{Harness: "codex", SessionID: "019c0000-0000-7000-8000-000000000042"}
+	if err := saveJSON(monitor.stateFile, state); err != nil {
+		t.Fatal(err)
+	}
+
+	paused, expired, err := monitor.currentCIPause(context.Background(), "owner/repo#42", source.pullRequest.HeadSHA)
+	if err != nil || paused || !expired {
+		t.Fatalf("paused/expired/error = %t/%t/%v", paused, expired, err)
+	}
+	state, err = loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := state.CI["owner/repo#42"]
+	if saved.Paused || !saved.Reported["check:1:first"] || state.Threads["owner/repo#42"]["review-1"] != "delivered" || state.Routes["owner/repo#42"].SessionID == "" {
+		t.Fatalf("delivery state was overwritten: %#v", state)
+	}
+}
+
 func TestTimestamplessCIPauseExpires(t *testing.T) {
 	t.Parallel()
 	saved := &ciState{Paused: true, Reason: "old pause"}

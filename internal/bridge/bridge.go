@@ -454,7 +454,7 @@ func (monitor *Monitor) deliver(ctx context.Context, item queuedDispatch) dispat
 		return monitor.completedDispatch(job, job.sessionID, result, dispatchError, false)
 	}
 	return dispatchOutcome{
-		err:          fmt.Errorf("dispatch %s: %w; route marked stale for batched discovery on the next cycle", job.key, harness.ErrSessionNotFound),
+		err:          fmt.Errorf("dispatch %s: %w; route marked stale for batched discovery on the next cycle", job.key, dispatchError),
 		replaceRoute: true,
 		staleID:      job.sessionID,
 	}
