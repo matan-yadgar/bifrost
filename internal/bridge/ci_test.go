@@ -75,6 +75,7 @@ func TestFailedCIDeliveryRetriesAndDisabledMonitoringDoesNotFetchCI(t *testing.T
 func TestPauseWrittenDuringDeliverySurvivesSaveAndNewHeads(t *testing.T) {
 	t.Parallel()
 	monitor, source, agent := ciFixture(t)
+	pausedAt := time.Now().UTC()
 	agent.dispatch = func(request harness.Request) (harness.Result, error) {
 		lock, err := monitor.stateLock(context.Background())
 		if err != nil {
@@ -87,6 +88,7 @@ func TestPauseWrittenDuringDeliverySurvivesSaveAndNewHeads(t *testing.T) {
 		}
 		saved := latest.CI["owner/repo#42"]
 		saved.Paused = true
+		saved.PausedAt = pausedAt
 		saved.Reason = "external outage"
 		saved.ResumeCondition = "service recovered"
 		if err := saveJSON(monitor.stateFile, latest); err != nil {
@@ -106,7 +108,7 @@ func TestPauseWrittenDuringDeliverySurvivesSaveAndNewHeads(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := latest.CI["owner/repo#42"]
-	if !saved.Paused || saved.Reason != "external outage" || saved.ResumeCondition != "service recovered" {
+	if !saved.Paused || !saved.PausedAt.Equal(pausedAt) || saved.Reason != "external outage" || saved.ResumeCondition != "service recovered" {
 		t.Fatalf("pause overwritten: %+v", saved)
 	}
 	// Review feedback still goes to the same fork while automatic CI is paused.
@@ -137,6 +139,80 @@ func TestPauseWrittenDuringDeliverySurvivesSaveAndNewHeads(t *testing.T) {
 	}
 }
 
+func TestExpiredCIPauseResumesDelivery(t *testing.T) {
+	t.Parallel()
+	monitor, source, agent := ciFixture(t)
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.CI["owner/repo#42"] = &ciState{
+		HeadSHA: source.pullRequest.HeadSHA, Paused: true,
+		PausedAt: time.Now().Add(-ciPauseDuration - time.Second).UTC(),
+		Reason:   "temporary outage", ResumeCondition: "service recovers",
+	}
+	if err := saveJSON(monitor.stateFile, state); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := monitor.RunOnce(context.Background()); err != nil || result.Dispatches != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	state, err = loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := state.CI["owner/repo#42"]
+	if saved.Paused || !saved.PausedAt.IsZero() || saved.Reason != "" || saved.ResumeCondition != "" {
+		t.Fatalf("expired pause was retained: %+v", saved)
+	}
+	if len(agent.requests) != 1 || !strings.Contains(agent.requests[0].Prompt, "CI failures") {
+		t.Fatalf("requests=%+v", agent.requests)
+	}
+}
+
+func TestExpireCIPauseTransactionPreservesDeliveryState(t *testing.T) {
+	t.Parallel()
+	monitor, source, _ := ciFixture(t)
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.CI["owner/repo#42"] = &ciState{
+		HeadSHA: source.pullRequest.HeadSHA, Paused: true,
+		PausedAt: time.Now().Add(-ciPauseDuration - time.Second).UTC(),
+		Reported: map[string]bool{"check:1:first": true},
+	}
+	state.Threads["owner/repo#42"] = map[string]string{"review-1": "delivered"}
+	state.Routes["owner/repo#42"] = route{Harness: "codex", SessionID: "019c0000-0000-7000-8000-000000000042"}
+	if err := saveJSON(monitor.stateFile, state); err != nil {
+		t.Fatal(err)
+	}
+
+	paused, expired, err := monitor.currentCIPause(context.Background(), "owner/repo#42", source.pullRequest.HeadSHA)
+	if err != nil || paused || !expired {
+		t.Fatalf("paused/expired/error = %t/%t/%v", paused, expired, err)
+	}
+	state, err = loadState(monitor.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := state.CI["owner/repo#42"]
+	if saved.Paused || !saved.Reported["check:1:first"] || state.Threads["owner/repo#42"]["review-1"] != "delivered" || state.Routes["owner/repo#42"].SessionID == "" {
+		t.Fatalf("delivery state was overwritten: %#v", state)
+	}
+}
+
+func TestTimestamplessCIPauseExpires(t *testing.T) {
+	t.Parallel()
+	saved := &ciState{Paused: true, Reason: "old pause"}
+	if !expireCIPause(saved, time.Now()) {
+		t.Fatal("timestampless pause did not expire")
+	}
+	if saved.Paused || saved.Reason != "" {
+		t.Fatalf("timestampless pause was retained: %+v", saved)
+	}
+}
+
 func TestDispatchRereadsPauseAfterQueueingAndClosurePrunesState(t *testing.T) {
 	t.Parallel()
 	monitor, source, agent := ciFixture(t)
@@ -149,6 +225,7 @@ func TestDispatchRereadsPauseAfterQueueingAndClosurePrunesState(t *testing.T) {
 		t.Fatal(err)
 	}
 	state.CI["owner/repo#42"].Paused = true
+	state.CI["owner/repo#42"].PausedAt = time.Now().UTC()
 	if err := saveJSON(monitor.stateFile, state); err != nil {
 		t.Fatal(err)
 	}

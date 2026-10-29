@@ -758,6 +758,9 @@ func TestCodexClassifiesMissingMappedSession(t *testing.T) {
 	if !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("error = %v", err)
 	}
+	if diagnostic := Diagnostic(err); diagnostic != "thread/resume failed: no rollout found for thread id "+sessionID {
+		t.Fatalf("diagnostic = %q", diagnostic)
+	}
 }
 
 func TestCommandErrorClassifiesAuthenticationWithoutExposingStderr(t *testing.T) {
@@ -772,6 +775,31 @@ func TestCommandErrorClassifiesAuthenticationWithoutExposingStderr(t *testing.T)
 	}
 	if strings.Contains(message, "secret-value") {
 		t.Fatalf("error exposed stderr = %q", message)
+	}
+}
+
+func TestCommandErrorClassifiesActiveWriterWithoutExposingStderr(t *testing.T) {
+	t.Parallel()
+	err := &commandError{
+		cause:  errors.New("exit status 1"),
+		stderr: "thread-store conflict: thread secret-session-id already has an active writer",
+	}
+	if message := err.Error(); message != "exit status 1: harness session has an active writer" {
+		t.Fatalf("error = %q", message)
+	}
+	if errors.Is(err, ErrSessionActiveWriter) == false {
+		t.Fatal("active writer classification was not preserved")
+	}
+	if strings.Contains(err.Error(), "secret-session-id") {
+		t.Fatalf("error exposed stderr = %q", err)
+	}
+}
+
+func TestDiagnosticReturnsCodexStderr(t *testing.T) {
+	t.Parallel()
+	err := fmt.Errorf("run Codex: %w", &commandError{cause: errors.New("exit status 1"), stderr: "launch diagnostic"})
+	if diagnostic := Diagnostic(err); diagnostic != "launch diagnostic" {
+		t.Fatalf("diagnostic = %q", diagnostic)
 	}
 }
 

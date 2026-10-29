@@ -119,3 +119,32 @@ func TestExecRunnerLaunchCancelsUnacknowledgedProcess(t *testing.T) {
 		t.Fatal("canceled launch did not return")
 	}
 }
+
+func TestExecRunnerLaunchReturnsOnlyStderrOnFailure(t *testing.T) {
+	t.Parallel()
+	runner := &execRunner{processes: osProcessStarter{}}
+	err := runner.Launch(context.Background(), "sh", []string{"-c", "printf stdout; printf 'launch failure\\n' >&2; exit 7"}, "", func(string) bool {
+		return false
+	})
+	if diagnostic := Diagnostic(err); diagnostic != "launch failure" {
+		t.Fatalf("diagnostic = %q", diagnostic)
+	}
+}
+
+func TestExecRunnerLaunchCapsStderr(t *testing.T) {
+	t.Parallel()
+	runner := &execRunner{processes: osProcessStarter{}}
+	err := runner.Launch(context.Background(), "sh", []string{"-c", "yes x | head -c 1048577 >&2; exit 7"}, "", func(string) bool {
+		return false
+	})
+	diagnostic := Diagnostic(err)
+	if !strings.Contains(err.Error(), "Codex launch stderr exceeded 1048576 bytes before acknowledgement") {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.HasSuffix(diagnostic, "[Codex stderr truncated after 1048576 bytes]") {
+		t.Fatalf("diagnostic suffix = %q", diagnostic[len(diagnostic)-min(len(diagnostic), 128):])
+	}
+	if len(diagnostic) > int(maxLaunchOutputBytes)+len("\n[Codex stderr truncated after 1048576 bytes]") {
+		t.Fatalf("diagnostic length = %d", len(diagnostic))
+	}
+}

@@ -76,6 +76,23 @@ type fakeHarness struct {
 	dispatch      func(harness.Request) (harness.Result, error)
 }
 
+type testDiagnosticError struct {
+	cause      error
+	diagnostic string
+}
+
+func (err *testDiagnosticError) Error() string {
+	return err.cause.Error()
+}
+
+func (err *testDiagnosticError) Unwrap() error {
+	return err.cause
+}
+
+func (err *testDiagnosticError) Diagnostic() string {
+	return err.diagnostic
+}
+
 func newTestMonitor(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, routes map[string]route) *Monitor {
 	state, err := loadState(statePath)
 	if err != nil {
@@ -1669,6 +1686,33 @@ func TestPerPullRequestSourceFailureDoesNotBlockHealthyDispatch(t *testing.T) {
 	}
 }
 
+func TestMonitorLogsStaleSessionDiagnostic(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	const sessionID = "019c0000-0000-7000-8000-000000000014"
+	var output bytes.Buffer
+	monitor := newTestMonitor(
+		reviewSource(),
+		&fakeHarness{dispatch: func(request harness.Request) (harness.Result, error) {
+			return harness.Result{SessionID: request.SessionID}, &testDiagnosticError{
+				cause: harness.ErrSessionNotFound, diagnostic: "thread/resume failed: no rollout found for thread id " + sessionID,
+			}
+		}},
+		[]Repository{{Name: "Owner/Repo", WorkingDirectory: directory}},
+		statePath,
+		map[string]route{"owner/repo#42": {Harness: "codex", SessionID: sessionID}},
+	)
+	monitor.logger = log.New(&output, "", 0)
+
+	if _, err := monitor.RunOnce(context.Background()); !errors.Is(err, harness.ErrSessionNotFound) {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.Contains(output.String(), "stderr=\"thread/resume failed: no rollout found for thread id "+sessionID+"\"") {
+		t.Fatalf("diagnostic missing from logs: %s", output.String())
+	}
+}
+
 type staleSessionHarness struct {
 	resumeStarted chan struct{}
 	resumeRelease chan struct{}
@@ -1925,6 +1969,13 @@ func TestOmittedThreadsRemainPending(t *testing.T) {
 	}
 	if len(state.Threads["owner/repo#42"]) <= firstCommitted {
 		t.Fatalf("omitted threads did not advance: %#v", state.Threads["owner/repo#42"])
+	}
+}
+
+func TestDispatchFailureReasonClassifiesActiveWriter(t *testing.T) {
+	t.Parallel()
+	if reason := dispatchFailureReason(fmt.Errorf("dispatch: %w", harness.ErrSessionActiveWriter)); reason != "active_writer" {
+		t.Fatalf("reason = %q", reason)
 	}
 }
 

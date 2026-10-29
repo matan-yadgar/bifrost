@@ -378,7 +378,11 @@ func (monitor *Monitor) runDispatchQueue(ctx context.Context, jobs []dispatchJob
 						outcome := monitor.dispatchWithHeartbeat(dispatchContext, item, started)
 						cancel()
 						if outcome.err != nil {
-							monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), elapsed(started))
+							if diagnostic := harness.Diagnostic(outcome.err); diagnostic != "" {
+								monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s stderr=%q duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), diagnostic, elapsed(started))
+							} else {
+								monitor.logger.Printf("dispatch failed: pr=%s route=%s reason=%s duration=%s", item.job.key, item.job.routeChoice, dispatchFailureReason(outcome.err), elapsed(started))
+							}
 						} else {
 							monitor.logger.Printf("dispatch succeeded: pr=%s route=%s duration=%s", item.job.key, item.job.routeChoice, elapsed(started))
 						}
@@ -450,7 +454,7 @@ func (monitor *Monitor) deliver(ctx context.Context, item queuedDispatch) dispat
 		return monitor.completedDispatch(job, job.sessionID, result, dispatchError, false)
 	}
 	return dispatchOutcome{
-		err:          fmt.Errorf("dispatch %s: %w; route marked stale for batched discovery on the next cycle", job.key, harness.ErrSessionNotFound),
+		err:          fmt.Errorf("dispatch %s: %w; route marked stale for batched discovery on the next cycle", job.key, dispatchError),
 		replaceRoute: true,
 		staleID:      job.sessionID,
 	}
@@ -596,6 +600,9 @@ func dispatchFailureReason(err error) string {
 	}
 	if errors.Is(err, harness.ErrSessionNotFound) {
 		return "stale_session"
+	}
+	if errors.Is(err, harness.ErrSessionActiveWriter) {
+		return "active_writer"
 	}
 	return "failed"
 }

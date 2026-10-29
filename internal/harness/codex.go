@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -89,7 +90,7 @@ func (codex *Codex) Dispatch(ctx context.Context, request Request) (Result, erro
 	})
 	if err != nil {
 		if request.SessionID != "" && isSessionNotFound(err) {
-			return Result{SessionID: sessionID}, fmt.Errorf("%w: %v", ErrSessionNotFound, err)
+			return Result{SessionID: sessionID}, fmt.Errorf("%w: %w", ErrSessionNotFound, err)
 		}
 		return Result{SessionID: sessionID}, fmt.Errorf("run Codex: %w", err)
 	}
@@ -151,7 +152,7 @@ func (runner *execRunner) Launch(ctx context.Context, command string, args []str
 	if err := launchContext.Err(); err != nil {
 		return err
 	}
-	inputFile, outputPath, err := createLaunchFiles(input)
+	inputFile, outputPath, stderrPath, err := createLaunchFiles(input)
 	if err != nil {
 		return err
 	}
@@ -159,15 +160,23 @@ func (runner *execRunner) Launch(ctx context.Context, command string, args []str
 	outputFile, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		_ = os.Remove(outputPath)
+		_ = os.Remove(stderrPath)
 		return err
 	}
 	defer closeAndRemove(outputFile)
+	stderrFile, err := os.OpenFile(stderrPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		_ = os.Remove(stderrPath)
+		return err
+	}
+	defer closeAndRemove(stderrFile)
+	stderr := &cappedFile{file: stderrFile, remaining: maxLaunchOutputBytes}
 	process := exec.Command(command, args...)
 	configureProcess(process)
 	process.Env = slices.Clone(runner.environment)
 	process.Stdin = inputFile
 	process.Stdout = outputFile
-	process.Stderr = outputFile
+	process.Stderr = stderr
 	if err := process.Start(); err != nil {
 		return err
 	}
@@ -178,20 +187,30 @@ func (runner *execRunner) Launch(ctx context.Context, command string, args []str
 	for {
 		acknowledged, outputErr := launchAcknowledged(outputPath, started)
 		if outputErr != nil {
-			return waitForLaunchExit(process, done, outputErr, outputPath)
+			return waitForLaunchExit(process, done, outputErr, stderrPath, stderr)
+		}
+		if stderr.Truncated() {
+			return waitForLaunchExit(process, done, fmt.Errorf("Codex launch stderr exceeded %d bytes before acknowledgement", maxLaunchOutputBytes), stderrPath, stderr)
 		}
 		if acknowledged {
 			if err := launchContext.Err(); err != nil {
-				return waitForLaunchExit(process, done, err, outputPath)
+				return waitForLaunchExit(process, done, err, stderrPath, stderr)
 			}
-			go reapLaunchedCommand(done, inputFile.Name(), outputFile.Name())
+			go reapLaunchedCommand(done, inputFile.Name(), outputFile.Name(), stderrFile.Name())
 			return nil
 		}
 		select {
 		case waitErr := <-done:
-			return commandRunError(processExit{WaitError: waitErr, Stderr: readLaunchOutput(outputPath)}, nil)
+			if stderr.Truncated() {
+				return commandRunError(processExit{
+					WaitError:    waitErr,
+					ContextError: fmt.Errorf("Codex launch stderr exceeded %d bytes before acknowledgement", maxLaunchOutputBytes),
+					Stderr:       readLaunchStderr(stderrPath, true),
+				}, nil)
+			}
+			return commandRunError(processExit{WaitError: waitErr, Stderr: readLaunchStderr(stderrPath, stderr.Truncated())}, nil)
 		case <-launchContext.Done():
-			return waitForLaunchExit(process, done, launchContext.Err(), outputPath)
+			return waitForLaunchExit(process, done, launchContext.Err(), stderrPath, stderr)
 		case <-ticker.C:
 		}
 	}
@@ -203,30 +222,39 @@ func closeAndRemove(file *os.File) {
 	_ = os.Remove(path)
 }
 
-func createLaunchFiles(input string) (*os.File, string, error) {
+func createLaunchFiles(input string) (*os.File, string, string, error) {
 	inputFile, err := os.CreateTemp("", "bifrost-codex-input-*")
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if _, err := io.WriteString(inputFile, input); err != nil {
 		_ = inputFile.Close()
 		_ = os.Remove(inputFile.Name())
-		return nil, "", err
+		return nil, "", "", err
 	}
 	if _, err := inputFile.Seek(0, io.SeekStart); err != nil {
 		_ = inputFile.Close()
 		_ = os.Remove(inputFile.Name())
-		return nil, "", err
+		return nil, "", "", err
 	}
 	outputFile, err := os.CreateTemp("", "bifrost-codex-output-*")
 	if err != nil {
 		_ = inputFile.Close()
 		_ = os.Remove(inputFile.Name())
-		return nil, "", err
+		return nil, "", "", err
 	}
 	outputPath := outputFile.Name()
 	_ = outputFile.Close()
-	return inputFile, outputPath, nil
+	stderrFile, err := os.CreateTemp("", "bifrost-codex-stderr-*")
+	if err != nil {
+		_ = os.Remove(outputPath)
+		_ = inputFile.Close()
+		_ = os.Remove(inputFile.Name())
+		return nil, "", "", err
+	}
+	stderrPath := stderrFile.Name()
+	_ = stderrFile.Close()
+	return inputFile, outputPath, stderrPath, nil
 }
 
 func launchAcknowledged(outputPath string, started func(string) bool) (bool, error) {
@@ -245,11 +273,11 @@ func launchAcknowledged(outputPath string, started func(string) bool) (bool, err
 	return false, nil
 }
 
-func waitForLaunchExit(process *exec.Cmd, done <-chan error, cause error, stderrPath string) error {
+func waitForLaunchExit(process *exec.Cmd, done <-chan error, cause error, stderrPath string, stderr *cappedFile) error {
 	cleanupErr := terminateCommand(process.Process)
 	waitErr := <-done
 	return commandRunError(processExit{
-		WaitError: waitErr, ContextError: cause, CleanupFailed: cleanupErr != nil, Stderr: readLaunchOutput(stderrPath),
+		WaitError: waitErr, ContextError: cause, CleanupFailed: cleanupErr != nil, Stderr: readLaunchStderr(stderrPath, stderr.Truncated()),
 	}, nil)
 }
 
@@ -266,6 +294,14 @@ func readLaunchOutput(path string) string {
 		return ""
 	}
 	return string(output)
+}
+
+func readLaunchStderr(path string, truncated bool) string {
+	output := readLaunchOutput(path)
+	if truncated {
+		return output + "\n[Codex stderr truncated after 1048576 bytes]"
+	}
+	return output
 }
 
 func readLaunchOutputBytes(path string) ([]byte, error) {
@@ -333,11 +369,21 @@ func (commandError *commandError) Error() string {
 			return fmt.Sprintf("%s: Codex authentication failed", commandError.cause)
 		}
 	}
+	if strings.Contains(lowerStderr, "already has an active writer") {
+		return fmt.Sprintf("%s: %s", commandError.cause, ErrSessionActiveWriter)
+	}
 	return commandError.cause.Error()
 }
 
-func (commandError *commandError) Unwrap() error {
-	return commandError.cause
+func (commandError *commandError) Unwrap() []error {
+	if strings.Contains(strings.ToLower(commandError.stderr), "already has an active writer") {
+		return []error{commandError.cause, ErrSessionActiveWriter}
+	}
+	return []error{commandError.cause}
+}
+
+func (commandError *commandError) Diagnostic() string {
+	return strings.TrimSpace(commandError.stderr)
 }
 
 func isSessionNotFound(err error) bool {
@@ -348,6 +394,34 @@ func isSessionNotFound(err error) bool {
 type boundedBuffer struct {
 	data  []byte
 	limit int
+}
+
+type cappedFile struct {
+	file      *os.File
+	remaining int64
+	truncated atomic.Bool
+}
+
+func (writer *cappedFile) Write(value []byte) (int, error) {
+	length := len(value)
+	if writer.remaining <= 0 {
+		writer.truncated.Store(true)
+		return length, nil
+	}
+	if int64(length) > writer.remaining {
+		value = value[:writer.remaining]
+		writer.truncated.Store(true)
+	}
+	written, err := writer.file.Write(value)
+	writer.remaining -= int64(written)
+	if err != nil || written != len(value) {
+		return written, err
+	}
+	return length, nil
+}
+
+func (writer *cappedFile) Truncated() bool {
+	return writer.truncated.Load()
 }
 
 func (buffer *boundedBuffer) Write(value []byte) (int, error) {

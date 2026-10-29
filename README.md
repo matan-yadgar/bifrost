@@ -51,7 +51,7 @@ An empty `authors` list monitors every open PR in that repository. Restrict repo
 
 The polling-only `GH_TOKEN` and `GITHUB_TOKEN` environment variables are removed from the Codex child process. This is not a credential sandbox: Codex still runs as the current OS user and may be able to use credentials stored by tools such as `gh`. Use a dedicated, least-privileged local environment for stronger isolation.
 
-Codex stderr is used only for bounded internal error classification. Bifrost does not copy arbitrary child stderr into its normal logs.
+When Codex fails before acknowledging a task, Bifrost logs its bounded stderr excerpt alongside the failed dispatch. Logs are local files created with mode `0600`.
 
 ## Codex task discovery
 
@@ -86,16 +86,17 @@ CI information is stored alongside routes and review fingerprints in `state.json
   "head_sha": "current-commit",
   "reported": {"check:123:completion-timestamp": true},
   "paused": true,
+  "paused_at": "2026-10-29T10:00:00Z",
   "reason": "CI requires credentials from a human",
   "resume_condition": "Credentials have been restored"
 }
 ```
 
-If further CI messages will not help, the fork can set `paused`, `reason`, and `resume_condition` in its existing PR entry. The prompt supplies the state path and lock instructions. Bifrost rereads the state before dispatch, preserves pause changes when saving delivery results, and logs skipped CI follow-ups. Pauses survive new commits and process restarts. Review comments continue through the normal flow.
+If further CI messages will not help, the fork can set `paused`, `paused_at`, `reason`, and `resume_condition` in its existing PR entry. `paused_at` is the current UTC RFC3339 timestamp. The prompt supplies the state path and lock instructions. Bifrost rereads the state before dispatch, preserves pause changes when saving delivery results, and logs skipped CI follow-ups. A pause expires automatically after ten minutes. Review comments continue through the normal flow.
 
 Both the fork and Bifrost must acquire an exclusive OS file lock on `<state_file>.update.lock` before reading and updating state, read the latest contents after acquiring it, and atomically replace the state file before releasing it. On macOS/Linux, Python `fcntl.flock(lock, fcntl.LOCK_EX)` interoperates with Bifrost's lock. Never delete the lock file or recreate a removed PR entry. This short transaction lock is separate from the `.lock` held for the service's lifetime.
 
-To resume, use the same locked update to set `paused` to `false` and clear `reason` and `resume_condition`. No restart or GitHub comment is needed. Unreported current failures become eligible after resuming; already reported attempts remain suppressed. A successful complete repository scan removes all state for PRs that are closed or merged. Failed scans never infer closure.
+To resume earlier, use the same locked update to set `paused` to `false` and clear `paused_at`, `reason`, and `resume_condition`. No restart or GitHub comment is needed. Unreported current failures become eligible after resuming; already reported attempts remain suppressed. A successful complete repository scan removes all state for PRs that are closed or merged. Failed scans never infer closure.
 
 The CLI exposes only `-config` and `-once` (plus standard help). The main configuration is read at startup; per-PR pause state is read during polling and immediately before CI delivery.
 
