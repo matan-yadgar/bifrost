@@ -225,21 +225,29 @@ func newAppServerClient(reader io.Reader, writer io.Writer) *appServerClient {
 }
 
 func (client *appServerClient) discover(target Target) Discovery {
-	creatorTaskName := strings.TrimSpace(target.TaskName)
-	if creatorTaskName == "" {
-		return Discovery{}
+	creatorSessionID := strings.TrimSpace(target.CreatorSessionID)
+	if creatorSessionID != "" {
+		if !validSessionID(creatorSessionID) {
+			return Discovery{Err: errors.New("invalid Codex creator task ID")}
+		}
+	} else {
+		creatorTaskName := strings.TrimSpace(target.TaskName)
+		if creatorTaskName == "" {
+			return Discovery{}
+		}
+		creatorSessions, err := client.exactNamedSessions(creatorTaskName, target.ExcludedSessionIDs)
+		if err != nil {
+			return Discovery{Err: err}
+		}
+		if len(creatorSessions) > 1 {
+			return Discovery{Err: fmt.Errorf("%w: found at least 2 tasks named %q", ErrAmbiguousSession, creatorTaskName)}
+		}
+		if len(creatorSessions) == 0 {
+			return Discovery{}
+		}
+		creatorSessionID = creatorSessions[0]
 	}
-	creatorSessions, err := client.exactNamedSessions(creatorTaskName, target.ExcludedSessionIDs)
-	if err != nil {
-		return Discovery{Err: err}
-	}
-	if len(creatorSessions) > 1 {
-		return Discovery{Err: fmt.Errorf("%w: found at least 2 tasks named %q", ErrAmbiguousSession, creatorTaskName)}
-	}
-	if len(creatorSessions) == 0 {
-		return Discovery{}
-	}
-	forkedSessionID, err := client.fork(creatorSessions[0], bifrostTaskName(target))
+	forkedSessionID, err := client.fork(creatorSessionID, bifrostTaskName(target))
 	if err != nil {
 		return Discovery{Err: err}
 	}

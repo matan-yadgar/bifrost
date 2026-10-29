@@ -98,10 +98,18 @@ type PullRequest struct {
 }
 
 func (pullRequest PullRequest) TaskName() string {
+	return pullRequest.bifrostMarker("Bifrost task:")
+}
+
+func (pullRequest PullRequest) CreatorTaskID() string {
+	return pullRequest.bifrostMarker("Bifrost task ID:")
+}
+
+func (pullRequest PullRequest) bifrostMarker(marker string) string {
 	for line := range strings.SplitSeq(pullRequest.Body, "\n") {
-		if name, found := strings.CutPrefix(strings.TrimSpace(line), "Bifrost task:"); found {
-			if name = strings.TrimSpace(name); name != "" {
-				return name
+		if value, found := strings.CutPrefix(strings.TrimSpace(line), marker); found {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
 			}
 		}
 	}

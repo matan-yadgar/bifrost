@@ -27,6 +27,7 @@ type Target struct {
 	Repository       string
 	PullRequest      int
 	TaskName         string
+	CreatorSessionID string
 	WorkingDirectory string
 	// ExcludedSessionIDs must be removed from candidates before ambiguity is evaluated.
 	ExcludedSessionIDs []string

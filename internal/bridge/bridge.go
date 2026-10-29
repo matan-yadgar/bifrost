@@ -612,6 +612,7 @@ func targetFor(job dispatchJob) harness.Target {
 		Repository:       job.pullRequest.Repository,
 		PullRequest:      job.pullRequest.Number,
 		TaskName:         taskNameFromDescription(job.pullRequest.Body),
+		CreatorSessionID: creatorTaskIDFromDescription(job.pullRequest.Body),
 		WorkingDirectory: job.repository.WorkingDirectory,
 	}
 	target.ExcludedSessionIDs = slices.Clone(job.staleIDs)
@@ -620,6 +621,10 @@ func targetFor(job dispatchJob) harness.Target {
 
 func taskNameFromDescription(description string) string {
 	return (githubapi.PullRequest{Body: description}).TaskName()
+}
+
+func creatorTaskIDFromDescription(description string) string {
+	return (githubapi.PullRequest{Body: description}).CreatorTaskID()
 }
 
 func appendStaleSessionID(sessionIDs []string, sessionID string) []string {

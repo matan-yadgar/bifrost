@@ -10,7 +10,7 @@ The first harness is Codex CLI. The Go interface in `internal/harness` is the ex
 - Reads complete unresolved inline review threads through GitHub GraphQL pagination.
 - Emits existing unresolved threads on the first run, then only new or changed thread versions.
 - Batches all changed threads for one PR into one message.
-- Discovers the creating Codex task from a labeled task name in the PR description.
+- Discovers the creating Codex task from labeled metadata in the PR description.
 - Forks the uniquely matching Codex task and resumes that child, or starts a new task when no task matches.
 - Keeps its private PR-to-task route cache in `state.json`; no second actor or mapping configuration is required.
 - Allows only one Bifrost process per state file. A second process exits immediately; the operating system releases the lock if the owner exits or crashes.
@@ -55,9 +55,14 @@ When Codex fails before acknowledging a task, Bifrost logs its bounded stderr ex
 
 ## Codex task discovery
 
-Use this convention when a Codex task opens a PR: add `Bifrost task: <exact task name>` on its own line anywhere in the PR description. Other description content is ignored.
+Use this convention when a Codex task opens a PR; add both lines anywhere in the PR description. Other description content is ignored:
 
-Bifrost reads that value, lists active and archived tasks through the local Codex app server once per discovery batch, and requires an exact user-visible name match.
+```
+Bifrost task: <exact task name>
+Bifrost task ID: <exact Codex task ID>
+```
+
+Bifrost uses the task ID to fork that exact creator task directly. The readable task name remains a fallback for existing PRs without an ID; in that case, Bifrost lists active and archived tasks through the local Codex app server and requires an exact user-visible name match.
 
 If exactly one task matches, Bifrost creates a persistent Codex fork containing its history and sends review feedback to that child. This avoids competing with the Desktop app for ownership of the creator task. Forks are named `Bifrost: owner/repo#number` for visibility in Codex. If none match, Bifrost starts a new task in the configured working directory. If multiple tasks match or discovery is unavailable, Bifrost reports the error and leaves the review feedback pending rather than guessing or creating a duplicate task.
 
