@@ -356,6 +356,42 @@ func TestAppServerDiscoveryRequiresExactTaskName(t *testing.T) {
 	}
 }
 
+func TestAppServerDiscoveryForksCreatorTaskIDDirectly(t *testing.T) {
+	t.Parallel()
+	const creatorSessionID = "019c0000-0000-7000-8000-000000000001"
+	const forkedSessionID = "019c0000-0000-7000-8000-000000000003"
+	responses := strings.NewReader(
+		rpcResult(1, threadForkResultJSON(forkedSessionID)) +
+			rpcResult(2, `{}`),
+	)
+	var requests bytes.Buffer
+	client := newAppServerClient(responses, &requests)
+	discovery := client.discover(Target{
+		Repository: "owner/repo", PullRequest: 42,
+		TaskName: "Ignored fallback task name", CreatorSessionID: creatorSessionID,
+	})
+	if discovery.Err != nil || !discovery.Found || discovery.Session.ID != forkedSessionID {
+		t.Fatalf("discovery = %#v", discovery)
+	}
+	emitted := decodeAppServerRequests(t, requests.Bytes())
+	if len(emitted) != 2 || emitted[0].Method != "thread/fork" || emitted[0].Params["threadId"] != creatorSessionID || emitted[1].Method != "thread/name/set" {
+		t.Fatalf("requests = %#v", emitted)
+	}
+}
+
+func TestAppServerDiscoveryRejectsInvalidCreatorTaskID(t *testing.T) {
+	t.Parallel()
+	var requests bytes.Buffer
+	client := newAppServerClient(strings.NewReader(""), &requests)
+	discovery := client.discover(Target{Repository: "owner/repo", PullRequest: 42, CreatorSessionID: "not-a-session"})
+	if discovery.Err == nil || discovery.Found || discovery.Session.ID != "" {
+		t.Fatalf("discovery = %#v", discovery)
+	}
+	if requests.Len() != 0 {
+		t.Fatalf("requests = %q", requests.String())
+	}
+}
+
 func TestAppServerDiscoveryRejectsInvalidForkResponses(t *testing.T) {
 	t.Parallel()
 	const creatorSessionID = "019c0000-0000-7000-8000-000000000001"

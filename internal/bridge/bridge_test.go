@@ -495,7 +495,7 @@ func TestMonitorDiscoversExistingTaskBeforeDispatch(t *testing.T) {
 		t.Fatalf("discovery targets = %#v", agentHarness.targets)
 	}
 	target := agentHarness.targets[0]
-	if target.Repository != source.pullRequest.Repository || target.PullRequest != source.pullRequest.Number || target.TaskName != "Implement feature" || target.WorkingDirectory != directory {
+	if target.Repository != source.pullRequest.Repository || target.PullRequest != source.pullRequest.Number || target.TaskName != "Implement feature" || target.CreatorSessionID != "019c0000-0000-7000-8000-000000000042" || target.WorkingDirectory != directory {
 		t.Fatalf("discovery target = %#v", target)
 	}
 	state, err := loadState(statePath)
@@ -557,17 +557,26 @@ func TestMonitorRetainsDiscoveredChildWhenFirstDispatchFails(t *testing.T) {
 	}
 }
 
-func TestTaskNameFromDynamicPullRequestDescription(t *testing.T) {
+func TestTaskMetadataFromDynamicPullRequestDescription(t *testing.T) {
 	t.Parallel()
-	description := "## Summary\n\nAdds the feature.\n\nBifrost task: Implement feature: phase 2\n\n## Testing\n- go test ./...\n"
+	description := "## Summary\n\nAdds the feature.\n\nBifrost task: Implement feature: phase 2\nBifrost task ID: 019c0000-0000-7000-8000-000000000042\n\n## Testing\n- go test ./...\n"
 	if taskName := taskNameFromDescription(description); taskName != "Implement feature: phase 2" {
 		t.Fatalf("task name = %q", taskName)
+	}
+	if taskID := creatorTaskIDFromDescription(description); taskID != "019c0000-0000-7000-8000-000000000042" {
+		t.Fatalf("creator task ID = %q", taskID)
 	}
 	if taskName := taskNameFromDescription("Bifrost task:   \nOther content\nBifrost task: Valid task"); taskName != "Valid task" {
 		t.Fatalf("task name after empty marker = %q", taskName)
 	}
+	if taskID := creatorTaskIDFromDescription("Bifrost task ID:   \nOther content\nBifrost task ID: 019c0000-0000-7000-8000-000000000043"); taskID != "019c0000-0000-7000-8000-000000000043" {
+		t.Fatalf("creator task ID after empty marker = %q", taskID)
+	}
 	if taskName := taskNameFromDescription("## Summary\n\nNo routing metadata here.\n"); taskName != "" {
 		t.Fatalf("missing task name = %q", taskName)
+	}
+	if taskID := creatorTaskIDFromDescription("## Summary\n\nNo routing metadata here.\n"); taskID != "" {
+		t.Fatalf("missing creator task ID = %q", taskID)
 	}
 }
 
@@ -2017,7 +2026,7 @@ func reviewThread(id string, now time.Time) githubapi.ReviewThread {
 func reviewSource() *fakeSource {
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	return &fakeSource{
-		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", Body: "## Summary\n\nBifrost task: Implement feature\n", URL: "https://example/pr/42", HeadRef: "codex/feature-42"},
+		pullRequest: githubapi.PullRequest{Repository: "Owner/Repo", Number: 42, Title: "Feature", Body: "## Summary\n\nBifrost task: Implement feature\nBifrost task ID: 019c0000-0000-7000-8000-000000000042\n", URL: "https://example/pr/42", HeadRef: "codex/feature-42"},
 		threads:     []githubapi.ReviewThread{reviewThread("thread-1", now)},
 	}
 }
