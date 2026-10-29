@@ -333,11 +333,17 @@ func (commandError *commandError) Error() string {
 			return fmt.Sprintf("%s: Codex authentication failed", commandError.cause)
 		}
 	}
+	if strings.Contains(lowerStderr, "already has an active writer") {
+		return fmt.Sprintf("%s: %s", commandError.cause, ErrSessionActiveWriter)
+	}
 	return commandError.cause.Error()
 }
 
-func (commandError *commandError) Unwrap() error {
-	return commandError.cause
+func (commandError *commandError) Unwrap() []error {
+	if strings.Contains(strings.ToLower(commandError.stderr), "already has an active writer") {
+		return []error{commandError.cause, ErrSessionActiveWriter}
+	}
+	return []error{commandError.cause}
 }
 
 func isSessionNotFound(err error) bool {

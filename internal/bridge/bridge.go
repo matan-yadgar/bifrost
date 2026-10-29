@@ -597,6 +597,9 @@ func dispatchFailureReason(err error) string {
 	if errors.Is(err, harness.ErrSessionNotFound) {
 		return "stale_session"
 	}
+	if errors.Is(err, harness.ErrSessionActiveWriter) {
+		return "active_writer"
+	}
 	return "failed"
 }
 

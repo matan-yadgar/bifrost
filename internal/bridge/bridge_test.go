@@ -1928,6 +1928,13 @@ func TestOmittedThreadsRemainPending(t *testing.T) {
 	}
 }
 
+func TestDispatchFailureReasonClassifiesActiveWriter(t *testing.T) {
+	t.Parallel()
+	if reason := dispatchFailureReason(fmt.Errorf("dispatch: %w", harness.ErrSessionActiveWriter)); reason != "active_writer" {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
 func receiveStartedSession(t *testing.T, started <-chan string) string {
 	t.Helper()
 	select {

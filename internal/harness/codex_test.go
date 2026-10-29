@@ -775,6 +775,23 @@ func TestCommandErrorClassifiesAuthenticationWithoutExposingStderr(t *testing.T)
 	}
 }
 
+func TestCommandErrorClassifiesActiveWriterWithoutExposingStderr(t *testing.T) {
+	t.Parallel()
+	err := &commandError{
+		cause:  errors.New("exit status 1"),
+		stderr: "thread-store conflict: thread secret-session-id already has an active writer",
+	}
+	if message := err.Error(); message != "exit status 1: harness session has an active writer" {
+		t.Fatalf("error = %q", message)
+	}
+	if errors.Is(err, ErrSessionActiveWriter) == false {
+		t.Fatal("active writer classification was not preserved")
+	}
+	if strings.Contains(err.Error(), "secret-session-id") {
+		t.Fatalf("error exposed stderr = %q", err)
+	}
+}
+
 func TestCommandErrorHidesUnclassifiedStderr(t *testing.T) {
 	t.Parallel()
 	err := &commandError{cause: errors.New("exit status 2"), stderr: "private diagnostic"}

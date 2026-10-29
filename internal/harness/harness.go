@@ -8,6 +8,8 @@ import (
 
 var ErrSessionNotFound = errors.New("harness session not found")
 
+var ErrSessionActiveWriter = errors.New("harness session has an active writer")
+
 var ErrAmbiguousSession = errors.New("multiple harness sessions match the pull request")
 
 var ErrDiscoveryDeferred = errors.New("harness discovery deferred after a batch failure")
