@@ -18,7 +18,7 @@ The first harness is Codex CLI. The Go interface in `internal/harness` is the ex
 - Clears stale routes for batched re-discovery on the next polling cycle, and removes route and delivery state after a successful scan shows that a PR is no longer open.
 - Marks a thread version delivered only after Codex exits successfully. Resolved threads are forgotten so reopening one emits it again.
 - Cancels a dispatch after 30 minutes by default and terminates its child process tree; timed-out thread versions remain pending.
-- Instructs the agent to validate every comment and document rejected feedback instead of blindly implementing it.
+- Instructs the agent to assess feedback, propose a fix, and wait for user approval before changing code or pushing.
 - Uses a bounded two-worker queue built with Go channels—no queue dependency. Different agent sessions can run in parallel, while messages for the same session run serially. New sessions sharing a configured checkout are started serially.
 
 ## Install
@@ -82,7 +82,7 @@ Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment m
 
 Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger delivery. New failures and changed review threads for a PR are combined into one prompt and sent through the same cached fork. No coordinator or Desktop chat tools are needed.
 
-The fork verifies the live PR, head and check results, investigates failures, and uses `post-push-validation` and `task-implementation` within its approved scope. Once the fork acknowledges startup, Bifrost records the reported CI attempts for that PR head and does not send those attempts again. New commits or newly failed reruns are eligible. Dispatch errors are logged and retried on a later poll. Bifrost does not track whether an acknowledged fork later finishes or crashes. The fork must check whether failures have recovered before doing work.
+The fork verifies the live PR, head and check results, investigates failures, proposes the smallest fix and validation, then waits for explicit user approval before changing code, committing, or pushing. Once the fork acknowledges startup, Bifrost records the reported CI attempts for that PR head and does not send those attempts again. New commits or newly failed reruns are eligible. Dispatch errors are logged and retried on a later poll. Bifrost does not track whether an acknowledged fork later finishes or crashes. The fork must check whether failures have recovered before doing work.
 
 CI information is stored alongside routes and review fingerprints in `state.json`, under `ci["owner/repo#42"]`:
 
