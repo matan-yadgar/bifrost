@@ -54,6 +54,14 @@ func TestCIReportsOncePerHeadAndAttemptAcrossRestarts(t *testing.T) {
 	}
 }
 
+func TestCIPromptRequiresApprovalBeforeChanges(t *testing.T) {
+	t.Parallel()
+	prompt, included := ciPrompt(githubapi.PullRequest{URL: "https://github.com/owner/repo/pull/42", HeadSHA: "head"}, []githubapi.FailedCheck{{ID: "check:1", Name: "unit", Conclusion: "failure", URL: "https://example/check"}})
+	if len(included) != 1 || !strings.Contains(prompt, "Do not edit files, run mutating commands, commit, push, update Bifrost state, or pause CI follow-ups") || !strings.Contains(prompt, "Wait for that approval before making any change") {
+		t.Fatalf("prompt = %q, included = %#v", prompt, included)
+	}
+}
+
 func TestFailedCIDeliveryRetriesAndDisabledMonitoringDoesNotFetchCI(t *testing.T) {
 	t.Parallel()
 	monitor, source, agent := ciFixture(t)

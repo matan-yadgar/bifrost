@@ -413,7 +413,7 @@ func TestMonitorDispatchesChangedUnresolvedThreads(t *testing.T) {
 	if result.Dispatches != 1 || len(agentHarness.requests) != 1 || agentHarness.requests[0].SessionID != "" {
 		t.Fatalf("first dispatch = %#v / %#v", result, agentHarness.requests)
 	}
-	if !strings.Contains(agentHarness.requests[0].Prompt, "Do not blindly implement comments") {
+	if !strings.Contains(agentHarness.requests[0].Prompt, "Do not blindly implement comments") || !strings.Contains(agentHarness.requests[0].Prompt, "Wait for that approval before making any change") {
 		t.Fatalf("prompt did not contain critical-review policy: %s", agentHarness.requests[0].Prompt)
 	}
 	if !strings.Contains(agentHarness.requests[0].Prompt, "main.go") || !strings.Contains(agentHarness.requests[0].Prompt, "other.go") {
@@ -1933,8 +1933,8 @@ func TestReviewPromptBoundsUntrustedCommentText(t *testing.T) {
 	if !strings.HasPrefix(prompt, "New or updated unresolved inline review feedback") || !strings.Contains(prompt, "comment-prefix") {
 		t.Fatalf("prompt lost required content: %s", prompt[:min(len(prompt), 200)])
 	}
-	if !strings.Contains(prompt, "verify through GitHub that the pull request is still open") || !strings.Contains(prompt, "If it is merged or closed, do not edit files, commit, push, or resolve review threads") {
-		t.Fatalf("prompt lost closed pull request guard")
+	if !strings.Contains(prompt, "Verify through GitHub that the pull request is still open") || !strings.Contains(prompt, "Do not edit files, run mutating commands, commit, push, resolve review threads, or update Bifrost state") || !strings.Contains(prompt, "Wait for that approval before making any change") {
+		t.Fatalf("prompt lost approval guard")
 	}
 	if len(included) == 0 || len(included) >= len(threads) {
 		t.Fatalf("included threads = %d", len(included))
