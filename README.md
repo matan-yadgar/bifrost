@@ -41,6 +41,18 @@ Use a different config or perform one polling pass:
 bifrost -config /path/to/config.json -once
 ```
 
+## Local control UI
+
+Run Bifrost with `-ui` to serve its local control page at [http://127.0.0.1:7420](http://127.0.0.1:7420):
+
+```sh
+bifrost -config ~/.config/bifrost/config.json -ui
+```
+
+The poller starts active, as it does in normal mode. The page can deactivate and reactivate polling without stopping the control page, shows the source JSON configuration read-only, and streams Bifrost's current-process log lines in real time. It listens only on the local machine and requires a per-start control token for activate/deactivate requests. Restart Bifrost after changing the configuration; the page does not edit or reload it.
+
+For a macOS LaunchAgent installation, add `-ui` to `ProgramArguments`, then reload or kickstart that same LaunchAgent. The control page stays available while polling is inactive.
+
 `GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state and working-directory paths are resolved from the config directory; `~/...` is also supported. Set `dispatch_timeout` to another positive [Go duration](https://pkg.go.dev/time#ParseDuration) when a task legitimately needs longer than the default `30m`.
 
 Set `log_directory` to the directory for persistent logs. Relative paths are resolved from the config directory, and existing configs default to `logs` beside the config file. Each process start creates `bifrost_<YYYY-MM-DD_HH-MM-SS>.log`; same-second collisions add `_1`, `_2`, and so on. A new file is created before writing line 1,001. Log retention and deletion are left to the user.

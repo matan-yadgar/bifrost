@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,40 +27,58 @@ func main() {
 	}
 	configPath := flag.String("config", defaultConfig, "path to bifrost JSON config")
 	runOnce := flag.Bool("once", false, "poll once and exit")
+	serveUI := flag.Bool("ui", false, "serve the local Bifrost control UI")
 	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *serveUI && *runOnce {
+		log.Fatal("-ui and -once cannot be used together")
+	}
+	if *serveUI {
+		err = runUI(ctx, *configPath, os.Stderr)
+	} else {
+		err = runDaemon(ctx, *configPath, *runOnce, os.Stderr)
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatal(err)
+	}
+}
 
-	runtimeConfig, err := config.Load(*configPath)
+func runDaemon(ctx context.Context, configPath string, runOnce bool, terminal io.Writer) error {
+	runtimeConfig, err := config.Load(configPath)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	environment := githubapi.WithoutAuthTokens(os.Environ())
-	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
+	logger, persistentLog, err := newPersistentLogger(runtimeConfig.LogDirectory, terminal)
 	if err != nil {
-		log.Fatal(err)
-	}
-	instanceLock, err := instance.Acquire(runtimeConfig.StateFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	logger, persistentLog, err := newPersistentLogger(runtimeConfig.LogDirectory, os.Stderr)
-	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer func() {
 		if err := persistentLog.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close log file: %v\n", err)
+			_, _ = fmt.Fprintf(terminal, "close log file: %v\n", err)
 		}
 	}()
+	return runPoller(ctx, runtimeConfig, runOnce, logger)
+}
+
+func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger) error {
+	environment := githubapi.WithoutAuthTokens(os.Environ())
+	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
+	if err != nil {
+		return err
+	}
+	instanceLock, err := instance.Acquire(runtimeConfig.StateFile)
+	if err != nil {
+		return err
+	}
 	defer func() {
 		if err := instanceLock.Close(); err != nil {
 			logger.Printf("release instance lock: %v", err)
 		}
 	}()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	token, err := githubapi.AuthToken(ctx)
 	if err != nil {
-		logger.Fatal(err)
+		return err
 	}
 	githubClient := githubapi.NewClient(token)
 
@@ -77,15 +96,15 @@ func main() {
 		logger.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
 		return result, err
 	}
-	if *runOnce {
+	if runOnce {
 		result, err := poll()
 		if err != nil {
-			logger.Fatal(err)
+			return err
 		}
 		if err := incompleteDeliveryError(result); err != nil {
-			logger.Fatal(err)
+			return err
 		}
-		return
+		return nil
 	}
 
 	logger.Printf("bifrost started: interval=%s dispatch_timeout=%s harness=%s log_directory=%s", runtimeConfig.PollInterval, runtimeConfig.DispatchTimeout, agentHarness.Name(), runtimeConfig.LogDirectory)
@@ -98,7 +117,7 @@ func main() {
 		select {
 		case <-ctx.Done():
 			logger.Print("bifrost stopped")
-			return
+			return nil
 		case <-ticker.C:
 			if _, err := poll(); err != nil {
 				logger.Printf("poll failed: %v", err)
