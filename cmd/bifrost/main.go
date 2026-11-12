@@ -18,6 +18,7 @@ import (
 	"github.com/matan-yadgar/bifrost/internal/harness"
 	"github.com/matan-yadgar/bifrost/internal/instance"
 	"github.com/matan-yadgar/bifrost/internal/logfile"
+	"github.com/matan-yadgar/bifrost/internal/prmanager"
 )
 
 func main() {
@@ -58,10 +59,24 @@ func runDaemon(ctx context.Context, configPath string, runOnce bool, terminal io
 			_, _ = fmt.Fprintf(terminal, "close log file: %v\n", err)
 		}
 	}()
-	return runPoller(ctx, runtimeConfig, runOnce, logger)
+	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger))
 }
 
-func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger) error {
+func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.Manager {
+	repositories := make([]prmanager.Repository, 0, len(runtimeConfig.Repositories))
+	for _, repository := range runtimeConfig.Repositories {
+		repositories = append(repositories, prmanager.Repository{Name: repository.Name, WorkingDirectory: repository.WorkingDirectory})
+	}
+	return prmanager.New(prmanager.Settings{
+		Enabled:      runtimeConfig.PRManager.Enabled,
+		AppTokenEnv:  runtimeConfig.PRManager.AppTokenEnv,
+		UserTokenEnv: runtimeConfig.PRManager.UserTokenEnv,
+		Conversation: runtimeConfig.PRManager.Conversation,
+		BotID:        runtimeConfig.PRManager.BotID,
+	}, repositories, runtimeConfig.DispatchTimeout, logger)
+}
+
+func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager) error {
 	environment := githubapi.WithoutAuthTokens(os.Environ())
 	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
 	if err != nil {
@@ -81,6 +96,12 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 		return err
 	}
 	githubClient := githubapi.NewClient(token)
+	if !runOnce && manager != nil {
+		if err := manager.Start(ctx, githubClient, agentHarness); err != nil {
+			logger.Printf("PR Manager listener unavailable: %v", err)
+		}
+		defer manager.Stop()
+	}
 
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {

@@ -67,6 +67,28 @@ func TestOpenPullRequestsReturnsAuthoritativeOpenSet(t *testing.T) {
 	}
 }
 
+func TestPullRequestReadsTheRequestedHead(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/repos/owner/repo/pulls/42" {
+			http.Error(writer, "wrong pull request target", http.StatusBadRequest)
+			return
+		}
+		_, _ = fmt.Fprint(writer, `{"number":42,"title":"Ship it","body":"body","html_url":"https://github.com/owner/repo/pull/42","user":{"login":"matan"},"head":{"ref":"codex/ship-it","sha":"abc123"}}`)
+	}))
+	defer server.Close()
+	client := NewClient("")
+	client.restBaseURL = server.URL
+
+	pullRequest, err := client.PullRequest(context.Background(), "owner/repo", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pullRequest.Number != 42 || pullRequest.HeadSHA != "abc123" || pullRequest.HeadRef != "codex/ship-it" || pullRequest.Author != "matan" {
+		t.Fatalf("pull request = %#v", pullRequest)
+	}
+}
+
 func TestReviewThreadsPaginatesThreadsAndComments(t *testing.T) {
 	t.Parallel()
 	var requestMutex sync.Mutex
