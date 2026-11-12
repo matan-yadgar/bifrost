@@ -140,7 +140,7 @@ func (manager *Manager) startLocked() error {
 		return nil
 	}
 	if manager.parent == nil || manager.source == nil || manager.harness == nil {
-		return manager.failLocked(fmt.Errorf("Bifrost must be active before PR Manager can start"))
+		return manager.failLocked(fmt.Errorf("bifrost must be active before PR Manager can start"))
 	}
 	if manager.settings.Conversation == "" || manager.settings.BotID == "" {
 		return manager.failLocked(fmt.Errorf("pr_manager.conversation_id and pr_manager.bot_id are required"))
@@ -213,7 +213,7 @@ func (manager *Manager) runSocket(ctx context.Context, cancel context.CancelFunc
 	manager.connected = false
 	manager.cancel = nil
 	manager.jobs = nil
-	if err != nil && ctx.Err() == nil {
+	if ctx.Err() == nil {
 		manager.lastError = err.Error()
 		manager.logger.Printf("PR Manager listener stopped: %v", err)
 		return
