@@ -22,6 +22,11 @@ func TestLoad(t *testing.T) {
     "authors": ["@Matan", "matan", ""],
     "working_directory": "repo"
   }],
+  "pr_manager": {
+    "enabled": true,
+    "conversation_id": "D0123",
+    "bot_id": "B0123"
+  },
   "harness": {"type": "codex"}
 }`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
@@ -56,6 +61,9 @@ func TestLoad(t *testing.T) {
 	}
 	if runtimeConfig.LogDirectory != filepath.Join(directory, "logs") {
 		t.Fatalf("log directory = %q", runtimeConfig.LogDirectory)
+	}
+	if !runtimeConfig.PRManager.Enabled || runtimeConfig.PRManager.Conversation != "D0123" || runtimeConfig.PRManager.BotID != "B0123" || runtimeConfig.PRManager.AppTokenEnv != "BIFROST_SLACK_APP_TOKEN" || runtimeConfig.PRManager.UserTokenEnv != "BIFROST_SLACK_USER_TOKEN" {
+		t.Fatalf("PR Manager = %#v", runtimeConfig.PRManager)
 	}
 }
 
@@ -198,5 +206,21 @@ func TestCIMonitoringRequiresExplicitAuthors(t *testing.T) {
 				t.Fatalf("CI config=%#v err=%v", settings, err)
 			}
 		})
+	}
+}
+
+func TestLoadRejectsEnabledPRManagerWithoutTrustedConversation(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	if err := os.Mkdir(filepath.Join(directory, "repo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "config.json")
+	data := `{"pr_manager":{"enabled":true,"conversation_id":"D123"},"repositories":[{"name":"owner/repo","working_directory":"repo"}]}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected PR Manager configuration error")
 	}
 }

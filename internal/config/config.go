@@ -20,6 +20,7 @@ type Config struct {
 	DispatchTimeout string       `json:"dispatch_timeout"`
 	StateFile       string       `json:"state_file"`
 	LogDirectory    string       `json:"log_directory,omitempty"`
+	PRManager       PRManager    `json:"pr_manager,omitempty"`
 	Repositories    []Repository `json:"repositories"`
 	Harness         Harness      `json:"harness"`
 }
@@ -36,12 +37,21 @@ type Harness struct {
 	Args    []string `json:"args,omitempty"`
 }
 
+type PRManager struct {
+	Enabled      bool   `json:"enabled,omitempty"`
+	AppTokenEnv  string `json:"app_token_env,omitempty"`
+	UserTokenEnv string `json:"user_token_env,omitempty"`
+	Conversation string `json:"conversation_id,omitempty"`
+	BotID        string `json:"bot_id,omitempty"`
+}
+
 type Runtime struct {
 	MonitorCI       bool
 	PollInterval    time.Duration
 	DispatchTimeout time.Duration
 	StateFile       string
 	LogDirectory    string
+	PRManager       PRManager
 	Repositories    []Repository
 	Harness         Harness
 }
@@ -128,6 +138,10 @@ func Load(path string) (Runtime, error) {
 	if strings.TrimSpace(config.Harness.Command) == "" {
 		config.Harness.Command = "codex"
 	}
+	config.PRManager, err = normalizePRManager(config.PRManager)
+	if err != nil {
+		return Runtime{}, err
+	}
 
 	stateFile := config.StateFile
 	if strings.TrimSpace(stateFile) == "" {
@@ -154,9 +168,40 @@ func Load(path string) (Runtime, error) {
 		DispatchTimeout: dispatchTimeout,
 		StateFile:       stateFile,
 		LogDirectory:    logDirectory,
+		PRManager:       config.PRManager,
 		Repositories:    config.Repositories,
 		Harness:         config.Harness,
 	}, nil
+}
+
+func normalizePRManager(prManager PRManager) (PRManager, error) {
+	prManager.AppTokenEnv = strings.TrimSpace(prManager.AppTokenEnv)
+	if prManager.AppTokenEnv == "" {
+		prManager.AppTokenEnv = "BIFROST_SLACK_APP_TOKEN"
+	}
+	prManager.UserTokenEnv = strings.TrimSpace(prManager.UserTokenEnv)
+	if prManager.UserTokenEnv == "" {
+		prManager.UserTokenEnv = "BIFROST_SLACK_USER_TOKEN"
+	}
+	prManager.Conversation = strings.TrimSpace(prManager.Conversation)
+	prManager.BotID = strings.TrimSpace(prManager.BotID)
+	if !validEnvironmentName(prManager.AppTokenEnv) || !validEnvironmentName(prManager.UserTokenEnv) {
+		return PRManager{}, fmt.Errorf("pr_manager token environment names must contain only letters, digits, and underscores")
+	}
+	if prManager.Enabled && (prManager.Conversation == "" || prManager.BotID == "") {
+		return PRManager{}, fmt.Errorf("pr_manager.conversation_id and pr_manager.bot_id are required when pr_manager is enabled")
+	}
+	return prManager, nil
+}
+
+func validEnvironmentName(value string) bool {
+	for index, character := range value {
+		if character == '_' || character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' || index > 0 && character >= '0' && character <= '9' {
+			continue
+		}
+		return false
+	}
+	return value != ""
 }
 
 func positiveDuration(name, value string, defaultValue time.Duration) (time.Duration, error) {

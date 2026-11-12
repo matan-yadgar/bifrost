@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/matan-yadgar/bifrost/internal/bridge"
+	"github.com/matan-yadgar/bifrost/internal/prmanager"
 )
 
 func TestNewPersistentLoggerMirrorsOutput(t *testing.T) {
@@ -55,12 +56,21 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	}
 	started := make(chan struct{})
 	stopped := make(chan struct{})
+	prManagerEnabled := false
 	logs := newLiveLogs()
 	ui := &controlUI{
 		configPath: configPath,
 		logger:     log.New(io.Discard, "", 0),
 		token:      "test-token",
 		logs:       logs,
+		prManagerStatus: func() prmanager.Status {
+			return prmanager.Status{Enabled: prManagerEnabled, Running: prManagerEnabled}
+		},
+		activatePRManager: func() error {
+			prManagerEnabled = true
+			return nil
+		},
+		deactivatePRManager: func() { prManagerEnabled = false },
 		run: func(ctx context.Context) error {
 			close(started)
 			<-ctx.Done()
@@ -143,6 +153,38 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	}
 	if !ui.status().Active {
 		t.Fatal("UI reports inactive after activation")
+	}
+
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/pr-manager/activate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !ui.status().PRManager.Running {
+		t.Fatalf("PR Manager activate status = %d %#v", response.StatusCode, ui.status().PRManager)
+	}
+
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/pr-manager/deactivate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || ui.status().PRManager.Enabled {
+		t.Fatalf("PR Manager deactivate status = %d %#v", response.StatusCode, ui.status().PRManager)
 	}
 
 	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/deactivate", nil)

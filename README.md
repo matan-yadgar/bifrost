@@ -53,6 +53,24 @@ The poller starts active, as it does in normal mode. The page can deactivate and
 
 For a macOS LaunchAgent installation, add `-ui` to `ProgramArguments`, then reload or kickstart that same LaunchAgent. The control page stays available while polling is inactive.
 
+## PR Manager Slack input
+
+Optionally, Bifrost can listen to one configured direct message with an existing PR Manager Slack app. It accepts only that app's `bot_message` events whose text starts with `Please review:` and whose PR URL belongs to a configured repository. It starts one new, read-only Codex review task per PR head; repeated notifications for the same head are ignored while Bifrost is running. The task can inspect and report findings, but is explicitly told not to edit, push, or post a GitHub review.
+
+Create a separate Slack app for Bifrost with Socket Mode enabled. Give its app-level token the `connections:write` scope, authorize it with a user token carrying `im:history`, and subscribe that user installation to the `message.im` event. Keep both tokens outside the JSON configuration, for example in the environment of the Bifrost process:
+
+```json
+"pr_manager": {
+  "enabled": false,
+  "app_token_env": "BIFROST_SLACK_APP_TOKEN",
+  "user_token_env": "BIFROST_SLACK_USER_TOKEN",
+  "conversation_id": "D0123456789",
+  "bot_id": "B0123456789"
+}
+```
+
+Use the direct-message conversation ID and the PR Manager bot ID, not its display name. The local control UI exposes an independent PR Manager enable/disable button. The switch affects the running Bifrost process only; changing `pr_manager` configuration still requires a restart. Because `im:history` lets the Slack app receive direct-message activity visible to the authorizing user, restrict the configuration to the one PR Manager conversation and bot ID above.
+
 `GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state and working-directory paths are resolved from the config directory; `~/...` is also supported. Set `dispatch_timeout` to another positive [Go duration](https://pkg.go.dev/time#ParseDuration) when a task legitimately needs longer than the default `30m`.
 
 Set `log_directory` to the directory for persistent logs. Relative paths are resolved from the config directory, and existing configs default to `logs` beside the config file. Each process start creates `bifrost_<YYYY-MM-DD_HH-MM-SS>.log`; same-second collisions add `_1`, `_2`, and so on. A new file is created before writing line 1,001. Log retention and deletion are left to the user.
@@ -86,7 +104,7 @@ The harness interface separates discovery from dispatch. Codex currently impleme
 
 ## Scope
 
-Bifrost currently targets macOS and Linux and has no UI, webhook listener, database, dynamic plugin loading, reviewer allowlist, per-PR worktree provisioning, or automatic GitHub-thread resolution. GitHub polling remains sequential; queued agent dispatches use at most two workers and the next poll waits for the queue to drain. At most 100 PR dispatches are retained per poll; excess work remains uncommitted and a persisted cursor rotates capacity fairly across later polls. Prompts are capped at 256 KiB and direct the agent to inspect omitted text on the live PR. One-shot mode exits unsuccessfully while PRs or threads remain deferred. Each GitHub response is capped at 8 MiB, with at most 32 MiB of retained review-thread text per PR. Distinct routed tasks can run concurrently, so give them isolated worktrees; Bifrost-spawned tasks otherwise share the configured checkout.
+Bifrost currently targets macOS and Linux and has no public UI, webhook listener, database, dynamic plugin loading, reviewer allowlist, per-PR worktree provisioning, or automatic GitHub-thread resolution. GitHub polling remains sequential; queued agent dispatches use at most two workers and the next poll waits for the queue to drain. At most 100 PR dispatches are retained per poll; excess work remains uncommitted and a persisted cursor rotates capacity fairly across later polls. Prompts are capped at 256 KiB and direct the agent to inspect omitted text on the live PR. One-shot mode exits unsuccessfully while PRs or threads remain deferred. Each GitHub response is capped at 8 MiB, with at most 32 MiB of retained review-thread text per PR. Distinct routed tasks can run concurrently, so give them isolated worktrees; Bifrost-spawned tasks otherwise share the configured checkout.
 
 ## CI follow-up
 
