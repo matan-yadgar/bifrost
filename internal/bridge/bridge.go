@@ -157,6 +157,16 @@ func newHeartbeatTicker(interval time.Duration) (<-chan time.Time, func()) {
 }
 
 func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
+	return monitor.runOnce(ctx, true)
+}
+
+// RunOnceWithoutReviewFollowUps keeps CI monitoring active without starting
+// tasks for inline review feedback.
+func (monitor *Monitor) RunOnceWithoutReviewFollowUps(ctx context.Context) (CycleResult, error) {
+	return monitor.runOnce(ctx, false)
+}
+
+func (monitor *Monitor) runOnce(ctx context.Context, reviewFollowUps bool) (CycleResult, error) {
 	state, err := monitor.readState(ctx)
 	if err != nil {
 		return CycleResult{}, err
@@ -189,17 +199,19 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 		pullRequests := filterPullRequestsByAuthor(openPullRequests, repository.Authors)
 		result.PullRequests += len(pullRequests)
 		for _, pullRequest := range pullRequests {
-			threads, err := monitor.source.ReviewThreads(ctx, pullRequest)
 			var changed []githubapi.ReviewThread
 			var fingerprints map[string]string
-			if err != nil {
-				cycleErrors = append(cycleErrors, fmt.Errorf("read %s review threads: %w", pullRequest.URL, err))
-				sourceScanFailed = true
-			} else {
-				result.Threads += len(threads)
-				var changedState bool
-				changed, changedState, fingerprints = changedThreads(state, pullRequest, threads)
-				stateChanged = stateChanged || changedState
+			if reviewFollowUps {
+				threads, err := monitor.source.ReviewThreads(ctx, pullRequest)
+				if err != nil {
+					cycleErrors = append(cycleErrors, fmt.Errorf("read %s review threads: %w", pullRequest.URL, err))
+					sourceScanFailed = true
+				} else {
+					result.Threads += len(threads)
+					var changedState bool
+					changed, changedState, fingerprints = changedThreads(state, pullRequest, threads)
+					stateChanged = stateChanged || changedState
+				}
 			}
 			var checks []githubapi.FailedCheck
 			if monitor.monitorCI {

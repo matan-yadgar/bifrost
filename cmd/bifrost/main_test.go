@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,6 +70,8 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	stopped := make(chan struct{})
 	prManagerEnabled := false
 	prManagerAutoReply := false
+	reviewFollowUps := &atomic.Bool{}
+	reviewFollowUps.Store(true)
 	logs := newLiveLogs()
 	ui := &controlUI{
 		configPath: configPath,
@@ -84,6 +87,7 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 		},
 		deactivatePRManager:   func() { prManagerEnabled = false },
 		setPRManagerAutoReply: func(autoReply bool) { prManagerAutoReply = autoReply },
+		reviewFollowUps:       reviewFollowUps,
 		run: func(ctx context.Context) error {
 			close(started)
 			<-ctx.Done()
@@ -166,6 +170,37 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	}
 	if !ui.status().Active {
 		t.Fatal("UI reports inactive after activation")
+	}
+
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/review-follow-ups/deactivate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || ui.status().ReviewFollowUps {
+		t.Fatalf("review follow-ups deactivate status = %d %#v", response.StatusCode, ui.status())
+	}
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/review-follow-ups/activate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !ui.status().ReviewFollowUps {
+		t.Fatalf("review follow-ups activate status = %d %#v", response.StatusCode, ui.status())
 	}
 
 	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/pr-manager/activate", nil)
