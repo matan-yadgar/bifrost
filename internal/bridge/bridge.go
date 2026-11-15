@@ -85,6 +85,7 @@ type stateFile struct {
 	Routes          map[string]route             `json:"routes,omitempty"`
 	CI              map[string]*ciState          `json:"ci,omitempty"`
 	PRManagerHeads  map[string]string            `json:"pr_manager_heads,omitempty"`
+	PRManagerCursor string                       `json:"pr_manager_cursor,omitempty"`
 }
 
 type dispatchJob struct {
@@ -683,6 +684,33 @@ func (monitor *Monitor) PRManagerReviewHandled(ctx context.Context, key, headSHA
 		return false, err
 	}
 	return state.PRManagerHeads[key] == headSHA, nil
+}
+
+func (monitor *Monitor) PRManagerCursor(ctx context.Context) (cursor string, err error) {
+	lock, err := monitor.stateLock(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		return "", err
+	}
+	return state.PRManagerCursor, nil
+}
+
+func (monitor *Monitor) SetPRManagerCursor(ctx context.Context, cursor string) (err error) {
+	lock, err := monitor.stateLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		return err
+	}
+	state.PRManagerCursor = cursor
+	return saveJSON(monitor.stateFile, state)
 }
 
 func (monitor *Monitor) MarkPRManagerReviewHandled(ctx context.Context, key, headSHA string) (err error) {

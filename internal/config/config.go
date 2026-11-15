@@ -40,7 +40,6 @@ type Harness struct {
 type PRManager struct {
 	Enabled      bool   `json:"enabled,omitempty"`
 	AutoReply    bool   `json:"auto_reply,omitempty"`
-	AppTokenEnv  string `json:"app_token_env,omitempty"`
 	UserTokenEnv string `json:"user_token_env,omitempty"`
 	Conversation string `json:"conversation_id,omitempty"`
 	BotID        string `json:"bot_id,omitempty"`
@@ -240,18 +239,14 @@ func UpdatePRManagerAutoReply(path string, autoReply bool) error {
 }
 
 func normalizePRManager(prManager PRManager) (PRManager, error) {
-	prManager.AppTokenEnv = strings.TrimSpace(prManager.AppTokenEnv)
-	if prManager.AppTokenEnv == "" {
-		prManager.AppTokenEnv = "BIFROST_SLACK_APP_TOKEN"
-	}
 	prManager.UserTokenEnv = strings.TrimSpace(prManager.UserTokenEnv)
 	if prManager.UserTokenEnv == "" {
 		prManager.UserTokenEnv = "BIFROST_SLACK_USER_TOKEN"
 	}
 	prManager.Conversation = strings.TrimSpace(prManager.Conversation)
 	prManager.BotID = strings.TrimSpace(prManager.BotID)
-	if !validEnvironmentName(prManager.AppTokenEnv) || !validEnvironmentName(prManager.UserTokenEnv) {
-		return PRManager{}, fmt.Errorf("pr_manager token environment names must contain only letters, digits, and underscores")
+	if !validEnvironmentName(prManager.UserTokenEnv) {
+		return PRManager{}, fmt.Errorf("pr_manager.user_token_env must contain only letters, digits, and underscores")
 	}
 	if prManager.Enabled && (prManager.Conversation == "" || prManager.BotID == "") {
 		return PRManager{}, fmt.Errorf("pr_manager.conversation_id and pr_manager.bot_id are required when pr_manager is enabled")

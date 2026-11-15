@@ -134,7 +134,7 @@ func TestPRManagerReviewHeadsPersistAndPrune(t *testing.T) {
 	}
 }
 
-func TestSaveStatePreservesPRManagerReviewHeads(t *testing.T) {
+func TestSaveStatePreservesPRManagerState(t *testing.T) {
 	t.Parallel()
 	monitor := New(&fakeSource{}, &fakeHarness{}, nil, filepath.Join(t.TempDir(), "state.json"), time.Minute, false, discardLogger())
 	staleState, err := monitor.readState(context.Background())
@@ -144,13 +144,16 @@ func TestSaveStatePreservesPRManagerReviewHeads(t *testing.T) {
 	if err := monitor.MarkPRManagerReviewHandled(context.Background(), "owner/repo#42", "first"); err != nil {
 		t.Fatal(err)
 	}
+	if err := monitor.SetPRManagerCursor(context.Background(), "1.000001"); err != nil {
+		t.Fatal(err)
+	}
 	staleState.QueueCursor = 1
 	if err := monitor.saveState(context.Background(), staleState); err != nil {
 		t.Fatal(err)
 	}
 	state, err := monitor.readState(context.Background())
-	if err != nil || state.PRManagerHeads["owner/repo#42"] != "first" {
-		t.Fatalf("saved state = %#v, err=%v", state.PRManagerHeads, err)
+	if err != nil || state.PRManagerHeads["owner/repo#42"] != "first" || state.PRManagerCursor != "1.000001" {
+		t.Fatalf("saved state = %#v, err=%v", state, err)
 	}
 }
 
