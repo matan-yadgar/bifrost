@@ -48,15 +48,10 @@ type Repository struct {
 	WorkingDirectory string
 }
 
-type OpenPullRequestsObserver interface {
-	ObserveOpenPullRequests(string, []githubapi.PullRequest)
-}
-
 type Monitor struct {
 	source             Source
 	harness            harness.Harness
 	repositories       []Repository
-	openPullRequests   OpenPullRequestsObserver
 	stateFile          string
 	monitorCI          bool
 	dispatchTimeout    time.Duration
@@ -89,6 +84,7 @@ type stateFile struct {
 	Threads         map[string]map[string]string `json:"threads"`
 	Routes          map[string]route             `json:"routes,omitempty"`
 	CI              map[string]*ciState          `json:"ci,omitempty"`
+	PRManagerHeads  map[string]string            `json:"pr_manager_heads,omitempty"`
 }
 
 type dispatchJob struct {
@@ -160,10 +156,6 @@ func newHeartbeatTicker(interval time.Duration) (<-chan time.Time, func()) {
 	return ticker.C, ticker.Stop
 }
 
-func (monitor *Monitor) SetOpenPullRequestsObserver(observer OpenPullRequestsObserver) {
-	monitor.openPullRequests = observer
-}
-
 func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 	state, err := monitor.readState(ctx)
 	if err != nil {
@@ -188,8 +180,8 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 			sourceScanFailed = true
 			continue
 		}
-		if monitor.openPullRequests != nil {
-			monitor.openPullRequests.ObserveOpenPullRequests(repository.Name, openPullRequests)
+		if err := monitor.prunePRManagerHeads(ctx, repository.Name, openPullRequests); err != nil {
+			cycleErrors = append(cycleErrors, fmt.Errorf("prune PR Manager review heads for %s: %w", repository.Name, err))
 		}
 		if pruneRepositoryState(state, repository.Name, openPullRequests) {
 			stateChanged = true
@@ -680,6 +672,61 @@ func pruneRepositoryState(state *stateFile, repository string, pullRequests []gi
 	return changed
 }
 
+func (monitor *Monitor) PRManagerReviewHandled(ctx context.Context, key, headSHA string) (handled bool, err error) {
+	lock, err := monitor.stateLock(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		return false, err
+	}
+	return state.PRManagerHeads[key] == headSHA, nil
+}
+
+func (monitor *Monitor) MarkPRManagerReviewHandled(ctx context.Context, key, headSHA string) (err error) {
+	lock, err := monitor.stateLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		return err
+	}
+	state.PRManagerHeads[key] = headSHA
+	return saveJSON(monitor.stateFile, state)
+}
+
+func (monitor *Monitor) prunePRManagerHeads(ctx context.Context, repository string, pullRequests []githubapi.PullRequest) (err error) {
+	lock, err := monitor.stateLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+	state, err := loadState(monitor.stateFile)
+	if err != nil {
+		return err
+	}
+	prefix := strings.ToLower(repository) + "#"
+	open := make(map[string]bool, len(pullRequests))
+	for _, pullRequest := range pullRequests {
+		open[pullRequestKey(pullRequest.Repository, pullRequest.Number)] = true
+	}
+	changed := false
+	for key := range state.PRManagerHeads {
+		if strings.HasPrefix(key, prefix) && !open[key] {
+			delete(state.PRManagerHeads, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return saveJSON(monitor.stateFile, state)
+}
+
 func changedThreads(state *stateFile, pullRequest githubapi.PullRequest, threads []githubapi.ReviewThread) ([]githubapi.ReviewThread, bool, map[string]string) {
 	key := pullRequestKey(pullRequest.Repository, pullRequest.Number)
 	seen := state.Threads[key]
@@ -785,10 +832,11 @@ func pullRequestKey(repository string, number int) string {
 
 func loadState(path string) (*stateFile, error) {
 	state := &stateFile{
-		Version: stateSchemaVersion,
-		Threads: make(map[string]map[string]string),
-		Routes:  make(map[string]route),
-		CI:      make(map[string]*ciState),
+		Version:        stateSchemaVersion,
+		Threads:        make(map[string]map[string]string),
+		Routes:         make(map[string]route),
+		CI:             make(map[string]*ciState),
+		PRManagerHeads: make(map[string]string),
 	}
 	if err := loadJSON(path, state); err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
@@ -810,6 +858,9 @@ func loadState(path string) (*stateFile, error) {
 	}
 	if state.CI == nil {
 		state.CI = make(map[string]*ciState)
+	}
+	if state.PRManagerHeads == nil {
+		state.PRManagerHeads = make(map[string]string)
 	}
 	for key, entry := range state.CI {
 		if entry == nil {

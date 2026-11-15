@@ -46,24 +46,29 @@ type Source interface {
 	PullRequest(context.Context, string, int) (github.PullRequest, error)
 }
 
+type ReviewCache interface {
+	PRManagerReviewHandled(context.Context, string, string) (bool, error)
+	MarkPRManagerReviewHandled(context.Context, string, string) error
+}
+
 type Manager struct {
 	settings        Settings
 	repositories    map[string]Repository
 	dispatchTimeout time.Duration
 	logger          *log.Logger
 
-	mutex      sync.Mutex
-	enabled    bool
-	running    bool
-	connected  bool
-	lastError  string
-	parent     context.Context
-	source     Source
-	harness    harness.Harness
-	cancel     context.CancelFunc
-	jobs       chan reviewRequest
-	generation uint64
-	delivered  map[string]string
+	mutex       sync.Mutex
+	enabled     bool
+	running     bool
+	connected   bool
+	lastError   string
+	parent      context.Context
+	source      Source
+	harness     harness.Harness
+	reviewCache ReviewCache
+	cancel      context.CancelFunc
+	jobs        chan reviewRequest
+	generation  uint64
 }
 
 type message struct {
@@ -87,18 +92,19 @@ func New(settings Settings, repositories []Repository, dispatchTimeout time.Dura
 	}
 	return &Manager{
 		settings: settings, repositories: configured, dispatchTimeout: dispatchTimeout,
-		logger: logger, enabled: settings.Enabled, delivered: make(map[string]string),
+		logger: logger, enabled: settings.Enabled,
 	}
 }
 
 // Start makes the manager available to the local control UI. It only opens a
 // Slack connection when enabled in config or by the UI.
-func (manager *Manager) Start(ctx context.Context, source Source, agentHarness harness.Harness) error {
+func (manager *Manager) Start(ctx context.Context, source Source, agentHarness harness.Harness, reviewCache ReviewCache) error {
 	manager.mutex.Lock()
 	defer manager.mutex.Unlock()
 	manager.parent = ctx
 	manager.source = source
 	manager.harness = agentHarness
+	manager.reviewCache = reviewCache
 	if !manager.enabled {
 		return nil
 	}
@@ -141,6 +147,9 @@ func (manager *Manager) startLocked() error {
 	}
 	if manager.parent == nil || manager.source == nil || manager.harness == nil {
 		return manager.failLocked(fmt.Errorf("bifrost must be active before PR Manager can start"))
+	}
+	if manager.reviewCache == nil {
+		return manager.failLocked(fmt.Errorf("pr manager review cache is required"))
 	}
 	if manager.settings.Conversation == "" || manager.settings.BotID == "" {
 		return manager.failLocked(fmt.Errorf("pr_manager.conversation_id and pr_manager.bot_id are required"))
@@ -358,13 +367,15 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 		return
 	}
 	key := strings.ToLower(pullRequest.Repository) + "#" + strconv.Itoa(pullRequest.Number)
-	manager.mutex.Lock()
-	if manager.delivered[key] == pullRequest.HeadSHA {
-		manager.mutex.Unlock()
+	handled, err := manager.reviewCache.PRManagerReviewHandled(ctx, key, pullRequest.HeadSHA)
+	if err != nil {
+		manager.logger.Printf("PR Manager review failed: pr=%s reason=read review cache: %v", key, err)
+		return
+	}
+	if handled {
 		manager.logger.Printf("PR Manager review ignored: pr=%s unchanged", key)
 		return
 	}
-	manager.mutex.Unlock()
 
 	dispatchContext, cancel := context.WithTimeout(ctx, manager.dispatchTimeout)
 	defer cancel()
@@ -377,26 +388,11 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 		manager.logger.Printf("PR Manager review failed: pr=%s reason=%v", key, err)
 		return
 	}
-	manager.mutex.Lock()
-	manager.delivered[key] = pullRequest.HeadSHA
-	manager.mutex.Unlock()
+	if err := manager.reviewCache.MarkPRManagerReviewHandled(ctx, key, pullRequest.HeadSHA); err != nil {
+		manager.logger.Printf("PR Manager review failed: pr=%s reason=save review cache: %v", key, err)
+		return
+	}
 	manager.logger.Printf("PR Manager review task started: pr=%s", key)
-}
-
-func (manager *Manager) ObserveOpenPullRequests(repository string, pullRequests []github.PullRequest) {
-	open := make(map[string]bool, len(pullRequests))
-	for _, pullRequest := range pullRequests {
-		open[strings.ToLower(pullRequest.Repository)+"#"+strconv.Itoa(pullRequest.Number)] = true
-	}
-	prefix := strings.ToLower(repository) + "#"
-	manager.mutex.Lock()
-	defer manager.mutex.Unlock()
-	for key := range manager.delivered {
-		if strings.HasPrefix(key, prefix) && !open[key] {
-			delete(manager.delivered, key)
-			manager.logger.Printf("PR Manager review cache removed: pr=%s", key)
-		}
-	}
 }
 
 func reviewPrompt(pullRequestURL string) string {

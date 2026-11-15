@@ -32,16 +32,6 @@ type fakeSource struct {
 	openErrorsByRepo     map[string]error
 }
 
-type fakeOpenPullRequestsObserver struct {
-	repository   string
-	pullRequests []githubapi.PullRequest
-}
-
-func (observer *fakeOpenPullRequestsObserver) ObserveOpenPullRequests(repository string, pullRequests []githubapi.PullRequest) {
-	observer.repository = repository
-	observer.pullRequests = append([]githubapi.PullRequest(nil), pullRequests...)
-}
-
 func (source *fakeSource) OpenPullRequests(_ context.Context, repository string) ([]githubapi.PullRequest, error) {
 	if err := source.openErrorsByRepo[repository]; err != nil {
 		return nil, err
@@ -119,18 +109,48 @@ func newTestMonitor(source Source, agentHarness harness.Harness, repositories []
 	return New(source, agentHarness, repositories, statePath, time.Minute, false, discardLogger())
 }
 
-func TestRunOnceObservesOpenPullRequests(t *testing.T) {
+func TestPRManagerReviewHeadsPersistAndPrune(t *testing.T) {
 	t.Parallel()
 	pullRequest := githubapi.PullRequest{Repository: "owner/repo", Number: 42, State: "open"}
-	monitor := New(&fakeSource{pullRequest: pullRequest}, &fakeHarness{}, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, filepath.Join(t.TempDir(), "state.json"), time.Minute, false, discardLogger())
-	observer := &fakeOpenPullRequestsObserver{}
-	monitor.SetOpenPullRequestsObserver(observer)
-
-	if _, err := monitor.RunOnce(context.Background()); err != nil {
+	source := &fakeSource{pullRequests: []githubapi.PullRequest{pullRequest}}
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	monitor := New(source, &fakeHarness{}, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, statePath, time.Minute, false, discardLogger())
+	if err := monitor.MarkPRManagerReviewHandled(context.Background(), "owner/repo#42", "first"); err != nil {
 		t.Fatal(err)
 	}
-	if observer.repository != "owner/repo" || len(observer.pullRequests) != 1 || observer.pullRequests[0].Number != 42 {
-		t.Fatalf("observed pull requests = repository %q, pull requests %#v", observer.repository, observer.pullRequests)
+	restartedMonitor := New(source, &fakeHarness{}, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, statePath, time.Minute, false, discardLogger())
+	handled, err := restartedMonitor.PRManagerReviewHandled(context.Background(), "owner/repo#42", "first")
+	if err != nil || !handled {
+		t.Fatalf("handled after restart = %t, err=%v", handled, err)
+	}
+
+	source.pullRequests = []githubapi.PullRequest{}
+	if _, err := restartedMonitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	handled, err = restartedMonitor.PRManagerReviewHandled(context.Background(), "owner/repo#42", "first")
+	if err != nil || handled {
+		t.Fatalf("handled after prune = %t, err=%v", handled, err)
+	}
+}
+
+func TestSaveStatePreservesPRManagerReviewHeads(t *testing.T) {
+	t.Parallel()
+	monitor := New(&fakeSource{}, &fakeHarness{}, nil, filepath.Join(t.TempDir(), "state.json"), time.Minute, false, discardLogger())
+	staleState, err := monitor.readState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.MarkPRManagerReviewHandled(context.Background(), "owner/repo#42", "first"); err != nil {
+		t.Fatal(err)
+	}
+	staleState.QueueCursor = 1
+	if err := monitor.saveState(context.Background(), staleState); err != nil {
+		t.Fatal(err)
+	}
+	state, err := monitor.readState(context.Background())
+	if err != nil || state.PRManagerHeads["owner/repo#42"] != "first" {
+		t.Fatalf("saved state = %#v, err=%v", state.PRManagerHeads, err)
 	}
 }
 

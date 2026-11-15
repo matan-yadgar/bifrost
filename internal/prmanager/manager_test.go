@@ -31,6 +31,19 @@ type fakeHarness struct {
 	dispatched chan harness.Request
 }
 
+type fakeReviewCache struct {
+	heads map[string]string
+}
+
+func (cache *fakeReviewCache) PRManagerReviewHandled(_ context.Context, key, headSHA string) (bool, error) {
+	return cache.heads[key] == headSHA, nil
+}
+
+func (cache *fakeReviewCache) MarkPRManagerReviewHandled(_ context.Context, key, headSHA string) error {
+	cache.heads[key] = headSHA
+	return nil
+}
+
 func (agentHarness *fakeHarness) Name() string { return "fake" }
 
 func (agentHarness *fakeHarness) Discover(context.Context, []harness.Target) ([]harness.Discovery, error) {
@@ -76,11 +89,13 @@ func TestRequestsAcceptsOnlyConfiguredPRManagerReviewMessages(t *testing.T) {
 	}
 }
 
-func TestDeliverDeduplicatesByCurrentHead(t *testing.T) {
+func TestDeliverDeduplicatesByCurrentHeadAcrossRestart(t *testing.T) {
 	t.Parallel()
 	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, State: "open", URL: "https://github.com/owner/repo/pull/42", Title: "Improve Bifrost", HeadSHA: "first"}}
 	agentHarness := &fakeHarness{}
+	cache := &fakeReviewCache{heads: make(map[string]string)}
 	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
+	manager.reviewCache = cache
 	request := reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42, PullRequestURL: "https://github.com/owner/repo/pull/42"}
 
 	manager.deliver(context.Background(), request, source, agentHarness)
@@ -92,8 +107,15 @@ func TestDeliverDeduplicatesByCurrentHead(t *testing.T) {
 		t.Fatalf("review request = %#v", agentHarness.requests[0])
 	}
 
+	restartedManager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
+	restartedManager.reviewCache = cache
+	restartedManager.deliver(context.Background(), request, source, agentHarness)
+	if len(agentHarness.requests) != 1 {
+		t.Fatalf("dispatches after restart = %d", len(agentHarness.requests))
+	}
+
 	source.pullRequest.HeadSHA = "second"
-	manager.deliver(context.Background(), request, source, agentHarness)
+	restartedManager.deliver(context.Background(), request, source, agentHarness)
 	if len(agentHarness.requests) != 2 {
 		t.Fatalf("dispatches after a new head = %d", len(agentHarness.requests))
 	}
@@ -129,6 +151,7 @@ func TestHandleSocketEventAcknowledgesAndDispatchesTrustedReview(t *testing.T) {
 	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, State: "open", URL: "https://github.com/owner/repo/pull/42", Title: "Improve Bifrost", HeadSHA: "reviewed"}}
 	agentHarness := &fakeHarness{dispatched: make(chan harness.Request, 1)}
 	manager := New(Settings{Conversation: "D123", BotID: "B123"}, []Repository{{Name: "owner/repo", WorkingDirectory: "/repo"}}, time.Minute, log.New(io.Discard, "", 0))
+	manager.reviewCache = &fakeReviewCache{heads: make(map[string]string)}
 	jobs := make(chan reviewRequest, 1)
 	manager.mutex.Lock()
 	manager.running = true
@@ -170,27 +193,12 @@ func TestHandleSocketEventAcknowledgesAndDispatchesTrustedReview(t *testing.T) {
 	}
 }
 
-func TestObserveOpenPullRequestsRemovesClosedReviewCache(t *testing.T) {
-	t.Parallel()
-	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
-	manager.delivered = map[string]string{
-		"owner/repo#42": "open", "owner/repo#43": "closed", "other/repo#42": "other",
-	}
-
-	manager.ObserveOpenPullRequests("owner/repo", []github.PullRequest{{Repository: "owner/repo", Number: 42}})
-	if _, found := manager.delivered["owner/repo#43"]; found {
-		t.Fatalf("closed PR remained in cache: %#v", manager.delivered)
-	}
-	if len(manager.delivered) != 2 || manager.delivered["owner/repo#42"] != "open" || manager.delivered["other/repo#42"] != "other" {
-		t.Fatalf("remaining cache = %#v", manager.delivered)
-	}
-}
-
 func TestDeliverSkipsClosedPullRequest(t *testing.T) {
 	t.Parallel()
 	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, State: "closed"}}
 	agentHarness := &fakeHarness{}
 	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
+	manager.reviewCache = &fakeReviewCache{heads: make(map[string]string)}
 	manager.deliver(context.Background(), reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42}, source, agentHarness)
 	if len(agentHarness.requests) != 0 {
 		t.Fatalf("dispatches for closed pull request = %d", len(agentHarness.requests))
@@ -207,7 +215,7 @@ func TestManagerConnectsWhenSlackTokensConfigured(t *testing.T) {
 	}, nil, time.Minute, log.New(io.Discard, "", 0))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := manager.Start(ctx, &fakeSource{}, &fakeHarness{}); err != nil {
+	if err := manager.Start(ctx, &fakeSource{}, &fakeHarness{}, &fakeReviewCache{heads: make(map[string]string)}); err != nil {
 		t.Fatal(err)
 	}
 	defer manager.Stop()

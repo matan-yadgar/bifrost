@@ -98,13 +98,6 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 		return err
 	}
 	githubClient := githubapi.NewClient(token)
-	if !runOnce && manager != nil {
-		if err := manager.Start(ctx, githubClient, agentHarness); err != nil {
-			logger.Printf("PR Manager listener unavailable: %v", err)
-		}
-		defer manager.Stop()
-	}
-
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {
 		repositories = append(repositories, bridge.Repository{
@@ -112,7 +105,12 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 		})
 	}
 	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, runtimeConfig.MonitorCI, logger)
-	monitor.SetOpenPullRequestsObserver(manager)
+	if !runOnce && manager != nil {
+		if err := manager.Start(ctx, githubClient, agentHarness, monitor); err != nil {
+			logger.Printf("PR Manager listener unavailable: %v", err)
+		}
+		defer manager.Stop()
+	}
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
