@@ -21,7 +21,7 @@ const (
 	maxIgnoredRPCMessages     = 100
 	maxAppServerOutputBytes   = 64 * 1024 * 1024
 	maxAppServerReconnects    = 3
-	bifrostTaskNamePrefix     = "Bifrost: "
+	bifrostTaskNamePrefix     = "bifrost - CR - "
 )
 
 var errAppServerOutputLimit = errors.New("Codex app-server output limit exceeded")
@@ -255,7 +255,7 @@ func (client *appServerClient) discover(target Target) Discovery {
 }
 
 func bifrostTaskName(target Target) string {
-	return fmt.Sprintf("%s%s#%d", bifrostTaskNamePrefix, strings.ToLower(target.Repository), target.PullRequest)
+	return fmt.Sprintf("%s%d", bifrostTaskNamePrefix, target.PullRequest)
 }
 
 func (client *appServerClient) fork(sessionID, taskName string) (string, error) {
