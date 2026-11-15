@@ -24,6 +24,7 @@ func TestLoad(t *testing.T) {
   }],
   "pr_manager": {
     "enabled": true,
+    "auto_reply": true,
     "conversation_id": "D0123",
     "bot_id": "B0123"
   },
@@ -62,7 +63,7 @@ func TestLoad(t *testing.T) {
 	if runtimeConfig.LogDirectory != filepath.Join(directory, "logs") {
 		t.Fatalf("log directory = %q", runtimeConfig.LogDirectory)
 	}
-	if !runtimeConfig.PRManager.Enabled || runtimeConfig.PRManager.Conversation != "D0123" || runtimeConfig.PRManager.BotID != "B0123" || runtimeConfig.PRManager.AppTokenEnv != "BIFROST_SLACK_APP_TOKEN" || runtimeConfig.PRManager.UserTokenEnv != "BIFROST_SLACK_USER_TOKEN" {
+	if !runtimeConfig.PRManager.Enabled || !runtimeConfig.PRManager.AutoReply || runtimeConfig.PRManager.Conversation != "D0123" || runtimeConfig.PRManager.BotID != "B0123" || runtimeConfig.PRManager.AppTokenEnv != "BIFROST_SLACK_APP_TOKEN" || runtimeConfig.PRManager.UserTokenEnv != "BIFROST_SLACK_USER_TOKEN" {
 		t.Fatalf("PR Manager = %#v", runtimeConfig.PRManager)
 	}
 }

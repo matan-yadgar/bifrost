@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -18,12 +19,16 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-const maxPendingReviews = 32
+const (
+	maxPendingReviews      = 32
+	slackConnectionTimeout = 30 * time.Second
+)
 
 var pullRequestURL = regexp.MustCompile(`https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)`)
 
 type Settings struct {
 	Enabled      bool
+	AutoReply    bool
 	AppTokenEnv  string
 	UserTokenEnv string
 	Conversation string
@@ -172,7 +177,7 @@ func (manager *Manager) startLocked() error {
 	manager.running = true
 	manager.connected = false
 	manager.lastError = ""
-	go manager.runWorker(ctx, jobs, manager.source, manager.harness)
+	go manager.runWorker(ctx, jobs, manager.source, manager.harness, manager.reviewCache)
 	go manager.runSocket(ctx, cancel, generation, appToken, userToken)
 	manager.logger.Printf("PR Manager listener started: conversation=%s", manager.settings.Conversation)
 	return nil
@@ -196,7 +201,7 @@ func (manager *Manager) stopLocked() {
 
 func (manager *Manager) runSocket(ctx context.Context, cancel context.CancelFunc, generation uint64, appToken, userToken string) {
 	defer cancel()
-	api := slack.New(userToken, slack.OptionAppLevelToken(appToken))
+	api := slack.New(userToken, slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(&http.Client{Timeout: slackConnectionTimeout}))
 	client := socketmode.New(api, socketmode.OptionReadLimit(1024*1024))
 	go func() {
 		for {
@@ -345,18 +350,18 @@ func (manager *Manager) requests(event message) []reviewRequest {
 	return requests
 }
 
-func (manager *Manager) runWorker(ctx context.Context, jobs <-chan reviewRequest, source Source, agentHarness harness.Harness) {
+func (manager *Manager) runWorker(ctx context.Context, jobs <-chan reviewRequest, source Source, agentHarness harness.Harness, reviewCache ReviewCache) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case request := <-jobs:
-			manager.deliver(ctx, request, source, agentHarness)
+			manager.deliver(ctx, request, source, agentHarness, reviewCache)
 		}
 	}
 }
 
-func (manager *Manager) deliver(ctx context.Context, request reviewRequest, source Source, agentHarness harness.Harness) {
+func (manager *Manager) deliver(ctx context.Context, request reviewRequest, source Source, agentHarness harness.Harness, reviewCache ReviewCache) {
 	pullRequest, err := source.PullRequest(ctx, request.Repository.Name, request.PullRequest)
 	if err != nil {
 		manager.logger.Printf("PR Manager review failed: pr=%s#%d reason=get pull request: %v", request.Repository.Name, request.PullRequest, err)
@@ -367,7 +372,7 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 		return
 	}
 	key := strings.ToLower(pullRequest.Repository) + "#" + strconv.Itoa(pullRequest.Number)
-	handled, err := manager.reviewCache.PRManagerReviewHandled(ctx, key, pullRequest.HeadSHA)
+	handled, err := reviewCache.PRManagerReviewHandled(ctx, key, pullRequest.HeadSHA)
 	if err != nil {
 		manager.logger.Printf("PR Manager review failed: pr=%s reason=read review cache: %v", key, err)
 		return
@@ -382,19 +387,22 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 	manager.logger.Printf("PR Manager review started: pr=%s", key)
 	_, err = agentHarness.Dispatch(dispatchContext, harness.Request{
 		WorkingDirectory: request.Repository.WorkingDirectory,
-		Prompt:           reviewPrompt(request.PullRequestURL),
+		Prompt:           reviewPrompt(request.PullRequestURL, pullRequest.HeadSHA, manager.settings.AutoReply),
 	})
 	if err != nil {
 		manager.logger.Printf("PR Manager review failed: pr=%s reason=%v", key, err)
 		return
 	}
-	if err := manager.reviewCache.MarkPRManagerReviewHandled(ctx, key, pullRequest.HeadSHA); err != nil {
+	if err := reviewCache.MarkPRManagerReviewHandled(ctx, key, pullRequest.HeadSHA); err != nil {
 		manager.logger.Printf("PR Manager review failed: pr=%s reason=save review cache: %v", key, err)
 		return
 	}
 	manager.logger.Printf("PR Manager review task started: pr=%s", key)
 }
 
-func reviewPrompt(pullRequestURL string) string {
-	return fmt.Sprintf("/trigger-code-review %s and paste the comments in the PR", pullRequestURL)
+func reviewPrompt(pullRequestURL, headSHA string, autoReply bool) string {
+	if autoReply {
+		return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s and paste the comments in the PR.", pullRequestURL, headSHA)
+	}
+	return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s. Do not post review comments; present the findings in this Codex task and wait for user approval.", pullRequestURL, headSHA)
 }

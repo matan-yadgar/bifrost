@@ -80,6 +80,7 @@ func TestRequestsAcceptsOnlyConfiguredPRManagerReviewMessages(t *testing.T) {
 	for _, event := range []message{
 		{Conversation: "D123", BotID: "B999", ChannelType: "im", Subtype: "bot_message", Text: "Please review: https://github.com/owner/repo/pull/42"},
 		{Conversation: "D123", BotID: "B123", ChannelType: "channel", Subtype: "bot_message", Text: "Please review: https://github.com/owner/repo/pull/42"},
+		{Conversation: "D123", BotID: "B123", ChannelType: "im", Subtype: "bot_message", Text: "Please review: https://github.com/other/repo/pull/42"},
 		{Conversation: "D123", BotID: "B123", ChannelType: "im", Subtype: "bot_message", Text: "PR manager moved its automatic review follow-up to @danielwolfman."},
 		{Conversation: "D123", BotID: "B123", ChannelType: "im", Subtype: "", Text: "Please review: https://github.com/owner/repo/pull/42"},
 	} {
@@ -98,26 +99,34 @@ func TestDeliverDeduplicatesByCurrentHeadAcrossRestart(t *testing.T) {
 	manager.reviewCache = cache
 	request := reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42, PullRequestURL: "https://github.com/owner/repo/pull/42"}
 
-	manager.deliver(context.Background(), request, source, agentHarness)
-	manager.deliver(context.Background(), request, source, agentHarness)
+	manager.deliver(context.Background(), request, source, agentHarness, cache)
+	manager.deliver(context.Background(), request, source, agentHarness, cache)
 	if len(agentHarness.requests) != 1 {
 		t.Fatalf("dispatches after duplicate notification = %d", len(agentHarness.requests))
 	}
-	if agentHarness.requests[0].WorkingDirectory != "/repo" || agentHarness.requests[0].Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 and paste the comments in the PR" {
+	if agentHarness.requests[0].WorkingDirectory != "/repo" || agentHarness.requests[0].Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit first. Do not post review comments; present the findings in this Codex task and wait for user approval." {
 		t.Fatalf("review request = %#v", agentHarness.requests[0])
 	}
 
 	restartedManager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
 	restartedManager.reviewCache = cache
-	restartedManager.deliver(context.Background(), request, source, agentHarness)
+	restartedManager.deliver(context.Background(), request, source, agentHarness, cache)
 	if len(agentHarness.requests) != 1 {
 		t.Fatalf("dispatches after restart = %d", len(agentHarness.requests))
 	}
 
 	source.pullRequest.HeadSHA = "second"
-	restartedManager.deliver(context.Background(), request, source, agentHarness)
+	restartedManager.deliver(context.Background(), request, source, agentHarness, cache)
 	if len(agentHarness.requests) != 2 {
 		t.Fatalf("dispatches after a new head = %d", len(agentHarness.requests))
+	}
+}
+
+func TestReviewPromptAutoReply(t *testing.T) {
+	t.Parallel()
+	prompt := reviewPrompt("https://github.com/owner/repo/pull/42", "first", true)
+	if prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit first and paste the comments in the PR." {
+		t.Fatalf("auto-reply prompt = %q", prompt)
 	}
 }
 
@@ -157,7 +166,11 @@ func TestHandleSocketEventAcknowledgesAndDispatchesTrustedReview(t *testing.T) {
 	manager.running = true
 	manager.jobs = jobs
 	manager.mutex.Unlock()
-	go manager.runWorker(context, jobs, source, agentHarness)
+	workerCache := manager.reviewCache
+	go manager.runWorker(context, jobs, source, agentHarness, workerCache)
+	manager.mutex.Lock()
+	manager.reviewCache = nil
+	manager.mutex.Unlock()
 	acknowledger := &fakeAcknowledger{}
 
 	manager.handleSocketEvent(context, acknowledger, socketmode.Event{
@@ -169,27 +182,15 @@ func TestHandleSocketEventAcknowledgesAndDispatchesTrustedReview(t *testing.T) {
 	})
 	select {
 	case request := <-agentHarness.dispatched:
-		if request.WorkingDirectory != "/repo" || request.Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 and paste the comments in the PR" {
+		if request.WorkingDirectory != "/repo" || request.Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit reviewed. Do not post review comments; present the findings in this Codex task and wait for user approval." {
 			t.Fatalf("dispatched review = %#v", request)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("trusted Slack review was not dispatched")
 	}
 
-	manager.handleSocketEvent(context, acknowledger, socketmode.Event{
-		Type:    socketmode.EventTypeEventsAPI,
-		Request: &socketmode.Request{EnvelopeID: "unconfigured"},
-		Data: slackevents.EventsAPIEvent{Type: slackevents.CallbackEvent, InnerEvent: slackevents.EventsAPIInnerEvent{Data: &slackevents.MessageEvent{
-			Channel: "D123", BotID: "B123", ChannelType: "im", SubType: "bot_message", Text: "Please review: https://github.com/other/repo/pull/42",
-		}}},
-	})
-	if len(acknowledger.envelopeIDs) != 2 || acknowledger.envelopeIDs[0] != "trusted" || acknowledger.envelopeIDs[1] != "unconfigured" {
+	if len(acknowledger.envelopeIDs) != 1 || acknowledger.envelopeIDs[0] != "trusted" {
 		t.Fatalf("acknowledged events = %#v", acknowledger.envelopeIDs)
-	}
-	select {
-	case request := <-agentHarness.dispatched:
-		t.Fatalf("unconfigured repository dispatched %#v", request)
-	default:
 	}
 }
 
@@ -199,7 +200,7 @@ func TestDeliverSkipsClosedPullRequest(t *testing.T) {
 	agentHarness := &fakeHarness{}
 	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
 	manager.reviewCache = &fakeReviewCache{heads: make(map[string]string)}
-	manager.deliver(context.Background(), reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42}, source, agentHarness)
+	manager.deliver(context.Background(), reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42}, source, agentHarness, manager.reviewCache)
 	if len(agentHarness.requests) != 0 {
 		t.Fatalf("dispatches for closed pull request = %d", len(agentHarness.requests))
 	}

@@ -55,13 +55,14 @@ For a macOS LaunchAgent installation, add `-ui` to `ProgramArguments`, then relo
 
 ## PR Manager Slack input
 
-Optionally, Bifrost can listen to one configured direct message with an existing PR Manager Slack app. It accepts only that app's `bot_message` events whose text starts with `Please review:` and whose PR URL belongs to a configured repository. It starts one new, read-only Codex review task per PR head; repeated notifications for the same head are ignored while Bifrost is running. The task can inspect and report findings, but is explicitly told not to edit, push, or post a GitHub review.
+Optionally, Bifrost can listen to one configured direct message with an existing PR Manager Slack app. It accepts only that app's `bot_message` events whose text starts with `Please review:` and whose PR URL belongs to a configured repository. It starts one Codex review task per PR head and records the handled head in `state.json`, so repeats are ignored across restarts. By default the task reviews a sampled head, reports findings in Codex, and waits for user approval before posting anything. Set `auto_reply` to `true` only when you want the review task to post its comments to the PR automatically.
 
 Create a separate Slack app for Bifrost with Socket Mode enabled. Give its app-level token the `connections:write` scope, authorize it with a user token carrying `im:history`, and subscribe that user installation to the `message.im` event. Keep both tokens outside the JSON configuration, for example in the environment of the Bifrost process:
 
 ```json
 "pr_manager": {
   "enabled": false,
+  "auto_reply": false,
   "app_token_env": "BIFROST_SLACK_APP_TOKEN",
   "user_token_env": "BIFROST_SLACK_USER_TOKEN",
   "conversation_id": "D0123456789",

@@ -71,6 +71,7 @@ func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.M
 	}
 	return prmanager.New(prmanager.Settings{
 		Enabled:      runtimeConfig.PRManager.Enabled,
+		AutoReply:    runtimeConfig.PRManager.AutoReply,
 		AppTokenEnv:  runtimeConfig.PRManager.AppTokenEnv,
 		UserTokenEnv: runtimeConfig.PRManager.UserTokenEnv,
 		Conversation: runtimeConfig.PRManager.Conversation,

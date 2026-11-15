@@ -39,6 +39,7 @@ type Harness struct {
 
 type PRManager struct {
 	Enabled      bool   `json:"enabled,omitempty"`
+	AutoReply    bool   `json:"auto_reply,omitempty"`
 	AppTokenEnv  string `json:"app_token_env,omitempty"`
 	UserTokenEnv string `json:"user_token_env,omitempty"`
 	Conversation string `json:"conversation_id,omitempty"`

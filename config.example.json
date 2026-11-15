@@ -6,6 +6,7 @@
   "log_directory": "logs",
   "pr_manager": {
     "enabled": false,
+    "auto_reply": false,
     "app_token_env": "BIFROST_SLACK_APP_TOKEN",
     "user_token_env": "BIFROST_SLACK_USER_TOKEN",
     "conversation_id": "D0123456789",
