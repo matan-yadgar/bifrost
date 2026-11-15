@@ -1,0 +1,408 @@
+package prmanager
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/matan-yadgar/bifrost/internal/github"
+	"github.com/matan-yadgar/bifrost/internal/harness"
+	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
+	"github.com/slack-go/slack/socketmode"
+)
+
+const (
+	maxPendingReviews      = 32
+	slackConnectionTimeout = 30 * time.Second
+)
+
+var pullRequestURL = regexp.MustCompile(`https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)`)
+
+type Settings struct {
+	Enabled      bool
+	AutoReply    bool
+	AppTokenEnv  string
+	UserTokenEnv string
+	Conversation string
+	BotID        string
+}
+
+type Repository struct {
+	Name             string
+	WorkingDirectory string
+}
+
+type Status struct {
+	Enabled   bool   `json:"enabled"`
+	Running   bool   `json:"running"`
+	Connected bool   `json:"connected"`
+	LastError string `json:"last_error,omitempty"`
+}
+
+type Source interface {
+	PullRequest(context.Context, string, int) (github.PullRequest, error)
+}
+
+type ReviewCache interface {
+	PRManagerReviewHandled(context.Context, string, string) (bool, error)
+	MarkPRManagerReviewHandled(context.Context, string, string) error
+}
+
+type Manager struct {
+	settings        Settings
+	repositories    map[string]Repository
+	dispatchTimeout time.Duration
+	logger          *log.Logger
+
+	mutex       sync.Mutex
+	enabled     bool
+	running     bool
+	connected   bool
+	lastError   string
+	parent      context.Context
+	source      Source
+	harness     harness.Harness
+	reviewCache ReviewCache
+	cancel      context.CancelFunc
+	jobs        chan reviewRequest
+	generation  uint64
+}
+
+type message struct {
+	Conversation string
+	BotID        string
+	ChannelType  string
+	Subtype      string
+	Text         string
+}
+
+type reviewRequest struct {
+	Repository     Repository
+	PullRequest    int
+	PullRequestURL string
+}
+
+func New(settings Settings, repositories []Repository, dispatchTimeout time.Duration, logger *log.Logger) *Manager {
+	configured := make(map[string]Repository, len(repositories))
+	for _, repository := range repositories {
+		configured[strings.ToLower(repository.Name)] = repository
+	}
+	return &Manager{
+		settings: settings, repositories: configured, dispatchTimeout: dispatchTimeout,
+		logger: logger, enabled: settings.Enabled,
+	}
+}
+
+// Start makes the manager available to the local control UI. It only opens a
+// Slack connection when enabled in config or by the UI.
+func (manager *Manager) Start(ctx context.Context, source Source, agentHarness harness.Harness, reviewCache ReviewCache) error {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	manager.parent = ctx
+	manager.source = source
+	manager.harness = agentHarness
+	manager.reviewCache = reviewCache
+	if !manager.enabled {
+		return nil
+	}
+	return manager.startLocked()
+}
+
+func (manager *Manager) Stop() {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	manager.parent = nil
+	manager.source = nil
+	manager.harness = nil
+	manager.stopLocked()
+}
+
+func (manager *Manager) Activate() error {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	manager.enabled = true
+	return manager.startLocked()
+}
+
+func (manager *Manager) Deactivate() {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	manager.enabled = false
+	manager.lastError = ""
+	manager.stopLocked()
+}
+
+func (manager *Manager) Status() Status {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	return Status{Enabled: manager.enabled, Running: manager.running, Connected: manager.connected, LastError: manager.lastError}
+}
+
+func (manager *Manager) startLocked() error {
+	if manager.running {
+		return nil
+	}
+	if manager.parent == nil || manager.source == nil || manager.harness == nil {
+		return manager.failLocked(fmt.Errorf("bifrost must be active before PR Manager can start"))
+	}
+	if manager.reviewCache == nil {
+		return manager.failLocked(fmt.Errorf("pr manager review cache is required"))
+	}
+	if manager.settings.Conversation == "" || manager.settings.BotID == "" {
+		return manager.failLocked(fmt.Errorf("pr_manager.conversation_id and pr_manager.bot_id are required"))
+	}
+	appToken := strings.TrimSpace(os.Getenv(manager.settings.AppTokenEnv))
+	if appToken == "" {
+		return manager.failLocked(fmt.Errorf("%s is required", manager.settings.AppTokenEnv))
+	}
+	userToken := strings.TrimSpace(os.Getenv(manager.settings.UserTokenEnv))
+	if userToken == "" {
+		return manager.failLocked(fmt.Errorf("%s is required", manager.settings.UserTokenEnv))
+	}
+
+	ctx, cancel := context.WithCancel(manager.parent)
+	manager.generation++
+	generation := manager.generation
+	jobs := make(chan reviewRequest, maxPendingReviews)
+	manager.cancel = cancel
+	manager.jobs = jobs
+	manager.running = true
+	manager.connected = false
+	manager.lastError = ""
+	go manager.runWorker(ctx, jobs, manager.source, manager.harness, manager.reviewCache)
+	go manager.runSocket(ctx, cancel, generation, appToken, userToken)
+	manager.logger.Printf("PR Manager listener started: conversation=%s", manager.settings.Conversation)
+	return nil
+}
+
+func (manager *Manager) failLocked(err error) error {
+	manager.lastError = err.Error()
+	return err
+}
+
+func (manager *Manager) stopLocked() {
+	manager.generation++
+	if manager.cancel != nil {
+		manager.cancel()
+	}
+	manager.cancel = nil
+	manager.jobs = nil
+	manager.running = false
+	manager.connected = false
+}
+
+func (manager *Manager) runSocket(ctx context.Context, cancel context.CancelFunc, generation uint64, appToken, userToken string) {
+	defer cancel()
+	api := slack.New(userToken, slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(&http.Client{Timeout: slackConnectionTimeout}))
+	client := socketmode.New(api, socketmode.OptionReadLimit(1024*1024))
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-client.Events:
+				switch event.Type {
+				case socketmode.EventTypeConnecting:
+					manager.setConnecting(generation)
+				case socketmode.EventTypeConnectionError:
+					connectionError, ok := event.Data.(*slack.ConnectionErrorEvent)
+					if ok && connectionError.ErrorObj != nil {
+						manager.setConnectionError(generation, connectionError.ErrorObj)
+					} else {
+						manager.setConnectionError(generation, fmt.Errorf("slack Socket Mode connection failed"))
+					}
+				case socketmode.EventTypeConnected:
+					manager.setConnected(generation)
+				default:
+					manager.handleSocketEvent(ctx, client, event)
+				}
+			}
+		}
+	}()
+	err := client.RunContext(ctx)
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if manager.generation != generation {
+		return
+	}
+	manager.running = false
+	manager.connected = false
+	manager.cancel = nil
+	manager.jobs = nil
+	if ctx.Err() == nil {
+		manager.lastError = err.Error()
+		manager.logger.Printf("PR Manager listener stopped: %v", err)
+		return
+	}
+	manager.logger.Print("PR Manager listener stopped")
+}
+
+func (manager *Manager) setConnected(generation uint64) {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if manager.generation != generation || !manager.running {
+		return
+	}
+	manager.connected = true
+	manager.lastError = ""
+	manager.logger.Print("PR Manager listener connected")
+}
+
+func (manager *Manager) setConnecting(generation uint64) {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if manager.generation != generation || !manager.running {
+		return
+	}
+	manager.connected = false
+}
+
+func (manager *Manager) setConnectionError(generation uint64, err error) {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if manager.generation != generation || !manager.running {
+		return
+	}
+	manager.connected = false
+	manager.lastError = err.Error()
+	manager.logger.Printf("PR Manager Slack connection failed; reconnecting: %v", err)
+}
+
+type acknowledger interface {
+	AckCtx(context.Context, string, any) error
+}
+
+func (manager *Manager) handleSocketEvent(ctx context.Context, client acknowledger, event socketmode.Event) {
+	if event.Type != socketmode.EventTypeEventsAPI || event.Request == nil {
+		return
+	}
+	if err := client.AckCtx(ctx, event.Request.EnvelopeID, nil); err != nil {
+		manager.logger.Printf("acknowledge PR Manager Slack event: %v", err)
+		return
+	}
+	eventsAPIEvent, ok := event.Data.(slackevents.EventsAPIEvent)
+	if !ok || eventsAPIEvent.Type != slackevents.CallbackEvent {
+		return
+	}
+	slackMessage, ok := eventsAPIEvent.InnerEvent.Data.(*slackevents.MessageEvent)
+	if !ok {
+		return
+	}
+	manager.enqueue(message{
+		Conversation: slackMessage.Channel,
+		BotID:        slackMessage.BotID,
+		ChannelType:  slackMessage.ChannelType,
+		Subtype:      slackMessage.SubType,
+		Text:         slackMessage.Text,
+	})
+}
+
+func (manager *Manager) enqueue(event message) {
+	requests := manager.requests(event)
+	if len(requests) == 0 {
+		return
+	}
+	manager.mutex.Lock()
+	jobs := manager.jobs
+	running := manager.running
+	manager.mutex.Unlock()
+	if !running || jobs == nil {
+		return
+	}
+	for _, request := range requests {
+		select {
+		case jobs <- request:
+			manager.logger.Printf("PR Manager review queued: pr=%s#%d", request.Repository.Name, request.PullRequest)
+		default:
+			manager.logger.Printf("PR Manager review ignored: queue is full pr=%s#%d", request.Repository.Name, request.PullRequest)
+		}
+	}
+}
+
+func (manager *Manager) requests(event message) []reviewRequest {
+	if event.Conversation != manager.settings.Conversation || event.BotID != manager.settings.BotID || event.ChannelType != "im" || event.Subtype != "bot_message" || !strings.HasPrefix(strings.TrimSpace(event.Text), "Please review:") {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var requests []reviewRequest
+	for _, match := range pullRequestURL.FindAllStringSubmatch(event.Text, -1) {
+		repositoryName := match[1] + "/" + match[2]
+		repository, found := manager.repositories[strings.ToLower(repositoryName)]
+		if !found {
+			continue
+		}
+		number, _ := strconv.Atoi(match[3])
+		key := strings.ToLower(repository.Name) + "#" + strconv.Itoa(number)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		requests = append(requests, reviewRequest{Repository: repository, PullRequest: number, PullRequestURL: match[0]})
+	}
+	return requests
+}
+
+func (manager *Manager) runWorker(ctx context.Context, jobs <-chan reviewRequest, source Source, agentHarness harness.Harness, reviewCache ReviewCache) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case request := <-jobs:
+			manager.deliver(ctx, request, source, agentHarness, reviewCache)
+		}
+	}
+}
+
+func (manager *Manager) deliver(ctx context.Context, request reviewRequest, source Source, agentHarness harness.Harness, reviewCache ReviewCache) {
+	pullRequest, err := source.PullRequest(ctx, request.Repository.Name, request.PullRequest)
+	if err != nil {
+		manager.logger.Printf("PR Manager review failed: pr=%s#%d reason=get pull request: %v", request.Repository.Name, request.PullRequest, err)
+		return
+	}
+	if pullRequest.State != "open" {
+		manager.logger.Printf("PR Manager review ignored: pr=%s#%d is no longer open", request.Repository.Name, request.PullRequest)
+		return
+	}
+	key := strings.ToLower(pullRequest.Repository) + "#" + strconv.Itoa(pullRequest.Number)
+	handled, err := reviewCache.PRManagerReviewHandled(ctx, key, pullRequest.HeadSHA)
+	if err != nil {
+		manager.logger.Printf("PR Manager review failed: pr=%s reason=read review cache: %v", key, err)
+		return
+	}
+	if handled {
+		manager.logger.Printf("PR Manager review ignored: pr=%s unchanged", key)
+		return
+	}
+
+	dispatchContext, cancel := context.WithTimeout(ctx, manager.dispatchTimeout)
+	defer cancel()
+	manager.logger.Printf("PR Manager review started: pr=%s", key)
+	_, err = agentHarness.Dispatch(dispatchContext, harness.Request{
+		WorkingDirectory: request.Repository.WorkingDirectory,
+		Prompt:           reviewPrompt(request.PullRequestURL, pullRequest.HeadSHA, manager.settings.AutoReply),
+	})
+	if err != nil {
+		manager.logger.Printf("PR Manager review failed: pr=%s reason=%v", key, err)
+		return
+	}
+	if err := reviewCache.MarkPRManagerReviewHandled(ctx, key, pullRequest.HeadSHA); err != nil {
+		manager.logger.Printf("PR Manager review failed: pr=%s reason=save review cache: %v", key, err)
+		return
+	}
+	manager.logger.Printf("PR Manager review task started: pr=%s", key)
+}
+
+func reviewPrompt(pullRequestURL, headSHA string, autoReply bool) string {
+	if autoReply {
+		return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s and paste the comments in the PR.", pullRequestURL, headSHA)
+	}
+	return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s. Do not post review comments; present the findings in this Codex task and wait for user approval.", pullRequestURL, headSHA)
+}

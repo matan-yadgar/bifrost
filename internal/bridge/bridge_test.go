@@ -109,6 +109,51 @@ func newTestMonitor(source Source, agentHarness harness.Harness, repositories []
 	return New(source, agentHarness, repositories, statePath, time.Minute, false, discardLogger())
 }
 
+func TestPRManagerReviewHeadsPersistAndPrune(t *testing.T) {
+	t.Parallel()
+	pullRequest := githubapi.PullRequest{Repository: "owner/repo", Number: 42, State: "open"}
+	source := &fakeSource{pullRequests: []githubapi.PullRequest{pullRequest}}
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	monitor := New(source, &fakeHarness{}, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, statePath, time.Minute, false, discardLogger())
+	if err := monitor.MarkPRManagerReviewHandled(context.Background(), "owner/repo#42", "first"); err != nil {
+		t.Fatal(err)
+	}
+	restartedMonitor := New(source, &fakeHarness{}, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, statePath, time.Minute, false, discardLogger())
+	handled, err := restartedMonitor.PRManagerReviewHandled(context.Background(), "owner/repo#42", "first")
+	if err != nil || !handled {
+		t.Fatalf("handled after restart = %t, err=%v", handled, err)
+	}
+
+	source.pullRequests = []githubapi.PullRequest{}
+	if _, err := restartedMonitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	handled, err = restartedMonitor.PRManagerReviewHandled(context.Background(), "owner/repo#42", "first")
+	if err != nil || handled {
+		t.Fatalf("handled after prune = %t, err=%v", handled, err)
+	}
+}
+
+func TestSaveStatePreservesPRManagerReviewHeads(t *testing.T) {
+	t.Parallel()
+	monitor := New(&fakeSource{}, &fakeHarness{}, nil, filepath.Join(t.TempDir(), "state.json"), time.Minute, false, discardLogger())
+	staleState, err := monitor.readState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.MarkPRManagerReviewHandled(context.Background(), "owner/repo#42", "first"); err != nil {
+		t.Fatal(err)
+	}
+	staleState.QueueCursor = 1
+	if err := monitor.saveState(context.Background(), staleState); err != nil {
+		t.Fatal(err)
+	}
+	state, err := monitor.readState(context.Background())
+	if err != nil || state.PRManagerHeads["owner/repo#42"] != "first" {
+		t.Fatalf("saved state = %#v, err=%v", state.PRManagerHeads, err)
+	}
+}
+
 func discardLogger() *log.Logger {
 	return log.New(io.Discard, "", 0)
 }

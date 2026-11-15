@@ -89,6 +89,7 @@ type Client struct {
 type PullRequest struct {
 	Repository string
 	Number     int
+	State      string
 	Title      string
 	Body       string
 	URL        string
@@ -218,6 +219,7 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string) (
 			pullRequests = append(pullRequests, PullRequest{
 				Repository: repository,
 				Number:     pullRequest.Number,
+				State:      "open",
 				Title:      pullRequest.Title,
 				Body:       pullRequest.Body,
 				URL:        pullRequest.HTMLURL,
@@ -230,6 +232,42 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string) (
 			return pullRequests, nil
 		}
 	}
+}
+
+func (client *Client) PullRequest(ctx context.Context, repository string, number int) (PullRequest, error) {
+	owner, name, ok := strings.Cut(repository, "/")
+	if !ok || number <= 0 {
+		return PullRequest{}, fmt.Errorf("invalid pull request %s#%d", repository, number)
+	}
+	var response struct {
+		Number  int    `json:"number"`
+		State   string `json:"state"`
+		Title   string `json:"title"`
+		Body    string `json:"body"`
+		HTMLURL string `json:"html_url"`
+		User    struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Head struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", client.restBaseURL, url.PathEscape(owner), url.PathEscape(name), number)
+	if err := client.get(ctx, endpoint, &response); err != nil {
+		return PullRequest{}, err
+	}
+	return PullRequest{
+		Repository: repository,
+		Number:     response.Number,
+		State:      response.State,
+		Title:      response.Title,
+		Body:       response.Body,
+		URL:        response.HTMLURL,
+		HeadRef:    response.Head.Ref,
+		HeadSHA:    response.Head.SHA,
+		Author:     response.User.Login,
+	}, nil
 }
 
 func (client *Client) ReviewThreads(ctx context.Context, pullRequest PullRequest) ([]ReviewThread, error) {

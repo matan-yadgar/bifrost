@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/matan-yadgar/bifrost/internal/harness"
 	"github.com/matan-yadgar/bifrost/internal/instance"
 	"github.com/matan-yadgar/bifrost/internal/logfile"
+	"github.com/matan-yadgar/bifrost/internal/prmanager"
 )
 
 func main() {
@@ -58,11 +61,26 @@ func runDaemon(ctx context.Context, configPath string, runOnce bool, terminal io
 			_, _ = fmt.Fprintf(terminal, "close log file: %v\n", err)
 		}
 	}()
-	return runPoller(ctx, runtimeConfig, runOnce, logger)
+	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger))
 }
 
-func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger) error {
-	environment := githubapi.WithoutAuthTokens(os.Environ())
+func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.Manager {
+	repositories := make([]prmanager.Repository, 0, len(runtimeConfig.Repositories))
+	for _, repository := range runtimeConfig.Repositories {
+		repositories = append(repositories, prmanager.Repository{Name: repository.Name, WorkingDirectory: repository.WorkingDirectory})
+	}
+	return prmanager.New(prmanager.Settings{
+		Enabled:      runtimeConfig.PRManager.Enabled,
+		AutoReply:    runtimeConfig.PRManager.AutoReply,
+		AppTokenEnv:  runtimeConfig.PRManager.AppTokenEnv,
+		UserTokenEnv: runtimeConfig.PRManager.UserTokenEnv,
+		Conversation: runtimeConfig.PRManager.Conversation,
+		BotID:        runtimeConfig.PRManager.BotID,
+	}, repositories, runtimeConfig.DispatchTimeout, logger)
+}
+
+func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager) error {
+	environment := withoutPRManagerTokens(githubapi.WithoutAuthTokens(os.Environ()), runtimeConfig.PRManager)
 	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
 	if err != nil {
 		return err
@@ -81,7 +99,6 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 		return err
 	}
 	githubClient := githubapi.NewClient(token)
-
 	repositories := make([]bridge.Repository, 0, len(runtimeConfig.Repositories))
 	for _, repository := range runtimeConfig.Repositories {
 		repositories = append(repositories, bridge.Repository{
@@ -89,6 +106,12 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 		})
 	}
 	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, runtimeConfig.MonitorCI, logger)
+	if !runOnce && manager != nil {
+		if err := manager.Start(ctx, githubClient, agentHarness, monitor); err != nil {
+			logger.Printf("PR Manager listener unavailable: %v", err)
+		}
+		defer manager.Stop()
+	}
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
@@ -124,6 +147,18 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 			}
 		}
 	}
+}
+
+func withoutPRManagerTokens(environment []string, settings config.PRManager) []string {
+	tokenNames := []string{settings.AppTokenEnv, settings.UserTokenEnv}
+	filtered := make([]string, 0, len(environment))
+	for _, value := range environment {
+		name, _, _ := strings.Cut(value, "=")
+		if !slices.Contains(tokenNames, name) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 func newPersistentLogger(directory string, terminal io.Writer) (*log.Logger, io.WriteCloser, error) {

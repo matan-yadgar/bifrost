@@ -54,6 +54,7 @@ func (monitor *Monitor) saveState(ctx context.Context, state *stateFile) (err er
 			}
 		}
 	}
+	state.PRManagerHeads = latest.PRManagerHeads
 	return saveJSON(monitor.stateFile, state)
 }
 
