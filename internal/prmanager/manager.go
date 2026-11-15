@@ -268,7 +268,7 @@ func (manager *Manager) pollSucceeded() {
 }
 
 func (manager *Manager) requests(event message, settings Settings) []reviewRequest {
-	if event.Conversation != settings.Conversation || event.BotID != settings.BotID || event.Subtype != "bot_message" || !strings.HasPrefix(strings.TrimSpace(event.Text), "Please review:") {
+	if event.Conversation != settings.Conversation || event.BotID != settings.BotID || (event.Subtype != "" && event.Subtype != "bot_message") || !strings.HasPrefix(strings.TrimSpace(event.Text), "Please review:") {
 		return nil
 	}
 	seen := make(map[string]bool)

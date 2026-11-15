@@ -107,11 +107,18 @@ func TestRequestsAcceptsOnlyConfiguredPRManagerReviewMessages(t *testing.T) {
 	if len(accepted) != 1 || accepted[0].Repository.Name != "Owner/Repo" || accepted[0].PullRequest != 42 {
 		t.Fatalf("accepted requests = %#v", accepted)
 	}
+	accepted = manager.requests(message{
+		Conversation: "D123", BotID: "B123",
+		Text: "Please review: https://github.com/owner/repo/pull/42",
+	}, manager.settings)
+	if len(accepted) != 1 {
+		t.Fatalf("empty-subtype requests = %#v", accepted)
+	}
 	for _, event := range []message{
 		{Conversation: "D123", BotID: "B999", Subtype: "bot_message", Text: "Please review: https://github.com/owner/repo/pull/42"},
 		{Conversation: "D123", BotID: "B123", Subtype: "bot_message", Text: "Please review: https://github.com/other/repo/pull/42"},
 		{Conversation: "D123", BotID: "B123", Subtype: "bot_message", Text: "PR manager moved its automatic review follow-up to @danielwolfman."},
-		{Conversation: "D123", BotID: "B123", Text: "Please review: https://github.com/owner/repo/pull/42"},
+		{Conversation: "D123", BotID: "B123", Subtype: "message_changed", Text: "Please review: https://github.com/owner/repo/pull/42"},
 	} {
 		if requests := manager.requests(event, manager.settings); len(requests) != 0 {
 			t.Fatalf("untrusted event produced %#v", requests)
