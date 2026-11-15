@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -61,7 +62,9 @@ func runDaemon(ctx context.Context, configPath string, runOnce bool, terminal io
 			_, _ = fmt.Fprintf(terminal, "close log file: %v\n", err)
 		}
 	}()
-	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger))
+	reviewFollowUps := &atomic.Bool{}
+	reviewFollowUps.Store(true)
+	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger), reviewFollowUps)
 }
 
 func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.Manager {
@@ -79,7 +82,7 @@ func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.M
 	}, repositories, runtimeConfig.DispatchTimeout, logger)
 }
 
-func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager) error {
+func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager, reviewFollowUps *atomic.Bool) error {
 	environment := withoutPRManagerTokens(githubapi.WithoutAuthTokens(os.Environ()), runtimeConfig.PRManager)
 	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
 	if err != nil {
@@ -115,7 +118,13 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
-		result, err := monitor.RunOnce(ctx)
+		var result bridge.CycleResult
+		var err error
+		if reviewFollowUps.Load() {
+			result, err = monitor.RunOnce(ctx)
+		} else {
+			result, err = monitor.RunOnceWithoutReviewFollowUps(ctx)
+		}
 		logger.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
 		return result, err
 	}

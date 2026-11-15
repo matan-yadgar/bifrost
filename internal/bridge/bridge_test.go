@@ -28,6 +28,7 @@ type fakeSource struct {
 	threads              []githubapi.ReviewThread
 	threadsByPullRequest map[int][]githubapi.ReviewThread
 	threadErrors         map[int]error
+	reviewThreadCalls    int
 	openError            error
 	openErrorsByRepo     map[string]error
 }
@@ -53,6 +54,7 @@ func (source *fakeSource) FailedChecks(context.Context, githubapi.PullRequest) (
 }
 
 func (source *fakeSource) ReviewThreads(_ context.Context, pullRequest githubapi.PullRequest) ([]githubapi.ReviewThread, error) {
+	source.reviewThreadCalls++
 	if err := source.threadErrors[pullRequest.Number]; err != nil {
 		return nil, err
 	}
@@ -60,6 +62,24 @@ func (source *fakeSource) ReviewThreads(_ context.Context, pullRequest githubapi
 		return source.threadsByPullRequest[pullRequest.Number], nil
 	}
 	return source.threads, nil
+}
+
+func TestMonitorSkipsReviewFollowUpsWhenDisabled(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	source := reviewSource()
+	agentHarness := &fakeHarness{}
+	monitor := newTestMonitor(source, agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, filepath.Join(directory, "state.json"), nil)
+
+	result, err := monitor.RunOnceWithoutReviewFollowUps(context.Background())
+	if err != nil || result.Threads != 0 || result.Dispatches != 0 || source.reviewThreadCalls != 0 || len(agentHarness.requests) != 0 {
+		t.Fatalf("disabled result = %#v err=%v review_calls=%d dispatches=%d", result, err, source.reviewThreadCalls, len(agentHarness.requests))
+	}
+
+	result, err = monitor.RunOnce(context.Background())
+	if err != nil || result.Dispatches != 1 || source.reviewThreadCalls != 1 || len(agentHarness.requests) != 1 {
+		t.Fatalf("enabled result = %#v err=%v review_calls=%d dispatches=%d", result, err, source.reviewThreadCalls, len(agentHarness.requests))
+	}
 }
 
 type fakeHarness struct {
