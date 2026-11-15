@@ -6,4 +6,4 @@ CI state lives in the same versioned state file. Forks may update only their exi
 
 Review versions are marked delivered after acknowledged dispatch. CI attempt identities are marked reported only after acknowledged dispatch, and only for checks actually included in the prompt. Suppress reported attempts on the same head; new heads clear reported identities and pauses expire after ten minutes. Prune closed/merged PR state only after a complete successful repository scan.
 
-PR Manager's handled review heads live in the same state file under `pr_manager_heads`. Bridge alone reads, writes, and prunes this map through the state transaction lock; PR Manager receives Bridge as a narrow review-cache dependency and never writes the state file itself.
+PR Manager's handled review heads and Slack history cursor live in the same state file under `pr_manager_heads` and `pr_manager_cursor`. Bridge alone reads, writes, and prunes this state through the state transaction lock; PR Manager receives Bridge as a narrow review-cache dependency and never writes the state file itself.

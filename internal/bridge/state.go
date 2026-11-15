@@ -55,6 +55,7 @@ func (monitor *Monitor) saveState(ctx context.Context, state *stateFile) (err er
 		}
 	}
 	state.PRManagerHeads = latest.PRManagerHeads
+	state.PRManagerCursor = latest.PRManagerCursor
 	return saveJSON(monitor.stateFile, state)
 }
 

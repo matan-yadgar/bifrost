@@ -49,28 +49,27 @@ Run Bifrost with `-ui` to serve its local control page at [http://127.0.0.1:7420
 bifrost -config ~/.config/bifrost/config.json -ui
 ```
 
-The poller starts active, as it does in normal mode. The page can deactivate and reactivate polling without stopping the control page, shows the source JSON configuration read-only, and streams Bifrost's current-process log lines in real time. It listens only on the local machine and requires a per-start control token for activate/deactivate requests. Restart Bifrost after changing the configuration; the page does not edit or reload it.
+The poller starts active, as it does in normal mode. The page can deactivate and reactivate polling without stopping the control page, persists the PR Manager auto-reply switch, shows the source JSON configuration, and streams Bifrost's current-process log lines in real time. It listens only on the local machine and requires a per-start control token for activate/deactivate requests. Restart Bifrost after changing any other configuration.
 
 For a macOS LaunchAgent installation, add `-ui` to `ProgramArguments`, then reload or kickstart that same LaunchAgent. The control page stays available while polling is inactive.
 
 ## PR Manager Slack input
 
-Optionally, Bifrost can listen to one configured direct message with an existing PR Manager Slack app. It accepts only that app's `bot_message` events whose text starts with `Please review:` and whose PR URL belongs to a configured repository. It starts one Codex review task per PR head and records the handled head in `state.json`, so repeats are ignored across restarts. By default the task reviews a sampled head, reports findings in Codex, and waits for user approval before posting anything. Set `auto_reply` to `true` only when you want the review task to post its comments to the PR automatically.
+Optionally, Bifrost polls one configured direct message with the existing PR Manager Slack app during its normal polling cycle (five minutes by default). It accepts only that app's `bot_message` messages whose text starts with `Please review:` and whose PR URL belongs to a configured repository. On its first poll Bifrost establishes a history baseline, then handles only newer messages. It starts one Codex review task per PR head and records both the handled head and Slack cursor in `state.json`, so repeats are ignored across restarts. By default the task reviews a sampled head, reports findings in Codex, and waits for user approval before posting anything. Set `auto_reply` to `true` only when you want the review task to post its comments to the PR automatically.
 
-Create a separate Slack app for Bifrost with Socket Mode enabled. Give its app-level token the `connections:write` scope, authorize it with a user token carrying `im:history`, and subscribe that user installation to the `message.im` event. Keep both tokens outside the JSON configuration, for example in the environment of the Bifrost process:
+Give the Slack user token used by Bifrost the `im:history` scope. Keep it outside the JSON configuration, for example in the environment of the Bifrost process. Socket Mode, an app-level token, and event subscriptions are not needed:
 
 ```json
 "pr_manager": {
   "enabled": false,
   "auto_reply": false,
-  "app_token_env": "BIFROST_SLACK_APP_TOKEN",
   "user_token_env": "BIFROST_SLACK_USER_TOKEN",
   "conversation_id": "D0123456789",
   "bot_id": "B0123456789"
 }
 ```
 
-Use the direct-message conversation ID and the PR Manager bot ID, not its display name. The local control UI exposes an independent PR Manager enable/disable button. The switch affects the running Bifrost process only; changing `pr_manager` configuration still requires a restart. Because `im:history` lets the Slack app receive direct-message activity visible to the authorizing user, restrict the configuration to the one PR Manager conversation and bot ID above.
+Use the direct-message conversation ID and the PR Manager bot ID, not its display name. The local control UI exposes an independent PR Manager enable/disable button. The switch affects the running Bifrost process only; changing `pr_manager` configuration still requires a restart. Because `im:history` lets the Slack token read direct-message activity visible to the authorizing user, restrict the configuration to the one PR Manager conversation and bot ID above.
 
 `GH_TOKEN` or `GITHUB_TOKEN` takes precedence over `gh auth token`. Relative state and working-directory paths are resolved from the config directory; `~/...` is also supported. Set `dispatch_timeout` to another positive [Go duration](https://pkg.go.dev/time#ParseDuration) when a task legitimately needs longer than the default `30m`.
 

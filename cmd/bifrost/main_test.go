@@ -51,9 +51,9 @@ func TestNewPersistentLoggerMirrorsOutput(t *testing.T) {
 func TestWithoutPRManagerTokens(t *testing.T) {
 	t.Parallel()
 	environment := withoutPRManagerTokens([]string{
-		"BIFROST_SLACK_APP_TOKEN=removed", "BIFROST_SLACK_USER_TOKEN=removed", "KEEP=present",
-	}, config.PRManager{AppTokenEnv: "BIFROST_SLACK_APP_TOKEN", UserTokenEnv: "BIFROST_SLACK_USER_TOKEN"})
-	if len(environment) != 1 || environment[0] != "KEEP=present" {
+		"BIFROST_SLACK_APP_TOKEN=keep", "BIFROST_SLACK_USER_TOKEN=removed", "KEEP=present",
+	}, config.PRManager{UserTokenEnv: "BIFROST_SLACK_USER_TOKEN"})
+	if len(environment) != 2 || environment[0] != "BIFROST_SLACK_APP_TOKEN=keep" || environment[1] != "KEEP=present" {
 		t.Fatalf("environment = %#v", environment)
 	}
 }

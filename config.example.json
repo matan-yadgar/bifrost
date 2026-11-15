@@ -7,7 +7,6 @@
   "pr_manager": {
     "enabled": false,
     "auto_reply": false,
-    "app_token_env": "BIFROST_SLACK_APP_TOKEN",
     "user_token_env": "BIFROST_SLACK_USER_TOKEN",
     "conversation_id": "D0123456789",
     "bot_id": "B0123456789"

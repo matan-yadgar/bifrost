@@ -9,7 +9,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -72,7 +71,6 @@ func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.M
 	return prmanager.New(prmanager.Settings{
 		Enabled:      runtimeConfig.PRManager.Enabled,
 		AutoReply:    runtimeConfig.PRManager.AutoReply,
-		AppTokenEnv:  runtimeConfig.PRManager.AppTokenEnv,
 		UserTokenEnv: runtimeConfig.PRManager.UserTokenEnv,
 		Conversation: runtimeConfig.PRManager.Conversation,
 		BotID:        runtimeConfig.PRManager.BotID,
@@ -116,6 +114,9 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()
 		result, err := monitor.RunOnce(ctx)
+		if !runOnce && manager != nil {
+			err = errors.Join(err, manager.Poll(ctx))
+		}
 		logger.Printf("poll completed: prs=%d threads=%d dispatches=%d deferred_prs=%d deferred_threads=%d duration=%s", result.PullRequests, result.Threads, result.Dispatches, result.Deferred, result.DeferredThreads, time.Since(started).Round(time.Millisecond))
 		return result, err
 	}
@@ -150,11 +151,10 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 }
 
 func withoutPRManagerTokens(environment []string, settings config.PRManager) []string {
-	tokenNames := []string{settings.AppTokenEnv, settings.UserTokenEnv}
 	filtered := make([]string, 0, len(environment))
 	for _, value := range environment {
 		name, _, _ := strings.Cut(value, "=")
-		if !slices.Contains(tokenNames, name) {
+		if name != settings.UserTokenEnv {
 			filtered = append(filtered, value)
 		}
 	}
