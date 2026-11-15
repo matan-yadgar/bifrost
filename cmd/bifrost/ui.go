@@ -15,6 +15,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/matan-yadgar/bifrost/internal/bridge"
 	"github.com/matan-yadgar/bifrost/internal/config"
 	"github.com/matan-yadgar/bifrost/internal/prmanager"
 )
@@ -31,6 +32,9 @@ type controlUI struct {
 	activatePRManager     func() error
 	deactivatePRManager   func()
 	setPRManagerAutoReply func(bool)
+	reviewCommentsEnabled func() bool
+	setReviewComments     func(bool)
+	restart               func()
 
 	mutex     sync.Mutex
 	active    bool
@@ -41,10 +45,51 @@ type controlUI struct {
 }
 
 type controlUIStatus struct {
-	Active    bool             `json:"active"`
-	Stopping  bool             `json:"stopping"`
-	LastError string           `json:"last_error,omitempty"`
-	PRManager prmanager.Status `json:"pr_manager"`
+	Active                bool             `json:"active"`
+	Stopping              bool             `json:"stopping"`
+	LastError             string           `json:"last_error,omitempty"`
+	PRManager             prmanager.Status `json:"pr_manager"`
+	ReviewCommentsEnabled bool             `json:"review_comments_enabled"`
+}
+
+type reviewCommentsControl struct {
+	mutex   sync.Mutex
+	enabled bool
+	monitor *bridge.Monitor
+}
+
+func newReviewCommentsControl() *reviewCommentsControl {
+	return &reviewCommentsControl{enabled: true}
+}
+
+func (control *reviewCommentsControl) Enabled() bool {
+	control.mutex.Lock()
+	defer control.mutex.Unlock()
+	return control.enabled
+}
+
+func (control *reviewCommentsControl) SetEnabled(enabled bool) {
+	control.mutex.Lock()
+	defer control.mutex.Unlock()
+	control.enabled = enabled
+	if control.monitor != nil {
+		control.monitor.SetReviewCommentsEnabled(enabled)
+	}
+}
+
+func (control *reviewCommentsControl) attach(monitor *bridge.Monitor) {
+	control.mutex.Lock()
+	defer control.mutex.Unlock()
+	control.monitor = monitor
+	monitor.SetReviewCommentsEnabled(control.enabled)
+}
+
+func (control *reviewCommentsControl) detach(monitor *bridge.Monitor) {
+	control.mutex.Lock()
+	defer control.mutex.Unlock()
+	if control.monitor == monitor {
+		control.monitor = nil
+	}
 }
 
 type liveLogs struct {
@@ -112,6 +157,8 @@ func runUI(ctx context.Context, configPath string, terminal io.Writer) error {
 		return err
 	}
 	manager := newPRManager(runtimeConfig, logger)
+	reviewComments := newReviewCommentsControl()
+	restartRequests := make(chan struct{}, 1)
 	ui := &controlUI{
 		configPath:            configPath,
 		logger:                logger,
@@ -121,8 +168,16 @@ func runUI(ctx context.Context, configPath string, terminal io.Writer) error {
 		activatePRManager:     manager.Activate,
 		deactivatePRManager:   manager.Deactivate,
 		setPRManagerAutoReply: manager.SetAutoReply,
+		reviewCommentsEnabled: reviewComments.Enabled,
+		setReviewComments:     reviewComments.SetEnabled,
+		restart: func() {
+			select {
+			case restartRequests <- struct{}{}:
+			default:
+			}
+		},
 		run: func(runContext context.Context) error {
-			return runPoller(runContext, runtimeConfig, false, logger, manager)
+			return runPoller(runContext, runtimeConfig, false, logger, manager, reviewComments)
 		},
 	}
 	listener, err := net.Listen("tcp", controlUIAddress)
@@ -141,6 +196,14 @@ func runUI(ctx context.Context, configPath string, terminal io.Writer) error {
 		ui.deactivate()
 		<-ui.finished()
 		return server.Shutdown(context.Background())
+	case <-restartRequests:
+		logger.Print("bifrost restart requested")
+		ui.deactivate()
+		<-ui.finished()
+		if err := server.Shutdown(context.Background()); err != nil {
+			return err
+		}
+		return errRestartRequested
 	case err := <-serverErrors:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
@@ -214,6 +277,7 @@ func (ui *controlUI) status() controlUIStatus {
 	defer ui.mutex.Unlock()
 	status := controlUIStatus{Active: ui.active, Stopping: ui.stopping, LastError: ui.lastError}
 	status.PRManager = ui.prManagerStatus()
+	status.ReviewCommentsEnabled = ui.reviewCommentsEnabled()
 	return status
 }
 
@@ -226,8 +290,11 @@ func (ui *controlUI) handler() http.Handler {
 	mux.HandleFunc("GET /api/logs/stream", ui.handleLogStream)
 	mux.HandleFunc("POST /api/activate", ui.handleActivate)
 	mux.HandleFunc("POST /api/deactivate", ui.handleDeactivate)
+	mux.HandleFunc("POST /api/restart", ui.handleRestart)
 	mux.HandleFunc("POST /api/pr-manager/activate", ui.handlePRManagerActivate)
 	mux.HandleFunc("POST /api/pr-manager/deactivate", ui.handlePRManagerDeactivate)
+	mux.HandleFunc("POST /api/review-comments/activate", ui.handleReviewCommentsActivate)
+	mux.HandleFunc("POST /api/review-comments/deactivate", ui.handleReviewCommentsDeactivate)
 	mux.HandleFunc("POST /api/config/pr-manager/auto-reply", ui.handlePRManagerAutoReply)
 	return mux
 }
@@ -295,6 +362,14 @@ func (ui *controlUI) handleDeactivate(writer http.ResponseWriter, request *http.
 	writeJSON(writer, ui.status())
 }
 
+func (ui *controlUI) handleRestart(writer http.ResponseWriter, request *http.Request) {
+	if !ui.authorized(writer, request) {
+		return
+	}
+	writeJSON(writer, ui.status())
+	ui.restart()
+}
+
 func (ui *controlUI) handlePRManagerActivate(writer http.ResponseWriter, request *http.Request) {
 	if !ui.authorized(writer, request) {
 		return
@@ -316,6 +391,22 @@ func (ui *controlUI) handlePRManagerDeactivate(writer http.ResponseWriter, reque
 		return
 	}
 	ui.deactivatePRManager()
+	writeJSON(writer, ui.status())
+}
+
+func (ui *controlUI) handleReviewCommentsActivate(writer http.ResponseWriter, request *http.Request) {
+	if !ui.authorized(writer, request) {
+		return
+	}
+	ui.setReviewComments(true)
+	writeJSON(writer, ui.status())
+}
+
+func (ui *controlUI) handleReviewCommentsDeactivate(writer http.ResponseWriter, request *http.Request) {
+	if !ui.authorized(writer, request) {
+		return
+	}
+	ui.setReviewComments(false)
 	writeJSON(writer, ui.status())
 }
 
@@ -365,7 +456,7 @@ func writeJSON(writer http.ResponseWriter, value any) {
 const controlUIPage = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bifrost</title><style>
-body{background:#10131a;color:#e8edf5;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1000px;margin:40px auto;padding:0 20px}h1{margin-bottom:6px}.muted{color:#a7b0bf}button{border:0;border-radius:6px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;margin-right:8px}#activate{background:#2fbd78;color:#062515}#deactivate{background:#e36363;color:#310606}pre{overflow:auto;background:#181d27;border:1px solid #2a3240;border-radius:8px;padding:14px;white-space:pre-wrap;word-break:break-word}#status{font-weight:700}#error{color:#ff9b9b}.section{margin-top:30px}</style></head>
-<body><h1>Bifrost</h1><div class="muted">%s</div><p>Status: <span id="status">Loading…</span> <span id="error"></span></p><p><button id="activate">Activate</button><button id="deactivate">Deactivate</button></p><p>PR Manager: <span id="pr-manager-status">Loading…</span> <span id="pr-manager-error"></span></p><p><button id="pr-manager-activate">Enable PR Manager</button><button id="pr-manager-deactivate">Disable PR Manager</button></p><p><label><input id="pr-manager-auto-reply" type="checkbox"> Post PR Manager review comments automatically</label><br><span class="muted">Off keeps the review task waiting for your approval.</span></p>
-<div class="section"><h2>Live activity</h2><pre id="logs"></pre></div><div class="section"><h2>Config</h2><pre id="config">Loading…</pre></div>
-<script>const token=%q,logs=document.querySelector('#logs'),autoReply=document.querySelector('#pr-manager-auto-reply');function append(line){logs.textContent+=line;logs.scrollTop=logs.scrollHeight}async function state(){let s=await fetch('/api/status').then(r=>r.json()),text=s.stopping?'Stopping…':s.active?'Active':'Inactive',pm=s.pr_manager;document.querySelector('#status').textContent=text;document.querySelector('#error').textContent=s.last_error?' — '+s.last_error:'';document.querySelector('#activate').disabled=s.active||s.stopping;document.querySelector('#deactivate').disabled=!s.active||s.stopping;document.querySelector('#pr-manager-status').textContent=pm.last_error?'Error':pm.running?'Polling':pm.enabled?'Waiting':'Inactive';document.querySelector('#pr-manager-error').textContent=pm.last_error?' — '+pm.last_error:'';document.querySelector('#pr-manager-activate').disabled=!s.active||s.stopping||pm.running;document.querySelector('#pr-manager-deactivate').disabled=!pm.enabled}async function loadConfig(){let v=await fetch('/api/config').then(r=>r.json());document.querySelector('#config').textContent=JSON.stringify(v,null,2);autoReply.checked=!!(v.pr_manager&&v.pr_manager.auto_reply)}async function action(path){await fetch(path,{method:'POST',headers:{'X-Bifrost-Token':token}});state()}async function updateAutoReply(){let r=await fetch('/api/config/pr-manager/auto-reply',{method:'POST',headers:{'X-Bifrost-Token':token,'Content-Type':'application/json'},body:JSON.stringify({auto_reply:autoReply.checked})});if(!r.ok){await loadConfig();return}await loadConfig()}fetch('/api/logs').then(r=>r.json()).then(v=>v.lines.forEach(append));loadConfig();new EventSource('/api/logs/stream').onmessage=e=>append(JSON.parse(e.data));document.querySelector('#activate').onclick=()=>action('/api/activate');document.querySelector('#deactivate').onclick=()=>action('/api/deactivate');document.querySelector('#pr-manager-activate').onclick=()=>action('/api/pr-manager/activate');document.querySelector('#pr-manager-deactivate').onclick=()=>action('/api/pr-manager/deactivate');autoReply.onchange=updateAutoReply;state();setInterval(state,1000)</script></body></html>`
+body{background:#10131a;color:#e8edf5;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1000px;margin:40px auto;padding:0 20px}h1{margin-bottom:6px}.muted{color:#a7b0bf}button{border:0;border-radius:6px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;margin-right:8px}#activate{background:#2fbd78;color:#062515}#deactivate{background:#e36363;color:#310606}#restart{background:#e5ad4c;color:#332000}pre{overflow:auto;background:#181d27;border:1px solid #2a3240;border-radius:8px;padding:14px;white-space:pre-wrap;word-break:break-word}#status{font-weight:700}#error{color:#ff9b9b}.section{margin-top:30px}.section summary{cursor:pointer;font-size:1.25em;font-weight:700}</style></head>
+<body><h1>Bifrost</h1><div class="muted">%s</div><p>Status: <span id="status">Loading…</span> <span id="error"></span></p><p><button id="activate">Activate</button><button id="deactivate">Deactivate</button><button id="restart">Restart Bifrost</button></p><p>Review-comment follow-ups: <span id="review-comments-status">Loading…</span></p><p><button id="review-comments-activate">Enable review comments</button><button id="review-comments-deactivate">Disable review comments</button></p><p>PR Manager: <span id="pr-manager-status">Loading…</span> <span id="pr-manager-error"></span></p><p><button id="pr-manager-activate">Enable PR Manager</button><button id="pr-manager-deactivate">Disable PR Manager</button></p><p><label><input id="pr-manager-auto-reply" type="checkbox"> Post PR Manager review comments automatically</label><br><span class="muted">Off keeps the review task waiting for your approval.</span></p>
+<details class="section" open><summary>Live activity</summary><pre id="logs"></pre></details><details class="section" open><summary>Config</summary><pre id="config">Loading…</pre></details>
+<script>const token=%q,logs=document.querySelector('#logs'),autoReply=document.querySelector('#pr-manager-auto-reply');function append(line){logs.textContent+=line;logs.scrollTop=logs.scrollHeight}async function state(){let s=await fetch('/api/status').then(r=>r.json()),text=s.stopping?'Stopping…':s.active?'Active':'Inactive',pm=s.pr_manager,review=s.review_comments_enabled;document.querySelector('#status').textContent=text;document.querySelector('#error').textContent=s.last_error?' — '+s.last_error:'';document.querySelector('#activate').disabled=s.active||s.stopping;document.querySelector('#deactivate').disabled=!s.active||s.stopping;document.querySelector('#restart').disabled=s.stopping;document.querySelector('#review-comments-status').textContent=review?'Active':'Inactive';document.querySelector('#review-comments-activate').disabled=review;document.querySelector('#review-comments-deactivate').disabled=!review;document.querySelector('#pr-manager-status').textContent=pm.last_error?'Error':pm.running?'Polling':pm.enabled?'Waiting':'Inactive';document.querySelector('#pr-manager-error').textContent=pm.last_error?' — '+pm.last_error:'';document.querySelector('#pr-manager-activate').disabled=!s.active||s.stopping||pm.running;document.querySelector('#pr-manager-deactivate').disabled=!pm.enabled}async function loadConfig(){let v=await fetch('/api/config').then(r=>r.json());document.querySelector('#config').textContent=JSON.stringify(v,null,2);autoReply.checked=!!(v.pr_manager&&v.pr_manager.auto_reply)}async function action(path){await fetch(path,{method:'POST',headers:{'X-Bifrost-Token':token}});state()}async function updateAutoReply(){let r=await fetch('/api/config/pr-manager/auto-reply',{method:'POST',headers:{'X-Bifrost-Token':token,'Content-Type':'application/json'},body:JSON.stringify({auto_reply:autoReply.checked})});if(!r.ok){await loadConfig();return}await loadConfig()}fetch('/api/logs').then(r=>r.json()).then(v=>v.lines.forEach(append));loadConfig();new EventSource('/api/logs/stream').onmessage=e=>append(JSON.parse(e.data));document.querySelector('#activate').onclick=()=>action('/api/activate');document.querySelector('#deactivate').onclick=()=>action('/api/deactivate');document.querySelector('#restart').onclick=()=>action('/api/restart');document.querySelector('#review-comments-activate').onclick=()=>action('/api/review-comments/activate');document.querySelector('#review-comments-deactivate').onclick=()=>action('/api/review-comments/deactivate');document.querySelector('#pr-manager-activate').onclick=()=>action('/api/pr-manager/activate');document.querySelector('#pr-manager-deactivate').onclick=()=>action('/api/pr-manager/deactivate');autoReply.onchange=updateAutoReply;state();setInterval(state,1000)</script></body></html>`

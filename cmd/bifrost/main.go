@@ -22,6 +22,8 @@ import (
 	"github.com/matan-yadgar/bifrost/internal/prmanager"
 )
 
+var errRestartRequested = errors.New("restart requested")
+
 func main() {
 	defaultConfig, err := config.DefaultPath()
 	if err != nil {
@@ -40,6 +42,9 @@ func main() {
 		err = runUI(ctx, *configPath, os.Stderr)
 	} else {
 		err = runDaemon(ctx, *configPath, *runOnce, os.Stderr)
+	}
+	if errors.Is(err, errRestartRequested) {
+		return
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
@@ -60,7 +65,7 @@ func runDaemon(ctx context.Context, configPath string, runOnce bool, terminal io
 			_, _ = fmt.Fprintf(terminal, "close log file: %v\n", err)
 		}
 	}()
-	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger))
+	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger), nil)
 }
 
 func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.Manager {
@@ -77,7 +82,7 @@ func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.M
 	}, repositories, runtimeConfig.DispatchTimeout, logger)
 }
 
-func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager) error {
+func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager, reviewComments *reviewCommentsControl) error {
 	environment := withoutPRManagerTokens(githubapi.WithoutAuthTokens(os.Environ()), runtimeConfig.PRManager)
 	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
 	if err != nil {
@@ -104,6 +109,10 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 		})
 	}
 	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, runtimeConfig.MonitorCI, logger)
+	if reviewComments != nil {
+		reviewComments.attach(monitor)
+		defer reviewComments.detach(monitor)
+	}
 	if !runOnce && manager != nil {
 		if err := manager.Start(ctx, githubClient, agentHarness, monitor); err != nil {
 			logger.Printf("PR Manager listener unavailable: %v", err)
