@@ -112,6 +112,7 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 		})
 	}
 	monitor := bridge.New(githubClient, agentHarness, repositories, runtimeConfig.StateFile, runtimeConfig.DispatchTimeout, runtimeConfig.MonitorCI, logger)
+	monitor.SetOpenPullRequestsObserver(manager)
 
 	poll := func() (bridge.CycleResult, error) {
 		started := time.Now()

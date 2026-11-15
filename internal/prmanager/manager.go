@@ -371,7 +371,7 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 	manager.logger.Printf("PR Manager review started: pr=%s", key)
 	_, err = agentHarness.Dispatch(dispatchContext, harness.Request{
 		WorkingDirectory: request.Repository.WorkingDirectory,
-		Prompt:           reviewPrompt(pullRequest, request.PullRequestURL),
+		Prompt:           reviewPrompt(request.PullRequestURL),
 	})
 	if err != nil {
 		manager.logger.Printf("PR Manager review failed: pr=%s reason=%v", key, err)
@@ -383,15 +383,22 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 	manager.logger.Printf("PR Manager review task started: pr=%s", key)
 }
 
-func reviewPrompt(pullRequest github.PullRequest, pullRequestURL string) string {
-	return fmt.Sprintf(`PR Manager requested a read-only review of %s.
+func (manager *Manager) ObserveOpenPullRequests(repository string, pullRequests []github.PullRequest) {
+	open := make(map[string]bool, len(pullRequests))
+	for _, pullRequest := range pullRequests {
+		open[strings.ToLower(pullRequest.Repository)+"#"+strconv.Itoa(pullRequest.Number)] = true
+	}
+	prefix := strings.ToLower(repository) + "#"
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	for key := range manager.delivered {
+		if strings.HasPrefix(key, prefix) && !open[key] {
+			delete(manager.delivered, key)
+			manager.logger.Printf("PR Manager review cache removed: pr=%s", key)
+		}
+	}
+}
 
-Review exactly the sampled pull-request head %s. Do not review a newer revision; if that commit is unavailable, report that rather than reviewing a different head. Inspect that revision's diff and relevant repository context. Identify concrete concerns and propose the smallest appropriate changes, if any.
-
-Do not modify files, commit, push, post a GitHub review/comment, or otherwise mutate local or remote state. Write a concise review in this Codex task and then finish.
-
-PR: %s
-Title: %s
-Head commit: %s
-`, pullRequestURL, pullRequest.HeadSHA, pullRequest.URL, pullRequest.Title, pullRequest.HeadSHA)
+func reviewPrompt(pullRequestURL string) string {
+	return fmt.Sprintf("/trigger-code-review %s and paste the comments in the PR", pullRequestURL)
 }

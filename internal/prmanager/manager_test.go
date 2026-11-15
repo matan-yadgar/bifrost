@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -89,7 +88,7 @@ func TestDeliverDeduplicatesByCurrentHead(t *testing.T) {
 	if len(agentHarness.requests) != 1 {
 		t.Fatalf("dispatches after duplicate notification = %d", len(agentHarness.requests))
 	}
-	if agentHarness.requests[0].WorkingDirectory != "/repo" || !strings.Contains(agentHarness.requests[0].Prompt, "Do not modify files") || !strings.Contains(agentHarness.requests[0].Prompt, "sampled pull-request head first") || !strings.Contains(agentHarness.requests[0].Prompt, "Head commit: first") {
+	if agentHarness.requests[0].WorkingDirectory != "/repo" || agentHarness.requests[0].Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 and paste the comments in the PR" {
 		t.Fatalf("review request = %#v", agentHarness.requests[0])
 	}
 
@@ -147,7 +146,7 @@ func TestHandleSocketEventAcknowledgesAndDispatchesTrustedReview(t *testing.T) {
 	})
 	select {
 	case request := <-agentHarness.dispatched:
-		if request.WorkingDirectory != "/repo" || !strings.Contains(request.Prompt, "Head commit: reviewed") {
+		if request.WorkingDirectory != "/repo" || request.Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 and paste the comments in the PR" {
 			t.Fatalf("dispatched review = %#v", request)
 		}
 	case <-time.After(time.Second):
@@ -168,6 +167,22 @@ func TestHandleSocketEventAcknowledgesAndDispatchesTrustedReview(t *testing.T) {
 	case request := <-agentHarness.dispatched:
 		t.Fatalf("unconfigured repository dispatched %#v", request)
 	default:
+	}
+}
+
+func TestObserveOpenPullRequestsRemovesClosedReviewCache(t *testing.T) {
+	t.Parallel()
+	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
+	manager.delivered = map[string]string{
+		"owner/repo#42": "open", "owner/repo#43": "closed", "other/repo#42": "other",
+	}
+
+	manager.ObserveOpenPullRequests("owner/repo", []github.PullRequest{{Repository: "owner/repo", Number: 42}})
+	if _, found := manager.delivered["owner/repo#43"]; found {
+		t.Fatalf("closed PR remained in cache: %#v", manager.delivered)
+	}
+	if len(manager.delivered) != 2 || manager.delivered["owner/repo#42"] != "open" || manager.delivered["other/repo#42"] != "other" {
+		t.Fatalf("remaining cache = %#v", manager.delivered)
 	}
 }
 

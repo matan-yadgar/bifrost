@@ -48,10 +48,15 @@ type Repository struct {
 	WorkingDirectory string
 }
 
+type OpenPullRequestsObserver interface {
+	ObserveOpenPullRequests(string, []githubapi.PullRequest)
+}
+
 type Monitor struct {
 	source             Source
 	harness            harness.Harness
 	repositories       []Repository
+	openPullRequests   OpenPullRequestsObserver
 	stateFile          string
 	monitorCI          bool
 	dispatchTimeout    time.Duration
@@ -155,6 +160,10 @@ func newHeartbeatTicker(interval time.Duration) (<-chan time.Time, func()) {
 	return ticker.C, ticker.Stop
 }
 
+func (monitor *Monitor) SetOpenPullRequestsObserver(observer OpenPullRequestsObserver) {
+	monitor.openPullRequests = observer
+}
+
 func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 	state, err := monitor.readState(ctx)
 	if err != nil {
@@ -178,6 +187,9 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 			cycleErrors = append(cycleErrors, fmt.Errorf("list %s pull requests: %w", repository.Name, err))
 			sourceScanFailed = true
 			continue
+		}
+		if monitor.openPullRequests != nil {
+			monitor.openPullRequests.ObserveOpenPullRequests(repository.Name, openPullRequests)
 		}
 		if pruneRepositoryState(state, repository.Name, openPullRequests) {
 			stateChanged = true
