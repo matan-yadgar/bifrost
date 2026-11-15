@@ -161,6 +161,27 @@ func discardLogger() *log.Logger {
 	return log.New(io.Discard, "", 0)
 }
 
+func TestReviewCommentsCanBeDisabledWithoutStoppingCIMonitoring(t *testing.T) {
+	pullRequest := githubapi.PullRequest{Repository: "owner/repo", Number: 42, Author: "author", URL: "https://github.com/owner/repo/pull/42"}
+	source := &fakeSource{
+		pullRequest:  pullRequest,
+		checksError:  errors.New("CI remained active"),
+		threadErrors: map[int]error{pullRequest.Number: errors.New("review comments were read")},
+	}
+	monitor := New(source, &fakeHarness{}, []Repository{{Name: pullRequest.Repository, WorkingDirectory: t.TempDir()}}, filepath.Join(t.TempDir(), "state.json"), time.Minute, true, discardLogger())
+	monitor.SetReviewCommentsEnabled(false)
+
+	result, err := monitor.RunOnce(context.Background())
+	if !strings.Contains(fmt.Sprint(err), "CI remained active") || strings.Contains(fmt.Sprint(err), "review comments were read") || result.Threads != 0 || result.Dispatches != 0 {
+		t.Fatalf("disabled review comments result/error = %#v / %v", result, err)
+	}
+
+	monitor.SetReviewCommentsEnabled(true)
+	if _, err := monitor.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "review comments were read") {
+		t.Fatalf("enabled review comments error = %v", err)
+	}
+}
+
 func readTestRoute(t *testing.T, statePath, key string) route {
 	t.Helper()
 	state, err := loadState(statePath)

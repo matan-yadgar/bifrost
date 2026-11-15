@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -54,6 +55,7 @@ type Monitor struct {
 	repositories       []Repository
 	stateFile          string
 	monitorCI          bool
+	reviewComments     atomic.Bool
 	dispatchTimeout    time.Duration
 	heartbeatInterval  time.Duration
 	newHeartbeatTicker func(time.Duration) (<-chan time.Time, func())
@@ -145,11 +147,23 @@ func (locks *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 }
 
 func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, dispatchTimeout time.Duration, monitorCI bool, logger *log.Logger) *Monitor {
-	return &Monitor{
+	monitor := &Monitor{
 		source: source, harness: agentHarness, repositories: repositories,
 		stateFile: statePath, monitorCI: monitorCI, dispatchTimeout: dispatchTimeout, heartbeatInterval: dispatchHeartbeatInterval,
 		newHeartbeatTicker: newHeartbeatTicker, logger: logger,
 	}
+	monitor.reviewComments.Store(true)
+	return monitor
+}
+
+// SetReviewCommentsEnabled controls only GitHub inline-review follow-ups.
+// CI and PR Manager polling remain active.
+func (monitor *Monitor) SetReviewCommentsEnabled(enabled bool) {
+	monitor.reviewComments.Store(enabled)
+}
+
+func (monitor *Monitor) ReviewCommentsEnabled() bool {
+	return monitor.reviewComments.Load()
 }
 
 func newHeartbeatTicker(interval time.Duration) (<-chan time.Time, func()) {
@@ -190,17 +204,19 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 		pullRequests := filterPullRequestsByAuthor(openPullRequests, repository.Authors)
 		result.PullRequests += len(pullRequests)
 		for _, pullRequest := range pullRequests {
-			threads, err := monitor.source.ReviewThreads(ctx, pullRequest)
 			var changed []githubapi.ReviewThread
 			var fingerprints map[string]string
-			if err != nil {
-				cycleErrors = append(cycleErrors, fmt.Errorf("read %s review threads: %w", pullRequest.URL, err))
-				sourceScanFailed = true
-			} else {
-				result.Threads += len(threads)
-				var changedState bool
-				changed, changedState, fingerprints = changedThreads(state, pullRequest, threads)
-				stateChanged = stateChanged || changedState
+			if monitor.ReviewCommentsEnabled() {
+				threads, err := monitor.source.ReviewThreads(ctx, pullRequest)
+				if err != nil {
+					cycleErrors = append(cycleErrors, fmt.Errorf("read %s review threads: %w", pullRequest.URL, err))
+					sourceScanFailed = true
+				} else {
+					result.Threads += len(threads)
+					var changedState bool
+					changed, changedState, fingerprints = changedThreads(state, pullRequest, threads)
+					stateChanged = stateChanged || changedState
+				}
 			}
 			var checks []githubapi.FailedCheck
 			if monitor.monitorCI {

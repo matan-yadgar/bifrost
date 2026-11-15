@@ -69,6 +69,8 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	stopped := make(chan struct{})
 	prManagerEnabled := false
 	prManagerAutoReply := false
+	reviewCommentsEnabled := true
+	restartRequested := make(chan struct{}, 1)
 	logs := newLiveLogs()
 	ui := &controlUI{
 		configPath: configPath,
@@ -84,6 +86,11 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 		},
 		deactivatePRManager:   func() { prManagerEnabled = false },
 		setPRManagerAutoReply: func(autoReply bool) { prManagerAutoReply = autoReply },
+		reviewCommentsEnabled: func() bool { return reviewCommentsEnabled },
+		setReviewComments:     func(enabled bool) { reviewCommentsEnabled = enabled },
+		restart: func() {
+			restartRequested <- struct{}{}
+		},
 		run: func(ctx context.Context) error {
 			close(started)
 			<-ctx.Done()
@@ -200,6 +207,38 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 		t.Fatalf("PR Manager deactivate status = %d %#v", response.StatusCode, ui.status().PRManager)
 	}
 
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/review-comments/deactivate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || ui.status().ReviewCommentsEnabled {
+		t.Fatalf("review comments deactivate status = %d %#v", response.StatusCode, ui.status())
+	}
+
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/review-comments/activate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !ui.status().ReviewCommentsEnabled {
+		t.Fatalf("review comments activate status = %d %#v", response.StatusCode, ui.status())
+	}
+
 	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/config/pr-manager/auto-reply", strings.NewReader(`{"auto_reply":true}`))
 	if err != nil {
 		t.Fatal(err)
@@ -225,6 +264,27 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	}
 	if !savedConfig.PRManager.AutoReply {
 		t.Fatalf("saved config = %s", updatedConfig)
+	}
+
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/restart", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("restart status = %d", response.StatusCode)
+	}
+	select {
+	case <-restartRequested:
+	case <-time.After(time.Second):
+		t.Fatal("restart was not requested")
 	}
 
 	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/deactivate", nil)
