@@ -130,6 +130,22 @@ func TestReviewPromptAutoReply(t *testing.T) {
 	}
 }
 
+func TestSetAutoReplyAppliesToNewReviewRequests(t *testing.T) {
+	t.Parallel()
+	manager := New(Settings{Conversation: "D123", BotID: "B123"}, []Repository{{Name: "owner/repo", WorkingDirectory: "/repo"}}, time.Minute, log.New(io.Discard, "", 0))
+	jobs := make(chan reviewRequest, 1)
+	manager.mutex.Lock()
+	manager.running = true
+	manager.jobs = jobs
+	manager.mutex.Unlock()
+	manager.SetAutoReply(true)
+	manager.enqueue(message{Conversation: "D123", BotID: "B123", ChannelType: "im", Subtype: "bot_message", Text: "Please review: https://github.com/owner/repo/pull/42"})
+	request := <-jobs
+	if !request.AutoReply {
+		t.Fatal("queued review does not use the updated auto reply setting")
+	}
+}
+
 func TestConnectionStatusTracksReconnects(t *testing.T) {
 	t.Parallel()
 	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
