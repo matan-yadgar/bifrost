@@ -195,11 +195,21 @@ func (manager *Manager) runSocket(ctx context.Context, cancel context.CancelFunc
 			case <-ctx.Done():
 				return
 			case event := <-client.Events:
-				if event.Type == socketmode.EventTypeConnected {
+				switch event.Type {
+				case socketmode.EventTypeConnecting:
+					manager.setConnecting(generation)
+				case socketmode.EventTypeConnectionError:
+					connectionError, ok := event.Data.(*slack.ConnectionErrorEvent)
+					if ok && connectionError.ErrorObj != nil {
+						manager.setConnectionError(generation, connectionError.ErrorObj)
+					} else {
+						manager.setConnectionError(generation, fmt.Errorf("slack Socket Mode connection failed"))
+					}
+				case socketmode.EventTypeConnected:
 					manager.setConnected(generation)
-					continue
+				default:
+					manager.handleSocketEvent(ctx, client, event)
 				}
-				manager.handleSocketEvent(ctx, client, event)
 			}
 		}
 	}()
@@ -228,10 +238,35 @@ func (manager *Manager) setConnected(generation uint64) {
 		return
 	}
 	manager.connected = true
+	manager.lastError = ""
 	manager.logger.Print("PR Manager listener connected")
 }
 
-func (manager *Manager) handleSocketEvent(ctx context.Context, client *socketmode.Client, event socketmode.Event) {
+func (manager *Manager) setConnecting(generation uint64) {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if manager.generation != generation || !manager.running {
+		return
+	}
+	manager.connected = false
+}
+
+func (manager *Manager) setConnectionError(generation uint64, err error) {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if manager.generation != generation || !manager.running {
+		return
+	}
+	manager.connected = false
+	manager.lastError = err.Error()
+	manager.logger.Printf("PR Manager Slack connection failed; reconnecting: %v", err)
+}
+
+type acknowledger interface {
+	AckCtx(context.Context, string, any) error
+}
+
+func (manager *Manager) handleSocketEvent(ctx context.Context, client acknowledger, event socketmode.Event) {
 	if event.Type != socketmode.EventTypeEventsAPI || event.Request == nil {
 		return
 	}
@@ -351,11 +386,12 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 func reviewPrompt(pullRequest github.PullRequest, pullRequestURL string) string {
 	return fmt.Sprintf(`PR Manager requested a read-only review of %s.
 
-Inspect the current pull request, its diff, and relevant repository context. Identify concrete concerns and propose the smallest appropriate changes, if any.
+Review exactly the sampled pull-request head %s. Do not review a newer revision; if that commit is unavailable, report that rather than reviewing a different head. Inspect that revision's diff and relevant repository context. Identify concrete concerns and propose the smallest appropriate changes, if any.
 
 Do not modify files, commit, push, post a GitHub review/comment, or otherwise mutate local or remote state. Write a concise review in this Codex task and then finish.
 
 PR: %s
 Title: %s
-`, pullRequestURL, pullRequest.URL, pullRequest.Title)
+Head commit: %s
+`, pullRequestURL, pullRequest.HeadSHA, pullRequest.URL, pullRequest.Title, pullRequest.HeadSHA)
 }
