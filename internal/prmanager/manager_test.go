@@ -63,7 +63,7 @@ func TestRequestsAcceptsOnlyConfiguredPRManagerReviewMessages(t *testing.T) {
 
 func TestDeliverDeduplicatesByCurrentHead(t *testing.T) {
 	t.Parallel()
-	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, URL: "https://github.com/owner/repo/pull/42", Title: "Improve Bifrost", HeadSHA: "first"}}
+	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, State: "open", URL: "https://github.com/owner/repo/pull/42", Title: "Improve Bifrost", HeadSHA: "first"}}
 	agentHarness := &fakeHarness{}
 	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
 	request := reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42, PullRequestURL: "https://github.com/owner/repo/pull/42"}
@@ -81,6 +81,17 @@ func TestDeliverDeduplicatesByCurrentHead(t *testing.T) {
 	manager.deliver(context.Background(), request, source, agentHarness)
 	if len(agentHarness.requests) != 2 {
 		t.Fatalf("dispatches after a new head = %d", len(agentHarness.requests))
+	}
+}
+
+func TestDeliverSkipsClosedPullRequest(t *testing.T) {
+	t.Parallel()
+	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, State: "closed"}}
+	agentHarness := &fakeHarness{}
+	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
+	manager.deliver(context.Background(), reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42}, source, agentHarness)
+	if len(agentHarness.requests) != 0 {
+		t.Fatalf("dispatches for closed pull request = %d", len(agentHarness.requests))
 	}
 }
 

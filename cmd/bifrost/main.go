@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -77,7 +79,7 @@ func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.M
 }
 
 func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager) error {
-	environment := githubapi.WithoutAuthTokens(os.Environ())
+	environment := withoutPRManagerTokens(githubapi.WithoutAuthTokens(os.Environ()), runtimeConfig.PRManager)
 	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
 	if err != nil {
 		return err
@@ -145,6 +147,18 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 			}
 		}
 	}
+}
+
+func withoutPRManagerTokens(environment []string, settings config.PRManager) []string {
+	tokenNames := []string{settings.AppTokenEnv, settings.UserTokenEnv}
+	filtered := make([]string, 0, len(environment))
+	for _, value := range environment {
+		name, _, _ := strings.Cut(value, "=")
+		if !slices.Contains(tokenNames, name) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 func newPersistentLogger(directory string, terminal io.Writer) (*log.Logger, io.WriteCloser, error) {

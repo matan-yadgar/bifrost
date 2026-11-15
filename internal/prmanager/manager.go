@@ -235,7 +235,7 @@ func (manager *Manager) handleSocketEvent(ctx context.Context, client *socketmod
 	if event.Type != socketmode.EventTypeEventsAPI || event.Request == nil {
 		return
 	}
-	if err := client.Ack(*event.Request); err != nil {
+	if err := client.AckCtx(ctx, event.Request.EnvelopeID, nil); err != nil {
 		manager.logger.Printf("acknowledge PR Manager Slack event: %v", err)
 		return
 	}
@@ -316,6 +316,10 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 	pullRequest, err := source.PullRequest(ctx, request.Repository.Name, request.PullRequest)
 	if err != nil {
 		manager.logger.Printf("PR Manager review failed: pr=%s#%d reason=get pull request: %v", request.Repository.Name, request.PullRequest, err)
+		return
+	}
+	if pullRequest.State != "open" {
+		manager.logger.Printf("PR Manager review ignored: pr=%s#%d is no longer open", request.Repository.Name, request.PullRequest)
 		return
 	}
 	key := strings.ToLower(pullRequest.Repository) + "#" + strconv.Itoa(pullRequest.Number)

@@ -74,7 +74,7 @@ func TestPullRequestReadsTheRequestedHead(t *testing.T) {
 			http.Error(writer, "wrong pull request target", http.StatusBadRequest)
 			return
 		}
-		_, _ = fmt.Fprint(writer, `{"number":42,"title":"Ship it","body":"body","html_url":"https://github.com/owner/repo/pull/42","user":{"login":"matan"},"head":{"ref":"codex/ship-it","sha":"abc123"}}`)
+		_, _ = fmt.Fprint(writer, `{"number":42,"state":"open","title":"Ship it","body":"body","html_url":"https://github.com/owner/repo/pull/42","user":{"login":"matan"},"head":{"ref":"codex/ship-it","sha":"abc123"}}`)
 	}))
 	defer server.Close()
 	client := NewClient("")
@@ -84,7 +84,7 @@ func TestPullRequestReadsTheRequestedHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pullRequest.Number != 42 || pullRequest.HeadSHA != "abc123" || pullRequest.HeadRef != "codex/ship-it" || pullRequest.Author != "matan" {
+	if pullRequest.Number != 42 || pullRequest.State != "open" || pullRequest.HeadSHA != "abc123" || pullRequest.HeadRef != "codex/ship-it" || pullRequest.Author != "matan" {
 		t.Fatalf("pull request = %#v", pullRequest)
 	}
 }

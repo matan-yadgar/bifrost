@@ -89,6 +89,7 @@ type Client struct {
 type PullRequest struct {
 	Repository string
 	Number     int
+	State      string
 	Title      string
 	Body       string
 	URL        string
@@ -218,6 +219,7 @@ func (client *Client) OpenPullRequests(ctx context.Context, repository string) (
 			pullRequests = append(pullRequests, PullRequest{
 				Repository: repository,
 				Number:     pullRequest.Number,
+				State:      "open",
 				Title:      pullRequest.Title,
 				Body:       pullRequest.Body,
 				URL:        pullRequest.HTMLURL,
@@ -239,6 +241,7 @@ func (client *Client) PullRequest(ctx context.Context, repository string, number
 	}
 	var response struct {
 		Number  int    `json:"number"`
+		State   string `json:"state"`
 		Title   string `json:"title"`
 		Body    string `json:"body"`
 		HTMLURL string `json:"html_url"`
@@ -257,6 +260,7 @@ func (client *Client) PullRequest(ctx context.Context, repository string, number
 	return PullRequest{
 		Repository: repository,
 		Number:     response.Number,
+		State:      response.State,
 		Title:      response.Title,
 		Body:       response.Body,
 		URL:        response.HTMLURL,

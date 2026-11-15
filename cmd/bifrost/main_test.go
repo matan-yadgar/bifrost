@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/matan-yadgar/bifrost/internal/bridge"
+	"github.com/matan-yadgar/bifrost/internal/config"
 	"github.com/matan-yadgar/bifrost/internal/prmanager"
 )
 
@@ -44,6 +45,16 @@ func TestNewPersistentLoggerMirrorsOutput(t *testing.T) {
 	}
 	if !strings.Contains(terminal.String(), "connected") || !bytes.Contains(data, []byte("connected")) {
 		t.Fatalf("terminal = %q, file = %q", terminal.String(), data)
+	}
+}
+
+func TestWithoutPRManagerTokens(t *testing.T) {
+	t.Parallel()
+	environment := withoutPRManagerTokens([]string{
+		"BIFROST_SLACK_APP_TOKEN=removed", "BIFROST_SLACK_USER_TOKEN=removed", "KEEP=present",
+	}, config.PRManager{AppTokenEnv: "BIFROST_SLACK_APP_TOKEN", UserTokenEnv: "BIFROST_SLACK_USER_TOKEN"})
+	if len(environment) != 1 || environment[0] != "KEEP=present" {
+		t.Fatalf("environment = %#v", environment)
 	}
 }
 
