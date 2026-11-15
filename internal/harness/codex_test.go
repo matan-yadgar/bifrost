@@ -216,7 +216,7 @@ func runAppServerHelper(mode string) {
 		case "thread/name/set":
 			if !reflect.DeepEqual(request.Params, map[string]any{
 				"threadId": appServerForkedSessionID,
-				"name":     "Bifrost: owner/repo#42",
+				"name":     "bifrost - CR - 42",
 			}) {
 				os.Exit(20)
 			}
@@ -272,7 +272,7 @@ func TestAppServerDiscoveryUsesExactTaskNameAcrossPages(t *testing.T) {
 	if !reflect.DeepEqual(emitted[5].Params, map[string]any{"threadId": creatorSessionID}) {
 		t.Fatalf("fork request = %#v", emitted[5])
 	}
-	if !reflect.DeepEqual(emitted[6].Params, map[string]any{"threadId": forkedSessionID, "name": "Bifrost: owner/repo#42"}) {
+	if !reflect.DeepEqual(emitted[6].Params, map[string]any{"threadId": forkedSessionID, "name": "bifrost - CR - 42"}) {
 		t.Fatalf("name request = %#v", emitted[6])
 	}
 }
@@ -321,7 +321,7 @@ func TestAppServerDiscoveryDoesNotTreatBifrostTitleAsRoute(t *testing.T) {
 	t.Parallel()
 	const unrelatedSessionID = "019c0000-0000-7000-8000-000000000002"
 	responses := strings.NewReader(
-		rpcResult(1, threadListResultJSON([]namedSession{{ID: unrelatedSessionID, Name: "Bifrost: owner/repo#42"}}, "")) +
+		rpcResult(1, threadListResultJSON([]namedSession{{ID: unrelatedSessionID, Name: "bifrost - CR - 42"}}, "")) +
 			rpcResult(2, threadListResultJSON(nil, "")),
 	)
 	var requests bytes.Buffer
@@ -435,7 +435,7 @@ func TestAppServerForkDeletesChildWhenNamingFails(t *testing.T) {
 	)
 	var requests bytes.Buffer
 	client := newAppServerClient(responses, &requests)
-	sessionID, err := client.fork("019c0000-0000-7000-8000-000000000001", "Bifrost: owner/repo#42")
+	sessionID, err := client.fork("019c0000-0000-7000-8000-000000000001", "bifrost - CR - 42")
 	if err == nil || sessionID != "" {
 		t.Fatalf("session/error = %q / %v", sessionID, err)
 	}
