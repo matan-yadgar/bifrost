@@ -68,6 +68,33 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestUpdatePRManagerAutoReply(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{"repositories":[],"pr_manager":{"enabled":true,"conversation_id":"D123"}}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdatePRManagerAutoReply(path, true); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(updated, &document); err != nil {
+		t.Fatal(err)
+	}
+	var prManager PRManager
+	if err := json.Unmarshal(document["pr_manager"], &prManager); err != nil {
+		t.Fatal(err)
+	}
+	if !prManager.AutoReply || !prManager.Enabled || prManager.Conversation != "D123" {
+		t.Fatalf("pr_manager = %#v", prManager)
+	}
+}
+
 func TestLoadRejectsDuplicateRepositories(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()

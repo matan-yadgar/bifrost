@@ -88,6 +88,7 @@ type reviewRequest struct {
 	Repository     Repository
 	PullRequest    int
 	PullRequestURL string
+	AutoReply      bool
 }
 
 func New(settings Settings, repositories []Repository, dispatchTimeout time.Duration, logger *log.Logger) *Manager {
@@ -138,6 +139,13 @@ func (manager *Manager) Deactivate() {
 	manager.enabled = false
 	manager.lastError = ""
 	manager.stopLocked()
+}
+
+// SetAutoReply changes the reply mode for reviews queued after this call.
+func (manager *Manager) SetAutoReply(autoReply bool) {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	manager.settings.AutoReply = autoReply
 }
 
 func (manager *Manager) Status() Status {
@@ -313,11 +321,13 @@ func (manager *Manager) enqueue(event message) {
 	manager.mutex.Lock()
 	jobs := manager.jobs
 	running := manager.running
+	autoReply := manager.settings.AutoReply
 	manager.mutex.Unlock()
 	if !running || jobs == nil {
 		return
 	}
 	for _, request := range requests {
+		request.AutoReply = autoReply
 		select {
 		case jobs <- request:
 			manager.logger.Printf("PR Manager review queued: pr=%s#%d", request.Repository.Name, request.PullRequest)
@@ -387,7 +397,7 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 	manager.logger.Printf("PR Manager review started: pr=%s", key)
 	_, err = agentHarness.Dispatch(dispatchContext, harness.Request{
 		WorkingDirectory: request.Repository.WorkingDirectory,
-		Prompt:           reviewPrompt(request.PullRequestURL, pullRequest.HeadSHA, manager.settings.AutoReply),
+		Prompt:           reviewPrompt(request.PullRequestURL, pullRequest.HeadSHA, request.AutoReply),
 	})
 	if err != nil {
 		manager.logger.Printf("PR Manager review failed: pr=%s reason=%v", key, err)

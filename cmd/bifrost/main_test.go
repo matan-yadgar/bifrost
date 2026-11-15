@@ -68,6 +68,7 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	started := make(chan struct{})
 	stopped := make(chan struct{})
 	prManagerEnabled := false
+	prManagerAutoReply := false
 	logs := newLiveLogs()
 	ui := &controlUI{
 		configPath: configPath,
@@ -81,7 +82,8 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 			prManagerEnabled = true
 			return nil
 		},
-		deactivatePRManager: func() { prManagerEnabled = false },
+		deactivatePRManager:   func() { prManagerEnabled = false },
+		setPRManagerAutoReply: func(autoReply bool) { prManagerAutoReply = autoReply },
 		run: func(ctx context.Context) error {
 			close(started)
 			<-ctx.Done()
@@ -196,6 +198,33 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	}
 	if response.StatusCode != http.StatusOK || ui.status().PRManager.Enabled {
 		t.Fatalf("PR Manager deactivate status = %d %#v", response.StatusCode, ui.status().PRManager)
+	}
+
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/config/pr-manager/auto-reply", strings.NewReader(`{"auto_reply":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !prManagerAutoReply {
+		t.Fatalf("update auto reply status = %d auto_reply=%t", response.StatusCode, prManagerAutoReply)
+	}
+	updatedConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var savedConfig config.Config
+	if err := json.Unmarshal(updatedConfig, &savedConfig); err != nil {
+		t.Fatal(err)
+	}
+	if !savedConfig.PRManager.AutoReply {
+		t.Fatalf("saved config = %s", updatedConfig)
 	}
 
 	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/deactivate", nil)

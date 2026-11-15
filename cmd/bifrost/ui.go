@@ -22,14 +22,15 @@ import (
 const controlUIAddress = "127.0.0.1:7420"
 
 type controlUI struct {
-	configPath          string
-	logger              *log.Logger
-	token               string
-	logs                *liveLogs
-	run                 func(context.Context) error
-	prManagerStatus     func() prmanager.Status
-	activatePRManager   func() error
-	deactivatePRManager func()
+	configPath            string
+	logger                *log.Logger
+	token                 string
+	logs                  *liveLogs
+	run                   func(context.Context) error
+	prManagerStatus       func() prmanager.Status
+	activatePRManager     func() error
+	deactivatePRManager   func()
+	setPRManagerAutoReply func(bool)
 
 	mutex     sync.Mutex
 	active    bool
@@ -112,13 +113,14 @@ func runUI(ctx context.Context, configPath string, terminal io.Writer) error {
 	}
 	manager := newPRManager(runtimeConfig, logger)
 	ui := &controlUI{
-		configPath:          configPath,
-		logger:              logger,
-		token:               token,
-		logs:                logs,
-		prManagerStatus:     manager.Status,
-		activatePRManager:   manager.Activate,
-		deactivatePRManager: manager.Deactivate,
+		configPath:            configPath,
+		logger:                logger,
+		token:                 token,
+		logs:                  logs,
+		prManagerStatus:       manager.Status,
+		activatePRManager:     manager.Activate,
+		deactivatePRManager:   manager.Deactivate,
+		setPRManagerAutoReply: manager.SetAutoReply,
 		run: func(runContext context.Context) error {
 			return runPoller(runContext, runtimeConfig, false, logger, manager)
 		},
@@ -226,6 +228,7 @@ func (ui *controlUI) handler() http.Handler {
 	mux.HandleFunc("POST /api/deactivate", ui.handleDeactivate)
 	mux.HandleFunc("POST /api/pr-manager/activate", ui.handlePRManagerActivate)
 	mux.HandleFunc("POST /api/pr-manager/deactivate", ui.handlePRManagerDeactivate)
+	mux.HandleFunc("POST /api/config/pr-manager/auto-reply", ui.handlePRManagerAutoReply)
 	return mux
 }
 
@@ -316,6 +319,34 @@ func (ui *controlUI) handlePRManagerDeactivate(writer http.ResponseWriter, reque
 	writeJSON(writer, ui.status())
 }
 
+func (ui *controlUI) handlePRManagerAutoReply(writer http.ResponseWriter, request *http.Request) {
+	if !ui.authorized(writer, request) {
+		return
+	}
+	request.Body = http.MaxBytesReader(writer, request.Body, 1024)
+	var update struct {
+		AutoReply *bool `json:"auto_reply"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	if err := decoder.Decode(&update); err != nil || update.AutoReply == nil {
+		http.Error(writer, "auto_reply must be a boolean", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		http.Error(writer, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := config.UpdatePRManagerAutoReply(ui.configPath, *update.AutoReply); err != nil {
+		ui.logger.Printf("update PR Manager auto reply: %v", err)
+		http.Error(writer, "update config", http.StatusInternalServerError)
+		return
+	}
+	ui.setPRManagerAutoReply(*update.AutoReply)
+	writeJSON(writer, struct {
+		AutoReply bool `json:"auto_reply"`
+	}{AutoReply: *update.AutoReply})
+}
+
 func (ui *controlUI) authorized(writer http.ResponseWriter, request *http.Request) bool {
 	if request.Header.Get("X-Bifrost-Token") == ui.token {
 		return true
@@ -335,6 +366,6 @@ const controlUIPage = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bifrost</title><style>
 body{background:#10131a;color:#e8edf5;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:1000px;margin:40px auto;padding:0 20px}h1{margin-bottom:6px}.muted{color:#a7b0bf}button{border:0;border-radius:6px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer;margin-right:8px}#activate{background:#2fbd78;color:#062515}#deactivate{background:#e36363;color:#310606}pre{overflow:auto;background:#181d27;border:1px solid #2a3240;border-radius:8px;padding:14px;white-space:pre-wrap;word-break:break-word}#status{font-weight:700}#error{color:#ff9b9b}.section{margin-top:30px}</style></head>
-<body><h1>Bifrost</h1><div class="muted">%s</div><p>Status: <span id="status">Loading…</span> <span id="error"></span></p><p><button id="activate">Activate</button><button id="deactivate">Deactivate</button></p><p>PR Manager: <span id="pr-manager-status">Loading…</span> <span id="pr-manager-error"></span></p><p><button id="pr-manager-activate">Enable PR Manager</button><button id="pr-manager-deactivate">Disable PR Manager</button></p>
+<body><h1>Bifrost</h1><div class="muted">%s</div><p>Status: <span id="status">Loading…</span> <span id="error"></span></p><p><button id="activate">Activate</button><button id="deactivate">Deactivate</button></p><p>PR Manager: <span id="pr-manager-status">Loading…</span> <span id="pr-manager-error"></span></p><p><button id="pr-manager-activate">Enable PR Manager</button><button id="pr-manager-deactivate">Disable PR Manager</button></p><p><label><input id="pr-manager-auto-reply" type="checkbox"> Post PR Manager review comments automatically</label><br><span class="muted">Off keeps the review task waiting for your approval.</span></p>
 <div class="section"><h2>Live activity</h2><pre id="logs"></pre></div><div class="section"><h2>Config</h2><pre id="config">Loading…</pre></div>
-<script>const token=%q,logs=document.querySelector('#logs');function append(line){logs.textContent+=line;logs.scrollTop=logs.scrollHeight}async function state(){let s=await fetch('/api/status').then(r=>r.json()),text=s.stopping?'Stopping…':s.active?'Active':'Inactive',pm=s.pr_manager;document.querySelector('#status').textContent=text;document.querySelector('#error').textContent=s.last_error?' — '+s.last_error:'';document.querySelector('#activate').disabled=s.active||s.stopping;document.querySelector('#deactivate').disabled=!s.active||s.stopping;document.querySelector('#pr-manager-status').textContent=pm.connected?'Connected':pm.last_error?'Error':pm.running?'Connecting…':pm.enabled?'Waiting':'Inactive';document.querySelector('#pr-manager-error').textContent=pm.last_error?' — '+pm.last_error:'';document.querySelector('#pr-manager-activate').disabled=!s.active||s.stopping||pm.running;document.querySelector('#pr-manager-deactivate').disabled=!pm.enabled}async function action(path){await fetch(path,{method:'POST',headers:{'X-Bifrost-Token':token}});state()}fetch('/api/logs').then(r=>r.json()).then(v=>v.lines.forEach(append));fetch('/api/config').then(r=>r.json()).then(v=>document.querySelector('#config').textContent=JSON.stringify(v,null,2));new EventSource('/api/logs/stream').onmessage=e=>append(JSON.parse(e.data));document.querySelector('#activate').onclick=()=>action('/api/activate');document.querySelector('#deactivate').onclick=()=>action('/api/deactivate');document.querySelector('#pr-manager-activate').onclick=()=>action('/api/pr-manager/activate');document.querySelector('#pr-manager-deactivate').onclick=()=>action('/api/pr-manager/deactivate');state();setInterval(state,1000)</script></body></html>`
+<script>const token=%q,logs=document.querySelector('#logs'),autoReply=document.querySelector('#pr-manager-auto-reply');function append(line){logs.textContent+=line;logs.scrollTop=logs.scrollHeight}async function state(){let s=await fetch('/api/status').then(r=>r.json()),text=s.stopping?'Stopping…':s.active?'Active':'Inactive',pm=s.pr_manager;document.querySelector('#status').textContent=text;document.querySelector('#error').textContent=s.last_error?' — '+s.last_error:'';document.querySelector('#activate').disabled=s.active||s.stopping;document.querySelector('#deactivate').disabled=!s.active||s.stopping;document.querySelector('#pr-manager-status').textContent=pm.connected?'Connected':pm.last_error?'Error':pm.running?'Connecting…':pm.enabled?'Waiting':'Inactive';document.querySelector('#pr-manager-error').textContent=pm.last_error?' — '+pm.last_error:'';document.querySelector('#pr-manager-activate').disabled=!s.active||s.stopping||pm.running;document.querySelector('#pr-manager-deactivate').disabled=!pm.enabled}async function loadConfig(){let v=await fetch('/api/config').then(r=>r.json());document.querySelector('#config').textContent=JSON.stringify(v,null,2);autoReply.checked=!!(v.pr_manager&&v.pr_manager.auto_reply)}async function action(path){await fetch(path,{method:'POST',headers:{'X-Bifrost-Token':token}});state()}async function updateAutoReply(){let r=await fetch('/api/config/pr-manager/auto-reply',{method:'POST',headers:{'X-Bifrost-Token':token,'Content-Type':'application/json'},body:JSON.stringify({auto_reply:autoReply.checked})});if(!r.ok){await loadConfig();return}await loadConfig()}fetch('/api/logs').then(r=>r.json()).then(v=>v.lines.forEach(append));loadConfig();new EventSource('/api/logs/stream').onmessage=e=>append(JSON.parse(e.data));document.querySelector('#activate').onclick=()=>action('/api/activate');document.querySelector('#deactivate').onclick=()=>action('/api/deactivate');document.querySelector('#pr-manager-activate').onclick=()=>action('/api/pr-manager/activate');document.querySelector('#pr-manager-deactivate').onclick=()=>action('/api/pr-manager/deactivate');autoReply.onchange=updateAutoReply;state();setInterval(state,1000)</script></body></html>`

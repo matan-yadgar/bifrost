@@ -175,6 +175,70 @@ func Load(path string) (Runtime, error) {
 	}, nil
 }
 
+// UpdatePRManagerAutoReply persists the PR Manager reply mode selected in the
+// local control UI.
+func UpdatePRManagerAutoReply(path string, autoReply bool) error {
+	path, err := expandPath(path)
+	if err != nil {
+		return err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve config path: %w", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &document); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+	if document == nil {
+		return fmt.Errorf("config must be an object")
+	}
+	prManager := make(map[string]json.RawMessage)
+	if encoded, found := document["pr_manager"]; found {
+		if err := json.Unmarshal(encoded, &prManager); err != nil {
+			return fmt.Errorf("decode pr_manager: %w", err)
+		}
+		if prManager == nil {
+			return fmt.Errorf("pr_manager must be an object")
+		}
+	}
+	autoReplyJSON, err := json.Marshal(autoReply)
+	if err != nil {
+		return fmt.Errorf("encode auto_reply: %w", err)
+	}
+	prManager["auto_reply"] = autoReplyJSON
+	document["pr_manager"], err = json.Marshal(prManager)
+	if err != nil {
+		return fmt.Errorf("encode pr_manager: %w", err)
+	}
+	contents, err = json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	contents = append(contents, '\n')
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".config-*")
+	if err != nil {
+		return fmt.Errorf("create config update: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if _, err := temporary.Write(contents); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write config update: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close config update: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
 func normalizePRManager(prManager PRManager) (PRManager, error) {
 	prManager.AppTokenEnv = strings.TrimSpace(prManager.AppTokenEnv)
 	if prManager.AppTokenEnv == "" {
