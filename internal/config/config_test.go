@@ -26,7 +26,8 @@ func TestLoad(t *testing.T) {
     "enabled": true,
     "auto_reply": true,
     "conversation_id": "D0123",
-    "bot_id": "B0123"
+    "bot_id": "B0123",
+    "template_task_id": "019f0000-0000-7000-8000-000000000001"
   },
   "harness": {"type": "codex"}
 }`
@@ -63,7 +64,7 @@ func TestLoad(t *testing.T) {
 	if runtimeConfig.LogDirectory != filepath.Join(directory, "logs") {
 		t.Fatalf("log directory = %q", runtimeConfig.LogDirectory)
 	}
-	if !runtimeConfig.PRManager.Enabled || !runtimeConfig.PRManager.AutoReply || runtimeConfig.PRManager.Conversation != "D0123" || runtimeConfig.PRManager.BotID != "B0123" || runtimeConfig.PRManager.UserTokenEnv != "BIFROST_SLACK_USER_TOKEN" {
+	if !runtimeConfig.PRManager.Enabled || !runtimeConfig.PRManager.AutoReply || runtimeConfig.PRManager.Conversation != "D0123" || runtimeConfig.PRManager.BotID != "B0123" || runtimeConfig.PRManager.TemplateTaskID != "019f0000-0000-7000-8000-000000000001" || runtimeConfig.PRManager.UserTokenEnv != "BIFROST_SLACK_USER_TOKEN" {
 		t.Fatalf("PR Manager = %#v", runtimeConfig.PRManager)
 	}
 }
@@ -237,14 +238,14 @@ func TestCIMonitoringRequiresExplicitAuthors(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsEnabledPRManagerWithoutTrustedConversation(t *testing.T) {
+func TestLoadRejectsEnabledPRManagerWithoutRequiredSettings(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
 	if err := os.Mkdir(filepath.Join(directory, "repo"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(directory, "config.json")
-	data := `{"pr_manager":{"enabled":true,"conversation_id":"D123"},"repositories":[{"name":"owner/repo","working_directory":"repo"}]}`
+	data := `{"pr_manager":{"enabled":true,"conversation_id":"D123","bot_id":"B123"},"repositories":[{"name":"owner/repo","working_directory":"repo"}]}`
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -28,14 +28,24 @@ func (source *fakeSource) PullRequest(_ context.Context, repository string, numb
 }
 
 type fakeHarness struct {
-	requests []harness.Request
-	err      error
+	requests    []harness.Request
+	targets     []harness.Target
+	discoveries []harness.Discovery
+	discoverErr error
+	err         error
 }
 
 func (agentHarness *fakeHarness) Name() string { return "fake" }
 
-func (agentHarness *fakeHarness) Discover(context.Context, []harness.Target) ([]harness.Discovery, error) {
-	return nil, nil
+func (agentHarness *fakeHarness) Discover(_ context.Context, targets []harness.Target) ([]harness.Discovery, error) {
+	agentHarness.targets = append(agentHarness.targets, targets...)
+	if agentHarness.discoverErr != nil {
+		return nil, agentHarness.discoverErr
+	}
+	if agentHarness.discoveries != nil {
+		return append([]harness.Discovery(nil), agentHarness.discoveries...), nil
+	}
+	return []harness.Discovery{{Found: true, Session: harness.Session{ID: "019f0000-0000-7000-8000-000000000002"}}}, nil
 }
 
 func (agentHarness *fakeHarness) Dispatch(_ context.Context, request harness.Request) (harness.Result, error) {
@@ -88,7 +98,7 @@ func (source *fakeMessageSource) Messages(_ context.Context, _ string, oldest st
 }
 
 func activeManager(source Source, agentHarness harness.Harness, reviewCache ReviewCache, messages messageSource) *Manager {
-	manager := New(Settings{Enabled: true, Conversation: "D123", BotID: "B123"}, []Repository{{Name: "owner/repo", WorkingDirectory: "/repo"}}, time.Minute, log.New(io.Discard, "", 0))
+	manager := New(Settings{Enabled: true, Conversation: "D123", BotID: "B123", TemplateTaskID: "019f0000-0000-7000-8000-000000000001"}, []Repository{{Name: "owner/repo", WorkingDirectory: "/repo"}}, time.Minute, log.New(io.Discard, "", 0))
 	manager.source = source
 	manager.harness = agentHarness
 	manager.reviewCache = reviewCache
@@ -151,6 +161,12 @@ func TestPollBaselinesHistoryThenDeliversNewTrustedReview(t *testing.T) {
 	if request := agentHarness.requests[0]; request.WorkingDirectory != "/repo" || request.Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit first. Do not post review comments; present the findings in this Codex task and wait for user approval." {
 		t.Fatalf("review request = %#v", request)
 	}
+	if len(agentHarness.targets) != 1 || agentHarness.targets[0].CreatorSessionID != "019f0000-0000-7000-8000-000000000001" || agentHarness.targets[0].Repository != "owner/repo" || agentHarness.targets[0].PullRequest != 42 {
+		t.Fatalf("template fork target = %#v", agentHarness.targets)
+	}
+	if agentHarness.requests[0].SessionID != "019f0000-0000-7000-8000-000000000002" {
+		t.Fatalf("review child session = %#v", agentHarness.requests[0])
+	}
 	if cache.cursor != "2.000001" || cache.heads["owner/repo#42"] != "first" {
 		t.Fatalf("cache = %#v", cache)
 	}
@@ -201,13 +217,27 @@ func TestPollRetriesDispatchFailureWithoutAdvancingCursor(t *testing.T) {
 	}
 }
 
+func TestPollRetriesTemplateForkFailureWithoutAdvancingCursor(t *testing.T) {
+	t.Parallel()
+	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, State: "open", HeadSHA: "first"}}
+	cache := &fakeReviewCache{heads: make(map[string]string), cursor: "1.000001"}
+	messages := &fakeMessageSource{messages: []message{{Conversation: "D123", BotID: "B123", Subtype: "bot_message", Text: "Please review: https://github.com/owner/repo/pull/42", Timestamp: "2.000001"}}}
+	agentHarness := &fakeHarness{discoverErr: errors.New("template unavailable")}
+	manager := activeManager(source, agentHarness, cache, messages)
+
+	err := manager.Poll(context.Background())
+	if err == nil || cache.cursor != "1.000001" || cache.heads["owner/repo#42"] != "" || len(agentHarness.requests) != 0 || manager.Status().LastError == "" {
+		t.Fatalf("err=%v cursor=%q cache=%#v dispatches=%d status=%#v", err, cache.cursor, cache.heads, len(agentHarness.requests), manager.Status())
+	}
+}
+
 func TestDeliverDeduplicatesByCurrentHeadAcrossRestart(t *testing.T) {
 	t.Parallel()
 	source := &fakeSource{pullRequest: github.PullRequest{Repository: "owner/repo", Number: 42, State: "open", URL: "https://github.com/owner/repo/pull/42", HeadSHA: "first"}}
 	agentHarness := &fakeHarness{}
 	cache := &fakeReviewCache{heads: make(map[string]string)}
 	manager := New(Settings{}, nil, time.Minute, log.New(io.Discard, "", 0))
-	request := reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42, PullRequestURL: "https://github.com/owner/repo/pull/42"}
+	request := reviewRequest{Repository: Repository{Name: "owner/repo", WorkingDirectory: "/repo"}, PullRequest: 42, PullRequestURL: "https://github.com/owner/repo/pull/42", TemplateTaskID: "019f0000-0000-7000-8000-000000000001"}
 
 	if err := manager.deliver(context.Background(), request, source, agentHarness, cache); err != nil {
 		t.Fatal(err)

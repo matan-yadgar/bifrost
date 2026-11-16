@@ -9,7 +9,8 @@
     "auto_reply": false,
     "user_token_env": "BIFROST_SLACK_USER_TOKEN",
     "conversation_id": "D0123456789",
-    "bot_id": "B0123456789"
+    "bot_id": "B0123456789",
+    "template_task_id": "01234567-89ab-cdef-0123-456789abcdef"
   },
   "repositories": [
     {
