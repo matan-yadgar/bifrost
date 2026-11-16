@@ -38,11 +38,12 @@ type Harness struct {
 }
 
 type PRManager struct {
-	Enabled      bool   `json:"enabled,omitempty"`
-	AutoReply    bool   `json:"auto_reply,omitempty"`
-	UserTokenEnv string `json:"user_token_env,omitempty"`
-	Conversation string `json:"conversation_id,omitempty"`
-	BotID        string `json:"bot_id,omitempty"`
+	Enabled        bool   `json:"enabled,omitempty"`
+	AutoReply      bool   `json:"auto_reply,omitempty"`
+	UserTokenEnv   string `json:"user_token_env,omitempty"`
+	Conversation   string `json:"conversation_id,omitempty"`
+	BotID          string `json:"bot_id,omitempty"`
+	TemplateTaskID string `json:"template_task_id,omitempty"`
 }
 
 type Runtime struct {
@@ -245,11 +246,12 @@ func normalizePRManager(prManager PRManager) (PRManager, error) {
 	}
 	prManager.Conversation = strings.TrimSpace(prManager.Conversation)
 	prManager.BotID = strings.TrimSpace(prManager.BotID)
+	prManager.TemplateTaskID = strings.TrimSpace(prManager.TemplateTaskID)
 	if !validEnvironmentName(prManager.UserTokenEnv) {
 		return PRManager{}, fmt.Errorf("pr_manager.user_token_env must contain only letters, digits, and underscores")
 	}
-	if prManager.Enabled && (prManager.Conversation == "" || prManager.BotID == "") {
-		return PRManager{}, fmt.Errorf("pr_manager.conversation_id and pr_manager.bot_id are required when pr_manager is enabled")
+	if prManager.Enabled && (prManager.Conversation == "" || prManager.BotID == "" || prManager.TemplateTaskID == "") {
+		return PRManager{}, fmt.Errorf("pr_manager.conversation_id, pr_manager.bot_id, and pr_manager.template_task_id are required when pr_manager is enabled")
 	}
 	return prManager, nil
 }

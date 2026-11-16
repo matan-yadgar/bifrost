@@ -26,11 +26,12 @@ const (
 var pullRequestURL = regexp.MustCompile(`https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)`)
 
 type Settings struct {
-	Enabled      bool
-	AutoReply    bool
-	UserTokenEnv string
-	Conversation string
-	BotID        string
+	Enabled        bool
+	AutoReply      bool
+	UserTokenEnv   string
+	Conversation   string
+	BotID          string
+	TemplateTaskID string
 }
 
 type Repository struct {
@@ -92,6 +93,7 @@ type reviewRequest struct {
 	PullRequest    int
 	PullRequestURL string
 	AutoReply      bool
+	TemplateTaskID string
 }
 
 func New(settings Settings, repositories []Repository, dispatchTimeout time.Duration, logger *log.Logger) *Manager {
@@ -220,8 +222,8 @@ func (manager *Manager) startLocked() error {
 	if manager.reviewCache == nil {
 		return manager.failLocked(fmt.Errorf("pr manager review cache is required"))
 	}
-	if manager.settings.Conversation == "" || manager.settings.BotID == "" {
-		return manager.failLocked(fmt.Errorf("pr_manager.conversation_id and pr_manager.bot_id are required"))
+	if manager.settings.Conversation == "" || manager.settings.BotID == "" || manager.settings.TemplateTaskID == "" {
+		return manager.failLocked(fmt.Errorf("pr_manager.conversation_id, pr_manager.bot_id, and pr_manager.template_task_id are required"))
 	}
 	userToken := strings.TrimSpace(os.Getenv(manager.settings.UserTokenEnv))
 	if userToken == "" {
@@ -285,7 +287,7 @@ func (manager *Manager) requests(event message, settings Settings) []reviewReque
 			continue
 		}
 		seen[key] = true
-		requests = append(requests, reviewRequest{Repository: repository, PullRequest: number, PullRequestURL: match[0]})
+		requests = append(requests, reviewRequest{Repository: repository, PullRequest: number, PullRequestURL: match[0], TemplateTaskID: settings.TemplateTaskID})
 	}
 	return requests
 }
@@ -312,9 +314,22 @@ func (manager *Manager) deliver(ctx context.Context, request reviewRequest, sour
 	dispatchContext, cancel := context.WithTimeout(ctx, manager.dispatchTimeout)
 	defer cancel()
 	manager.logger.Printf("PR Manager review started: pr=%s", key)
+	discoveries, err := agentHarness.Discover(dispatchContext, []harness.Target{{
+		Repository: pullRequest.Repository, PullRequest: pullRequest.Number,
+		CreatorSessionID: request.TemplateTaskID, WorkingDirectory: request.Repository.WorkingDirectory,
+	}})
+	if err != nil {
+		return fmt.Errorf("PR Manager review failed: pr=%s reason=fork template task: %w", key, err)
+	}
+	if len(discoveries) != 1 || discoveries[0].Err != nil || !discoveries[0].Found || discoveries[0].Session.ID == "" {
+		if len(discoveries) == 1 && discoveries[0].Err != nil {
+			return fmt.Errorf("PR Manager review failed: pr=%s reason=fork template task: %w", key, discoveries[0].Err)
+		}
+		return fmt.Errorf("PR Manager review failed: pr=%s reason=fork template task did not return a session", key)
+	}
 	_, err = agentHarness.Dispatch(dispatchContext, harness.Request{
-		WorkingDirectory: request.Repository.WorkingDirectory,
-		Prompt:           reviewPrompt(request.PullRequestURL, pullRequest.HeadSHA, request.AutoReply),
+		SessionID: discoveries[0].Session.ID, WorkingDirectory: request.Repository.WorkingDirectory,
+		Prompt: reviewPrompt(request.PullRequestURL, pullRequest.HeadSHA, request.AutoReply),
 	})
 	if err != nil {
 		return fmt.Errorf("PR Manager review failed: pr=%s reason=dispatch: %w", key, err)

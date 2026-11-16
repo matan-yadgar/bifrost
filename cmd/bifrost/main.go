@@ -74,11 +74,12 @@ func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.M
 		repositories = append(repositories, prmanager.Repository{Name: repository.Name, WorkingDirectory: repository.WorkingDirectory})
 	}
 	return prmanager.New(prmanager.Settings{
-		Enabled:      runtimeConfig.PRManager.Enabled,
-		AutoReply:    runtimeConfig.PRManager.AutoReply,
-		UserTokenEnv: runtimeConfig.PRManager.UserTokenEnv,
-		Conversation: runtimeConfig.PRManager.Conversation,
-		BotID:        runtimeConfig.PRManager.BotID,
+		Enabled:        runtimeConfig.PRManager.Enabled,
+		AutoReply:      runtimeConfig.PRManager.AutoReply,
+		UserTokenEnv:   runtimeConfig.PRManager.UserTokenEnv,
+		Conversation:   runtimeConfig.PRManager.Conversation,
+		BotID:          runtimeConfig.PRManager.BotID,
+		TemplateTaskID: runtimeConfig.PRManager.TemplateTaskID,
 	}, repositories, runtimeConfig.DispatchTimeout, logger)
 }
 
