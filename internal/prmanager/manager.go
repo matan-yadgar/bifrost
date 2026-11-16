@@ -382,7 +382,7 @@ func slackTimestamp(now time.Time) string {
 
 func reviewPrompt(pullRequestURL, headSHA string, autoReply bool) string {
 	if autoReply {
-		return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s and paste the comments in the PR.", pullRequestURL, headSHA)
+		return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s. Post only actionable review comments. If there are no actionable comments, do not post a comment; approve the PR if GitHub permits it, otherwise stop without making any write.", pullRequestURL, headSHA)
 	}
 	return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s. Do not post review comments; present the findings in this Codex task and wait for user approval.", pullRequestURL, headSHA)
 }
