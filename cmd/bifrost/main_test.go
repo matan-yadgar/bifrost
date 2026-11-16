@@ -406,8 +406,36 @@ func TestControlUIRebuildFailureKeepsPollerActive(t *testing.T) {
 		t.Fatal("failed rebuild requested restart")
 	default:
 	}
-	if !strings.Contains(strings.Join(logs.snapshot(), ""), "Bifrost rebuild failed: build failed") {
+	if !strings.Contains(strings.Join(logs.snapshot(), ""), "Bifrost update and rebuild failed: build failed") {
 		t.Fatalf("rebuild failure was not logged: %#v", logs.snapshot())
+	}
+}
+
+func TestUpdateAndRebuildInstalledBinaryStopsWhenGitPullFails(t *testing.T) {
+	directory := t.TempDir()
+	binDirectory := filepath.Join(directory, "bin")
+	if err := os.Mkdir(binDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	argumentsPath := filepath.Join(directory, "git-arguments")
+	gitPath := filepath.Join(binDirectory, "git")
+	gitScript := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BIFROST_TEST_GIT_ARGUMENTS\"\nprintf 'cannot fast-forward\\n' >&2\nexit 1\n"
+	if err := os.WriteFile(gitPath, []byte(gitScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BIFROST_TEST_GIT_ARGUMENTS", argumentsPath)
+
+	err := updateAndRebuildInstalledBinary(directory, filepath.Join(directory, "bifrost"))
+	if err == nil || !strings.Contains(err.Error(), "update Bifrost checkout") || !strings.Contains(err.Error(), "cannot fast-forward") {
+		t.Fatalf("error = %v", err)
+	}
+	arguments, err := os.ReadFile(argumentsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(arguments) != "pull\n--ff-only\norigin\nmain\n" {
+		t.Fatalf("git arguments = %q", arguments)
 	}
 }
 
