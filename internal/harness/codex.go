@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -34,6 +35,7 @@ type Codex struct {
 	args       []string
 	runner     commandRunner
 	discoverer sessionDiscoverer
+	openThread func(string)
 }
 
 var _ Harness = (*Codex)(nil)
@@ -46,6 +48,7 @@ func NewCodex(command string, args, environment []string) *Codex {
 		args:       append([]string(nil), args...),
 		runner:     &execRunner{environment: slices.Clone(environment), processes: processes},
 		discoverer: appServer,
+		openThread: openCodexDesktopThread,
 	}
 }
 
@@ -97,7 +100,17 @@ func (codex *Codex) Dispatch(ctx context.Context, request Request) (Result, erro
 	if sessionID == "" {
 		return Result{}, fmt.Errorf("Codex completed without reporting a session ID")
 	}
+	if codex.openThread != nil {
+		codex.openThread(sessionID)
+	}
 	return Result{SessionID: sessionID}, nil
+}
+
+func openCodexDesktopThread(sessionID string) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	_ = exec.Command("open", "codex://threads/"+sessionID).Start()
 }
 
 func validSessionID(value string) bool {

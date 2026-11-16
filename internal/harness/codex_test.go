@@ -719,6 +719,8 @@ func TestCodexDispatchStartsAndResumesSessions(t *testing.T) {
 	runner := &fakeRunner{lines: []string{`{"type":"thread.started","thread_id":"` + sessionID + `"}`}}
 	codex := NewCodex("custom-codex", []string{"--approve-for-me"}, nil)
 	codex.runner = runner
+	var opened []string
+	codex.openThread = func(id string) { opened = append(opened, id) }
 
 	result, err := codex.Dispatch(context.Background(), Request{WorkingDirectory: "/repo", Prompt: "handle review"})
 	if err != nil {
@@ -740,6 +742,9 @@ func TestCodexDispatchStartsAndResumesSessions(t *testing.T) {
 	wantResume := []string{"exec", "--approve-for-me", "resume", "--json", sessionID, "-"}
 	if result.SessionID != sessionID || !reflect.DeepEqual(runner.args, wantResume) {
 		t.Fatalf("resume result/args = %#v / %#v", result, runner.args)
+	}
+	if !reflect.DeepEqual(opened, []string{sessionID, sessionID}) {
+		t.Fatalf("opened tasks = %#v", opened)
 	}
 }
 
