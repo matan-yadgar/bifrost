@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -70,6 +71,7 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	prManagerEnabled := false
 	prManagerAutoReply := false
 	reviewCommentsEnabled := true
+	rebuildRequested := make(chan struct{}, 1)
 	restartRequested := make(chan struct{}, 1)
 	logs := newLiveLogs()
 	ui := &controlUI{
@@ -88,6 +90,10 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 		setPRManagerAutoReply: func(autoReply bool) { prManagerAutoReply = autoReply },
 		reviewCommentsEnabled: func() bool { return reviewCommentsEnabled },
 		setReviewComments:     func(enabled bool) { reviewCommentsEnabled = enabled },
+		rebuild: func() error {
+			rebuildRequested <- struct{}{}
+			return nil
+		},
 		restart: func() {
 			restartRequested <- struct{}{}
 		},
@@ -287,6 +293,32 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 		t.Fatal("restart was not requested")
 	}
 
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/rebuild-restart", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("rebuild status = %d", response.StatusCode)
+	}
+	select {
+	case <-rebuildRequested:
+	case <-time.After(time.Second):
+		t.Fatal("rebuild was not requested")
+	}
+	select {
+	case <-restartRequested:
+	case <-time.After(time.Second):
+		t.Fatal("restart was not requested after rebuild")
+	}
+
 	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/deactivate", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -310,6 +342,72 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	<-ui.finished()
 	if ui.status().Active {
 		t.Fatal("UI reports active after deactivation")
+	}
+}
+
+func TestControlUIRebuildFailureKeepsPollerActive(t *testing.T) {
+	logs := newLiveLogs()
+	restartRequested := make(chan struct{}, 1)
+	ui := &controlUI{
+		logger: log.New(logs, "", 0),
+		token:  "test-token",
+		logs:   logs,
+		prManagerStatus: func() prmanager.Status {
+			return prmanager.Status{}
+		},
+		reviewCommentsEnabled: func() bool { return true },
+		rebuild: func() error {
+			return errors.New("build failed")
+		},
+		restart: func() {
+			restartRequested <- struct{}{}
+		},
+		active: true,
+	}
+	server := httptest.NewServer(ui.handler())
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/rebuild-restart", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("rebuild status = %d", response.StatusCode)
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		status := ui.status()
+		if status.LastError != "" {
+			if !status.Active || status.Rebuilding {
+				t.Fatalf("status after failed rebuild = %#v", status)
+			}
+			if !strings.Contains(status.LastError, "build failed") {
+				t.Fatalf("rebuild error = %q", status.LastError)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("rebuild failure was not reported")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case <-restartRequested:
+		t.Fatal("failed rebuild requested restart")
+	default:
+	}
+	if !strings.Contains(strings.Join(logs.snapshot(), ""), "Bifrost rebuild failed: build failed") {
+		t.Fatalf("rebuild failure was not logged: %#v", logs.snapshot())
 	}
 }
 
