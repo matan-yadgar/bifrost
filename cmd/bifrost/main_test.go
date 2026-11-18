@@ -71,6 +71,7 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 	prManagerEnabled := false
 	prManagerAutoReply := false
 	reviewCommentsEnabled := true
+	ciMonitoringEnabled := true
 	rebuildRequested := make(chan struct{}, 1)
 	restartRequested := make(chan struct{}, 1)
 	logs := newLiveLogs()
@@ -90,6 +91,8 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 		setPRManagerAutoReply: func(autoReply bool) { prManagerAutoReply = autoReply },
 		reviewCommentsEnabled: func() bool { return reviewCommentsEnabled },
 		setReviewComments:     func(enabled bool) { reviewCommentsEnabled = enabled },
+		ciMonitoringEnabled:   func() bool { return ciMonitoringEnabled },
+		setCIMonitoring:       func(enabled bool) { ciMonitoringEnabled = enabled },
 		rebuild: func() error {
 			rebuildRequested <- struct{}{}
 			return nil
@@ -245,6 +248,38 @@ func TestControlUIShowsConfigLogsAndControlsPoller(t *testing.T) {
 		t.Fatalf("review comments activate status = %d %#v", response.StatusCode, ui.status())
 	}
 
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/ci-monitoring/deactivate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || ui.status().CIMonitoringEnabled {
+		t.Fatalf("CI monitoring deactivate status = %d %#v", response.StatusCode, ui.status())
+	}
+
+	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/ci-monitoring/activate", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Bifrost-Token", ui.token)
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || !ui.status().CIMonitoringEnabled {
+		t.Fatalf("CI monitoring activate status = %d %#v", response.StatusCode, ui.status())
+	}
+
 	request, err = http.NewRequest(http.MethodPost, server.URL+"/api/config/pr-manager/auto-reply", strings.NewReader(`{"auto_reply":true}`))
 	if err != nil {
 		t.Fatal(err)
@@ -356,6 +391,7 @@ func TestControlUIRebuildFailureKeepsPollerActive(t *testing.T) {
 			return prmanager.Status{}
 		},
 		reviewCommentsEnabled: func() bool { return true },
+		ciMonitoringEnabled:   func() bool { return true },
 		rebuild: func() error {
 			return errors.New("build failed")
 		},
