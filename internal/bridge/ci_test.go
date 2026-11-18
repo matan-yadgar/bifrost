@@ -73,7 +73,7 @@ func TestFailedCIDeliveryRetriesAndDisabledMonitoringDoesNotFetchCI(t *testing.T
 	if r, err := monitor.RunOnce(context.Background()); err != nil || r.Dispatches != 1 {
 		t.Fatalf("retry=%+v err=%v", r, err)
 	}
-	monitor.monitorCI = false
+	monitor.SetCIMonitoringEnabled(false)
 	source.checksError = errors.New("CI must not be read")
 	if _, err := monitor.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)

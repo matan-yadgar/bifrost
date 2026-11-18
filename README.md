@@ -49,7 +49,7 @@ Run Bifrost with `-ui` to serve its local control page at [http://127.0.0.1:7420
 bifrost -config ~/.config/bifrost/config.json -ui
 ```
 
-The poller starts active, as it does in normal mode. The page can deactivate and reactivate polling without stopping the control page, independently enable or disable GitHub review-comment follow-ups while PR Manager and CI monitoring continue, and persist the PR Manager auto-reply switch. It also shows collapsible live activity and source configuration sections. The restart button gracefully exits the process so a supervising service can relaunch it with fresh configuration. The update, rebuild-and-restart button fast-forwards the launch working directory from `origin/main`, builds the installed executable, then follows that same restart path. If Git cannot fast-forward, it keeps Bifrost running and shows the error. It listens only on the local machine and requires a per-start control token for control requests.
+The poller starts active, as it does in normal mode. The page can deactivate and reactivate polling without stopping the control page, independently enable or disable GitHub review-comment and CI-failure follow-ups, and persist the PR Manager auto-reply switch. It also shows collapsible live activity and source configuration sections. The restart button gracefully exits the process so a supervising service can relaunch it with fresh configuration. The update, rebuild-and-restart button fast-forwards the launch working directory from `origin/main`, builds the installed executable, then follows that same restart path. If Git cannot fast-forward, it keeps Bifrost running and shows the error. It listens only on the local machine and requires a per-start control token for control requests.
 
 For a macOS LaunchAgent installation, add `-ui` to `ProgramArguments`, then reload or kickstart that same LaunchAgent. With `KeepAlive` enabled, the UI restart and update, rebuild-and-restart buttons relaunch Bifrost. The control page stays available while polling is inactive.
 
@@ -109,7 +109,7 @@ Bifrost currently targets macOS and Linux and has no public UI, webhook listener
 
 ## CI follow-up
 
-Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment monitoring. It uses the existing `poll_interval` and each repository's `authors`; CI monitoring requires a nonempty author list. Existing configurations keep CI monitoring disabled.
+Set `"monitor_ci": true` to enable CI monitoring in addition to review-comment monitoring. It uses the existing `poll_interval` and each repository's `authors`; CI monitoring requires a nonempty author list. Existing configurations keep CI monitoring disabled. The control page can temporarily enable or disable CI monitoring until Bifrost restarts.
 
 Bifrost checks completed failures on each open PR's current head commit, including GitHub check runs and legacy commit statuses. Cancelled and pending checks do not trigger delivery. New failures and changed review threads for a PR are combined into one prompt and sent through the same cached fork. No coordinator or Desktop chat tools are needed.
 

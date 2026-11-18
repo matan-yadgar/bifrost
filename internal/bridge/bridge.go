@@ -54,7 +54,7 @@ type Monitor struct {
 	harness            harness.Harness
 	repositories       []Repository
 	stateFile          string
-	monitorCI          bool
+	ciMonitoring       atomic.Bool
 	reviewComments     atomic.Bool
 	dispatchTimeout    time.Duration
 	heartbeatInterval  time.Duration
@@ -149,10 +149,11 @@ func (locks *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 func New(source Source, agentHarness harness.Harness, repositories []Repository, statePath string, dispatchTimeout time.Duration, monitorCI bool, logger *log.Logger) *Monitor {
 	monitor := &Monitor{
 		source: source, harness: agentHarness, repositories: repositories,
-		stateFile: statePath, monitorCI: monitorCI, dispatchTimeout: dispatchTimeout, heartbeatInterval: dispatchHeartbeatInterval,
+		stateFile: statePath, dispatchTimeout: dispatchTimeout, heartbeatInterval: dispatchHeartbeatInterval,
 		newHeartbeatTicker: newHeartbeatTicker, logger: logger,
 	}
 	monitor.reviewComments.Store(true)
+	monitor.ciMonitoring.Store(monitorCI)
 	return monitor
 }
 
@@ -164,6 +165,14 @@ func (monitor *Monitor) SetReviewCommentsEnabled(enabled bool) {
 
 func (monitor *Monitor) ReviewCommentsEnabled() bool {
 	return monitor.reviewComments.Load()
+}
+
+func (monitor *Monitor) SetCIMonitoringEnabled(enabled bool) {
+	monitor.ciMonitoring.Store(enabled)
+}
+
+func (monitor *Monitor) CIMonitoringEnabled() bool {
+	return monitor.ciMonitoring.Load()
 }
 
 func newHeartbeatTicker(interval time.Duration) (<-chan time.Time, func()) {
@@ -219,7 +228,7 @@ func (monitor *Monitor) RunOnce(ctx context.Context) (CycleResult, error) {
 				}
 			}
 			var checks []githubapi.FailedCheck
-			if monitor.monitorCI {
+			if monitor.CIMonitoringEnabled() {
 				checks, err = monitor.changedChecks(ctx, state, pullRequest)
 				stateChanged = true
 				if err != nil {

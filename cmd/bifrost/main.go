@@ -65,7 +65,7 @@ func runDaemon(ctx context.Context, configPath string, runOnce bool, terminal io
 			_, _ = fmt.Fprintf(terminal, "close log file: %v\n", err)
 		}
 	}()
-	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger), nil)
+	return runPoller(ctx, runtimeConfig, runOnce, logger, newPRManager(runtimeConfig, logger), nil, nil)
 }
 
 func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.Manager {
@@ -83,7 +83,7 @@ func newPRManager(runtimeConfig config.Runtime, logger *log.Logger) *prmanager.M
 	}, repositories, runtimeConfig.DispatchTimeout, logger)
 }
 
-func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager, reviewComments *reviewCommentsControl) error {
+func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, logger *log.Logger, manager *prmanager.Manager, reviewComments *reviewCommentsControl, ciMonitoring *ciMonitoringControl) error {
 	environment := withoutPRManagerTokens(githubapi.WithoutAuthTokens(os.Environ()), runtimeConfig.PRManager)
 	agentHarness, err := harness.New(runtimeConfig.Harness.Type, runtimeConfig.Harness.Command, runtimeConfig.Harness.Args, environment)
 	if err != nil {
@@ -113,6 +113,10 @@ func runPoller(ctx context.Context, runtimeConfig config.Runtime, runOnce bool, 
 	if reviewComments != nil {
 		reviewComments.attach(monitor)
 		defer reviewComments.detach(monitor)
+	}
+	if ciMonitoring != nil {
+		ciMonitoring.attach(monitor)
+		defer ciMonitoring.detach(monitor)
 	}
 	if !runOnce && manager != nil {
 		if err := manager.Start(ctx, githubClient, agentHarness, monitor); err != nil {
