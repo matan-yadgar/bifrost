@@ -382,7 +382,7 @@ func slackTimestamp(now time.Time) string {
 
 func reviewPrompt(pullRequestURL, headSHA string, autoReply bool) string {
 	if autoReply {
-		return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s. Post only actionable review comments. If there are no actionable comments, do not post a comment; approve the PR if GitHub permits it, otherwise stop without making any write.", pullRequestURL, headSHA)
+		return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s. Post only actionable review comments. If all actionable comments are P3, paste them in the PR and approve it if GitHub permits it. If any actionable comment is P1 or P2, paste the comments in a submitted GitHub review with the Comment event so its status is Commented, but do not approve. If there are no actionable comments, do not post a comment. In this no-findings case only, approve the PR if GitHub permits it. If it cannot be approved in this case, stop without making any write.", pullRequestURL, headSHA)
 	}
 	return fmt.Sprintf("/trigger-code-review %s Review exactly commit %s. Do not post review comments; present the findings in this Codex task and wait for user approval.", pullRequestURL, headSHA)
 }
