@@ -184,7 +184,7 @@ func TestSetAutoReplyAppliesToNewPolledReview(t *testing.T) {
 	if err := manager.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(agentHarness.requests) != 1 || agentHarness.requests[0].Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit first. Post only actionable review comments. If all actionable comments are P3, paste them in the PR and approve it if GitHub permits it. If any actionable comment is P1 or P2, paste the comments but do not approve. If there are no actionable comments, do not post a comment. In this no-findings case only, approve the PR if GitHub permits it. If it cannot be approved in this case, stop without making any write." {
+	if len(agentHarness.requests) != 1 || agentHarness.requests[0].Prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit first. Post only actionable review comments. If all actionable comments are P3, paste them in the PR and approve it if GitHub permits it. If any actionable comment is P1 or P2, paste the comments in a submitted GitHub review with the Comment event so its status is Commented, but do not approve. If there are no actionable comments, do not post a comment. In this no-findings case only, approve the PR if GitHub permits it. If it cannot be approved in this case, stop without making any write." {
 		t.Fatalf("review requests = %#v", agentHarness.requests)
 	}
 }
@@ -282,7 +282,7 @@ func TestDeliverSkipsClosedPullRequest(t *testing.T) {
 func TestReviewPromptAutoReply(t *testing.T) {
 	t.Parallel()
 	prompt := reviewPrompt("https://github.com/owner/repo/pull/42", "first", true)
-	if prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit first. Post only actionable review comments. If all actionable comments are P3, paste them in the PR and approve it if GitHub permits it. If any actionable comment is P1 or P2, paste the comments but do not approve. If there are no actionable comments, do not post a comment. In this no-findings case only, approve the PR if GitHub permits it. If it cannot be approved in this case, stop without making any write." {
+	if prompt != "/trigger-code-review https://github.com/owner/repo/pull/42 Review exactly commit first. Post only actionable review comments. If all actionable comments are P3, paste them in the PR and approve it if GitHub permits it. If any actionable comment is P1 or P2, paste the comments in a submitted GitHub review with the Comment event so its status is Commented, but do not approve. If there are no actionable comments, do not post a comment. In this no-findings case only, approve the PR if GitHub permits it. If it cannot be approved in this case, stop without making any write." {
 		t.Fatalf("auto-reply prompt = %q", prompt)
 	}
 }
