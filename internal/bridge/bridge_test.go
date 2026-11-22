@@ -106,7 +106,9 @@ func newTestMonitor(source Source, agentHarness harness.Harness, repositories []
 			panic(err)
 		}
 	}
-	return New(source, agentHarness, repositories, statePath, time.Minute, false, discardLogger())
+	monitor := New(source, agentHarness, repositories, statePath, time.Minute, false, discardLogger())
+	monitor.SetReviewCommentsEnabled(true)
+	return monitor
 }
 
 func TestPRManagerReviewHeadsPersistAndPrune(t *testing.T) {
@@ -179,6 +181,14 @@ func TestReviewCommentsCanBeDisabledWithoutStoppingCIMonitoring(t *testing.T) {
 	monitor.SetReviewCommentsEnabled(true)
 	if _, err := monitor.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "review comments were read") {
 		t.Fatalf("enabled review comments error = %v", err)
+	}
+}
+
+func TestNewDefaultsFollowUpsToDisabled(t *testing.T) {
+	t.Parallel()
+	monitor := New(&fakeSource{}, &fakeHarness{}, nil, filepath.Join(t.TempDir(), "state.json"), time.Minute, false, discardLogger())
+	if monitor.ReviewCommentsEnabled() || monitor.CIMonitoringEnabled() {
+		t.Fatalf("follow-ups enabled by default: review_comments=%t ci=%t", monitor.ReviewCommentsEnabled(), monitor.CIMonitoringEnabled())
 	}
 }
 
@@ -291,6 +301,7 @@ func TestMonitorLogsOperationalLifecycleWithoutSensitivePayloads(t *testing.T) {
 		time.Minute, false,
 		log.New(&output, "", 0),
 	)
+	monitor.SetReviewCommentsEnabled(true)
 
 	result, err := monitor.RunOnce(context.Background())
 	if err == nil || result.Dispatches != 2 || result.Deferred != 2 {
@@ -1631,6 +1642,7 @@ func TestDispatchTimeoutPreservesSessionAndLeavesFeedbackPending(t *testing.T) {
 	agentHarness := &timeoutHarness{sessionID: "started-session", deadline: make(chan timeoutObservation, 1)}
 	statePath := filepath.Join(directory, "state.json")
 	monitor := New(reviewSource(), agentHarness, []Repository{{Name: "Owner/Repo", WorkingDirectory: directory}}, statePath, dispatchTimeout, false, discardLogger())
+	monitor.SetReviewCommentsEnabled(true)
 	type cycleOutcome struct {
 		result CycleResult
 		err    error

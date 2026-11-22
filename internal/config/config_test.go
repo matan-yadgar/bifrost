@@ -69,6 +69,26 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsOptionalFollowUpsToDisabled(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	if err := os.Mkdir(filepath.Join(directory, "repo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(path, []byte(`{"repositories":[{"name":"owner/repo","working_directory":"repo"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeConfig, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtimeConfig.MonitorCI || runtimeConfig.PRManager.Enabled {
+		t.Fatalf("follow-up configuration enabled by default: monitor_ci=%t pr_manager=%t", runtimeConfig.MonitorCI, runtimeConfig.PRManager.Enabled)
+	}
+}
+
 func TestUpdatePRManagerAutoReply(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.json")

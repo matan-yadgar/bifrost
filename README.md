@@ -15,6 +15,7 @@ The first harness is Codex CLI. The Go interface in `internal/harness` is the ex
 - Keeps its private PR-to-task route cache in `state.json`; no second actor or mapping configuration is required.
 - Allows only one Bifrost process per state file. A second process exits immediately; the operating system releases the lock if the owner exits or crashes.
 - Writes logs to the configured directory while continuing to show them in the terminal. Every start creates a new file, and files rotate after 1,000 lines.
+- Starts review-comment, CI-failure, and PR Manager follow-ups disabled; enable the sources you want explicitly.
 - Clears stale routes for batched re-discovery on the next polling cycle, and removes route and delivery state after a successful scan shows that a PR is no longer open.
 - Marks a thread version delivered only after Codex exits successfully. Resolved threads are forgotten so reopening one emits it again.
 - Cancels a dispatch after 30 minutes by default and terminates its child process tree; timed-out thread versions remain pending.
