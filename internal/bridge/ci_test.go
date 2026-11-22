@@ -18,6 +18,7 @@ func ciFixture(t *testing.T) (*Monitor, *fakeSource, *fakeHarness) {
 	source := &fakeSource{pullRequest: githubapi.PullRequest{Repository: "owner/repo", Number: 42, URL: "https://github.com/owner/repo/pull/42", HeadSHA: "head-1"}, checks: []githubapi.FailedCheck{{ID: "check:1:first", Name: "unit", URL: "https://github.com/owner/repo/actions/runs/1", Conclusion: "failure"}}}
 	agent := &fakeHarness{discoveredID: "019c0000-0000-7000-8000-000000000003"}
 	monitor := New(source, agent, []Repository{{Name: "owner/repo", WorkingDirectory: t.TempDir()}}, filepath.Join(t.TempDir(), "state.json"), time.Minute, true, discardLogger())
+	monitor.SetReviewCommentsEnabled(true)
 	return monitor, source, agent
 }
 
@@ -38,6 +39,7 @@ func TestCIReportsOncePerHeadAndAttemptAcrossRestarts(t *testing.T) {
 	}
 	run(0)
 	monitor = New(source, agent, monitor.repositories, monitor.stateFile, time.Minute, true, discardLogger())
+	monitor.SetReviewCommentsEnabled(true)
 	run(0)
 	source.checks[0].ID = "check:1:rerun"
 	run(1)

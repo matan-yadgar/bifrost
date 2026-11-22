@@ -152,7 +152,7 @@ func New(source Source, agentHarness harness.Harness, repositories []Repository,
 		stateFile: statePath, dispatchTimeout: dispatchTimeout, heartbeatInterval: dispatchHeartbeatInterval,
 		newHeartbeatTicker: newHeartbeatTicker, logger: logger,
 	}
-	monitor.reviewComments.Store(true)
+	monitor.reviewComments.Store(false)
 	monitor.ciMonitoring.Store(monitorCI)
 	return monitor
 }
